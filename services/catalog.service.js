@@ -17,11 +17,11 @@ const listCustomers = async ({ status, search, page, pageSize }) => {
 };
 
 const listRoutes = async ({ onlyActive, refDate }) => {
-  return {
-    code: 0,
-    message: "sp_route_list no esta disponible en esta version",
-    data: [],
-  };
+  const out = await callProcedure("sp_route_list", [
+    Number(onlyActive || 0),
+    refDate || null,
+  ]);
+  return mapSpResult(out);
 };
 
 const listProducts = async ({ onlyActive, categoryId, search, page, pageSize }) => {
@@ -39,6 +39,31 @@ const listRawMaterials = async ({ onlyActive, categoryId, search, page, pageSize
   const out = await callProcedure("sp_raw_material_list", [
     Number(onlyActive || 0),
     categoryId ? Number(categoryId) : null,
+    search || null,
+    Number(page || 1),
+    Number(pageSize || 20),
+  ]);
+  return mapSpResult(out);
+};
+
+const listTaxRates = async ({ onlyActive }) => {
+  const out = await callProcedure("sp_tax_rate_list", [Number(onlyActive || 0)]);
+  return mapSpResult(out);
+};
+
+const listProductCategories = async ({ onlyActive }) => {
+  const out = await callProcedure("sp_product_category_list", [Number(onlyActive || 0)]);
+  return mapSpResult(out);
+};
+
+const listRawMaterialCategories = async ({ onlyActive }) => {
+  const out = await callProcedure("sp_raw_material_category_list", [Number(onlyActive || 0)]);
+  return mapSpResult(out);
+};
+
+const listSuppliers = async ({ status, search, page, pageSize }) => {
+  const out = await callProcedure("sp_supplier_list", [
+    status || null,
     search || null,
     Number(page || 1),
     Number(pageSize || 20),
@@ -250,6 +275,10 @@ module.exports = {
   listRoutes,
   listProducts,
   listRawMaterials,
+  listTaxRates,
+  listProductCategories,
+  listRawMaterialCategories,
+  listSuppliers,
   createBranch,
   updateBranch,
   createTaxRate,

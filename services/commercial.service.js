@@ -44,7 +44,7 @@ const createRoute = async (payload, actorUserId) => {
     payload.p_code || null,
     payload.p_name || null,
     payload.p_description || null,
-    payload.p_is_active || null,
+    payload.p_is_active ?? 1,
     actorUserId || null,
   ]);
   return mapSpResult(out);
@@ -55,7 +55,7 @@ const updateRoute = async (payload, actorUserId) => {
     payload.p_route_id,
     payload.p_name || null,
     payload.p_description || null,
-    payload.p_is_active || null,
+    payload.p_is_active ?? null,
     actorUserId || null,
   ]);
   return mapSpResult(out);
@@ -64,7 +64,7 @@ const updateRoute = async (payload, actorUserId) => {
 const setRouteStatus = async (payload, actorUserId) => {
   const out = await callProcedure("sp_route_set_status", [
     payload.p_route_id,
-    payload.p_is_active || null,
+    payload.p_is_active ?? null,
     actorUserId || null,
   ]);
   return mapSpResult(out);

@@ -55,11 +55,15 @@ const login = async ({ identifier, password, ipAddress, userAgent }) => {
 
   const permissionsOut = await callProcedure("sp_permission_list_by_user", [start.data.user_id]);
   const permissions = mapSpResult(permissionsOut);
+  const roles = permissions.data ? permissions.data.roles : [];
+  const permissionCodes = permissions.data ? permissions.data.permissions : [];
   const accessToken = signToken({
     user: {
       userId: start.data.user_id,
       username: start.data.username,
       email: start.data.email,
+      roles,
+      permissions: permissionCodes,
     },
   });
 
@@ -76,8 +80,8 @@ const login = async ({ identifier, password, ipAddress, userAgent }) => {
         email: start.data.email,
         must_change_password: success.data.must_change_password,
       },
-      roles: permissions.data ? permissions.data.roles : [],
-      permissions: permissions.data ? permissions.data.permissions : [],
+      roles,
+      permissions: permissionCodes,
     },
   };
 };
@@ -101,7 +105,15 @@ const refreshSession = async ({ sessionId, userId, refreshToken }) => {
     return result;
   }
 
-  const accessToken = signToken({ user: { userId } });
+  const permissionsOut = await callProcedure("sp_permission_list_by_user", [userId]);
+  const permissions = mapSpResult(permissionsOut);
+  const accessToken = signToken({
+    user: {
+      userId,
+      roles: permissions.data ? permissions.data.roles : [],
+      permissions: permissions.data ? permissions.data.permissions : [],
+    },
+  });
   return {
     code: 1,
     message: "sesion renovada",

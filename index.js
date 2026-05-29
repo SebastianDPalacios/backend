@@ -31,6 +31,7 @@ app.use("/api/commercial", require("./api/commercial.router"));
 app.use("/api/recipes", require("./api/recipes.router"));
 app.use("/api/rbac", require("./api/rbac.router"));
 app.use("/api/admin-auth", require("./api/admin-auth.router"));
+app.use("/api/reports", require("./api/reports.router"));
 app.use("/api/standard", require("./api/standard.router"));
 
 app.use(logErrors);

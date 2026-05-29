@@ -1,4 +1,4 @@
-const { callProcedure } = require("../data-access");
+const { callProcedure, connect } = require("../data-access");
 const { mapSpResult } = require("./sp-response");
 
 const createRecipe = async (payload, actorUserId) => {
@@ -9,6 +9,86 @@ const createRecipe = async (payload, actorUserId) => {
     actorUserId || null,
   ]);
   return mapSpResult(out);
+};
+
+const listRecipes = async ({ onlyActive, productId } = {}) => {
+  const db = await connect();
+  const filters = [];
+  const params = [];
+
+  if (onlyActive) {
+    filters.push("r.is_active = 1");
+  }
+
+  if (productId) {
+    filters.push("r.product_id = ?");
+    params.push(Number(productId));
+  }
+
+  const sql = `
+    SELECT
+      r.id,
+      r.product_id,
+      r.version_no,
+      r.output_quantity,
+      r.notes,
+      r.is_active,
+      p.name AS product_name,
+      p.sku AS product_sku
+    FROM recipes r
+    JOIN products p ON p.id = r.product_id
+    ${filters.length ? `WHERE ${filters.join(" AND ")}` : ""}
+    ORDER BY p.name, r.version_no DESC
+  `;
+
+  const [rows] = await db.query(sql, params);
+  return {
+    code: 1,
+    message: "recetas obtenidas",
+    data: rows,
+  };
+};
+
+const getRecipeBaseData = async ({ onlyActive } = {}) => {
+  const db = await connect();
+  const activeFilter = onlyActive ? "WHERE is_active = 1" : "";
+
+  const [products] = await db.query(`
+    SELECT
+      id,
+      sku,
+      name,
+      description,
+      unit,
+      base_price,
+      is_active
+    FROM products
+    ${activeFilter}
+    ORDER BY name
+  `);
+
+  const [rawMaterials] = await db.query(`
+    SELECT
+      id,
+      sku,
+      name,
+      description,
+      unit,
+      unit_cost,
+      is_active
+    FROM raw_materials
+    ${activeFilter}
+    ORDER BY name
+  `);
+
+  return {
+    code: 1,
+    message: "catalogos de recetas obtenidos",
+    data: {
+      products,
+      raw_materials: rawMaterials,
+    },
+  };
 };
 
 const addRecipeItem = async (payload, actorUserId) => {
@@ -41,6 +121,8 @@ const publishRecipeVersion = async (payload, actorUserId) => {
 
 module.exports = {
   createRecipe,
+  listRecipes,
+  getRecipeBaseData,
   addRecipeItem,
   removeRecipeItem,
   publishRecipeVersion,

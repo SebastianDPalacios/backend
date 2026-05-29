@@ -1,11 +1,15 @@
 const express = require("express");
-const { verifyToken } = require("../middlewares/auth.handler");
+const { verifyToken, requirePermission } = require("../middlewares/auth.handler");
 const {
   listBranches,
   listCustomers,
   listRoutes,
   listProducts,
   listRawMaterials,
+  listTaxRates,
+  listProductCategories,
+  listRawMaterialCategories,
+  listSuppliers,
   createBranch,
   updateBranch,
   createTaxRate,
@@ -25,6 +29,10 @@ const {
 } = require("../services/catalog.service");
 
 const router = express.Router();
+const canManageProducts = requirePermission("products.manage");
+const canManageMaterials = requirePermission("materials.manage");
+const canManageCustomers = requirePermission("customers.manage");
+const canManageRoutes = requirePermission("routes.manage");
 
 router.get("/branches", verifyToken, async (req, res, next) => {
   try {
@@ -35,7 +43,7 @@ router.get("/branches", verifyToken, async (req, res, next) => {
   }
 });
 
-router.get("/customers", verifyToken, async (req, res, next) => {
+router.get("/customers", verifyToken, canManageCustomers, async (req, res, next) => {
   try {
     const result = await listCustomers({
       status: req.query.status,
@@ -49,7 +57,7 @@ router.get("/customers", verifyToken, async (req, res, next) => {
   }
 });
 
-router.get("/routes", verifyToken, async (req, res, next) => {
+router.get("/routes", verifyToken, canManageRoutes, async (req, res, next) => {
   try {
     const result = await listRoutes({
       onlyActive: req.query.onlyActive,
@@ -61,7 +69,7 @@ router.get("/routes", verifyToken, async (req, res, next) => {
   }
 });
 
-router.get("/products", verifyToken, async (req, res, next) => {
+router.get("/products", verifyToken, canManageProducts, async (req, res, next) => {
   try {
     const result = await listProducts({
       onlyActive: req.query.onlyActive,
@@ -76,11 +84,58 @@ router.get("/products", verifyToken, async (req, res, next) => {
   }
 });
 
-router.get("/raw-materials", verifyToken, async (req, res, next) => {
+router.get("/raw-materials", verifyToken, canManageMaterials, async (req, res, next) => {
   try {
     const result = await listRawMaterials({
       onlyActive: req.query.onlyActive,
       categoryId: req.query.categoryId,
+      search: req.query.search,
+      page: req.query.page,
+      pageSize: req.query.pageSize,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/tax-rates", verifyToken, canManageProducts, async (req, res, next) => {
+  try {
+    const result = await listTaxRates({
+      onlyActive: req.query.onlyActive,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/product-categories", verifyToken, canManageProducts, async (req, res, next) => {
+  try {
+    const result = await listProductCategories({
+      onlyActive: req.query.onlyActive,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/raw-material-categories", verifyToken, canManageMaterials, async (req, res, next) => {
+  try {
+    const result = await listRawMaterialCategories({
+      onlyActive: req.query.onlyActive,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/suppliers", verifyToken, canManageMaterials, async (req, res, next) => {
+  try {
+    const result = await listSuppliers({
+      status: req.query.status,
       search: req.query.search,
       page: req.query.page,
       pageSize: req.query.pageSize,
@@ -112,7 +167,7 @@ router.put("/branches/:id", verifyToken, async (req, res, next) => {
   }
 });
 
-router.post("/tax-rates", verifyToken, async (req, res, next) => {
+router.post("/tax-rates", verifyToken, canManageProducts, async (req, res, next) => {
   try {
     const result = await createTaxRate(req.body, req.user.userId);
     res.json(result);
@@ -121,7 +176,7 @@ router.post("/tax-rates", verifyToken, async (req, res, next) => {
   }
 });
 
-router.put("/tax-rates/:id", verifyToken, async (req, res, next) => {
+router.put("/tax-rates/:id", verifyToken, canManageProducts, async (req, res, next) => {
   try {
     const result = await updateTaxRate(
       { ...req.body, p_tax_rate_id: Number(req.params.id) },
@@ -133,7 +188,7 @@ router.put("/tax-rates/:id", verifyToken, async (req, res, next) => {
   }
 });
 
-router.post("/product-categories", verifyToken, async (req, res, next) => {
+router.post("/product-categories", verifyToken, canManageProducts, async (req, res, next) => {
   try {
     const result = await createProductCategory(req.body, req.user.userId);
     res.json(result);
@@ -142,7 +197,7 @@ router.post("/product-categories", verifyToken, async (req, res, next) => {
   }
 });
 
-router.put("/product-categories/:id", verifyToken, async (req, res, next) => {
+router.put("/product-categories/:id", verifyToken, canManageProducts, async (req, res, next) => {
   try {
     const result = await updateProductCategory(
       { ...req.body, p_category_id: Number(req.params.id) },
@@ -154,7 +209,7 @@ router.put("/product-categories/:id", verifyToken, async (req, res, next) => {
   }
 });
 
-router.post("/raw-material-categories", verifyToken, async (req, res, next) => {
+router.post("/raw-material-categories", verifyToken, canManageMaterials, async (req, res, next) => {
   try {
     const result = await createRawMaterialCategory(req.body, req.user.userId);
     res.json(result);
@@ -163,7 +218,7 @@ router.post("/raw-material-categories", verifyToken, async (req, res, next) => {
   }
 });
 
-router.put("/raw-material-categories/:id", verifyToken, async (req, res, next) => {
+router.put("/raw-material-categories/:id", verifyToken, canManageMaterials, async (req, res, next) => {
   try {
     const result = await updateRawMaterialCategory(
       { ...req.body, p_category_id: Number(req.params.id) },
@@ -175,7 +230,7 @@ router.put("/raw-material-categories/:id", verifyToken, async (req, res, next) =
   }
 });
 
-router.post("/suppliers", verifyToken, async (req, res, next) => {
+router.post("/suppliers", verifyToken, canManageMaterials, async (req, res, next) => {
   try {
     const result = await createSupplier(req.body, req.user.userId);
     res.json(result);
@@ -184,7 +239,7 @@ router.post("/suppliers", verifyToken, async (req, res, next) => {
   }
 });
 
-router.put("/suppliers/:id", verifyToken, async (req, res, next) => {
+router.put("/suppliers/:id", verifyToken, canManageMaterials, async (req, res, next) => {
   try {
     const result = await updateSupplier(
       { ...req.body, p_supplier_id: Number(req.params.id) },
@@ -196,7 +251,7 @@ router.put("/suppliers/:id", verifyToken, async (req, res, next) => {
   }
 });
 
-router.post("/products", verifyToken, async (req, res, next) => {
+router.post("/products", verifyToken, canManageProducts, async (req, res, next) => {
   try {
     const result = await createProduct(req.body, req.user.userId);
     res.json(result);
@@ -205,7 +260,7 @@ router.post("/products", verifyToken, async (req, res, next) => {
   }
 });
 
-router.put("/products/:id", verifyToken, async (req, res, next) => {
+router.put("/products/:id", verifyToken, canManageProducts, async (req, res, next) => {
   try {
     const result = await updateProduct(
       { ...req.body, p_product_id: Number(req.params.id) },
@@ -217,7 +272,7 @@ router.put("/products/:id", verifyToken, async (req, res, next) => {
   }
 });
 
-router.patch("/products/:id/status", verifyToken, async (req, res, next) => {
+router.patch("/products/:id/status", verifyToken, canManageProducts, async (req, res, next) => {
   try {
     const result = await setProductStatus(
       { ...req.body, p_product_id: Number(req.params.id) },
@@ -229,7 +284,7 @@ router.patch("/products/:id/status", verifyToken, async (req, res, next) => {
   }
 });
 
-router.post("/raw-materials", verifyToken, async (req, res, next) => {
+router.post("/raw-materials", verifyToken, canManageMaterials, async (req, res, next) => {
   try {
     const result = await createRawMaterial(req.body, req.user.userId);
     res.json(result);
@@ -238,7 +293,7 @@ router.post("/raw-materials", verifyToken, async (req, res, next) => {
   }
 });
 
-router.put("/raw-materials/:id", verifyToken, async (req, res, next) => {
+router.put("/raw-materials/:id", verifyToken, canManageMaterials, async (req, res, next) => {
   try {
     const result = await updateRawMaterial(
       { ...req.body, p_raw_material_id: Number(req.params.id) },
@@ -250,7 +305,7 @@ router.put("/raw-materials/:id", verifyToken, async (req, res, next) => {
   }
 });
 
-router.patch("/raw-materials/:id/status", verifyToken, async (req, res, next) => {
+router.patch("/raw-materials/:id/status", verifyToken, canManageMaterials, async (req, res, next) => {
   try {
     const result = await setRawMaterialStatus(
       { ...req.body, p_raw_material_id: Number(req.params.id) },

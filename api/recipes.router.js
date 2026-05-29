@@ -1,15 +1,18 @@
 const express = require("express");
-const { verifyToken } = require("../middlewares/auth.handler");
+const { verifyToken, requirePermission } = require("../middlewares/auth.handler");
 const {
   createRecipe,
+  listRecipes,
+  getRecipeBaseData,
   addRecipeItem,
   removeRecipeItem,
   publishRecipeVersion,
 } = require("../services/recipes.service");
 
 const router = express.Router();
+const canManageRecipes = requirePermission("recipes.manage");
 
-router.post("/", verifyToken, async (req, res, next) => {
+router.post("/", verifyToken, canManageRecipes, async (req, res, next) => {
   try {
     const result = await createRecipe(req.body, req.user.userId);
     res.json(result);
@@ -18,7 +21,30 @@ router.post("/", verifyToken, async (req, res, next) => {
   }
 });
 
-router.post("/:id/items", verifyToken, async (req, res, next) => {
+router.get("/", verifyToken, canManageRecipes, async (req, res, next) => {
+  try {
+    const result = await listRecipes({
+      onlyActive: req.query.onlyActive,
+      productId: req.query.product_id,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/base-data", verifyToken, canManageRecipes, async (req, res, next) => {
+  try {
+    const result = await getRecipeBaseData({
+      onlyActive: req.query.onlyActive,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/:id/items", verifyToken, canManageRecipes, async (req, res, next) => {
   try {
     const result = await addRecipeItem(
       { ...req.body, p_recipe_id: Number(req.params.id) },
@@ -30,7 +56,7 @@ router.post("/:id/items", verifyToken, async (req, res, next) => {
   }
 });
 
-router.delete("/:id/items/:rawMaterialId", verifyToken, async (req, res, next) => {
+router.delete("/:id/items/:rawMaterialId", verifyToken, canManageRecipes, async (req, res, next) => {
   try {
     const result = await removeRecipeItem(
       {
@@ -45,7 +71,7 @@ router.delete("/:id/items/:rawMaterialId", verifyToken, async (req, res, next) =
   }
 });
 
-router.post("/:id/publish", verifyToken, async (req, res, next) => {
+router.post("/:id/publish", verifyToken, canManageRecipes, async (req, res, next) => {
   try {
     const result = await publishRecipeVersion(
       { p_recipe_id: Number(req.params.id) },

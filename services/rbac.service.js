@@ -1,5 +1,58 @@
-const { callProcedure } = require("../data-access");
+const { callProcedure, connect } = require("../data-access");
 const { mapSpResult } = require("./sp-response");
+
+const listRoles = async () => {
+  const db = await connect();
+  const [rows] = await db.query(`
+    SELECT
+      r.id,
+      r.code,
+      r.name,
+      r.description,
+      r.is_system_role,
+      r.created_at,
+      COALESCE(
+        JSON_ARRAYAGG(
+          CASE
+            WHEN p.code IS NULL THEN NULL
+            ELSE p.code
+          END
+        ),
+        JSON_ARRAY()
+      ) AS permissions
+    FROM roles r
+    LEFT JOIN role_permissions rp ON rp.role_id = r.id
+    LEFT JOIN permissions p ON p.id = rp.permission_id
+    GROUP BY r.id, r.code, r.name, r.description, r.is_system_role, r.created_at
+    ORDER BY r.is_system_role DESC, r.code ASC
+  `);
+
+  return {
+    code: 1,
+    message: "roles listados",
+    data: {
+      items: rows.map((role) => ({
+        ...role,
+        permissions: Array.isArray(role.permissions) ? role.permissions.filter(Boolean) : [],
+      })),
+    },
+  };
+};
+
+const listPermissions = async () => {
+  const db = await connect();
+  const [rows] = await db.query(`
+    SELECT id, code, name, description, created_at
+    FROM permissions
+    ORDER BY code ASC
+  `);
+
+  return {
+    code: 1,
+    message: "permisos listados",
+    data: { items: rows },
+  };
+};
 
 const createRole = async (payload, actorUserId) => {
   const out = await callProcedure("sp_role_create", [
@@ -47,6 +100,8 @@ const setRolePermissions = async (payload, actorUserId) => {
 };
 
 module.exports = {
+  listRoles,
+  listPermissions,
   createRole,
   updateRole,
   createPermission,

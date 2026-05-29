@@ -54,7 +54,16 @@ const callProcedure = async (name, inputs = []) => {
   const db = await connect();
   const inPlaceholders = inputs.map(() => "?").join(",");
   const callArgs = inPlaceholders ? `${inPlaceholders}, @o_code, @o_message, @o_data_json` : "@o_code, @o_message, @o_data_json";
-  const sql = `SET @o_code = 0, @o_message = '', @o_data_json = NULL; CALL ${name}(${callArgs}); SELECT @o_code AS o_code, @o_message AS o_message, @o_data_json AS o_data_json;`;
+  const sql = `SET SESSION group_concat_max_len = 1048576; SET @o_code = 0, @o_message = '', @o_data_json = NULL; CALL ${name}(${callArgs}); SELECT @o_code AS o_code, @o_message AS o_message, @o_data_json AS o_data_json;`;
+  const [resultSets] = await db.query(sql, inputs);
+  return normalizeOutRow(resultSets);
+};
+
+const callProcedureWithoutData = async (name, inputs = []) => {
+  const db = await connect();
+  const inPlaceholders = inputs.map(() => "?").join(",");
+  const callArgs = inPlaceholders ? `${inPlaceholders}, @o_code, @o_message` : "@o_code, @o_message";
+  const sql = `SET @o_code = 0, @o_message = ''; CALL ${name}(${callArgs}); SELECT @o_code AS o_code, @o_message AS o_message, NULL AS o_data_json;`;
   const [resultSets] = await db.query(sql, inputs);
   return normalizeOutRow(resultSets);
 };
@@ -62,4 +71,5 @@ const callProcedure = async (name, inputs = []) => {
 module.exports = {
   connect,
   callProcedure,
+  callProcedureWithoutData,
 };
