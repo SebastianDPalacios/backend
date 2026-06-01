@@ -66,4 +66,19 @@ router.post("/logout", verifyToken, async (req, res, next) => {
   }
 });
 
+router.get("/session", verifyToken, async (req, res, next) => {
+  try {
+    res.json({
+      code: 1,
+      message: "sesion activa",
+      data: {
+        user_id: req.user.userId,
+        session_id: req.user.sessionId,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;

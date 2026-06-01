@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const boom = require("@hapi/boom");
+const { connect } = require("../data-access");
 
 const signToken = (payload, secret, expiresIn) => {
   return jwt.sign(payload, secret || process.env.JWT_SECRET, {
@@ -7,7 +8,32 @@ const signToken = (payload, secret, expiresIn) => {
   });
 };
 
-const verifyToken = (req, res, next) => {
+const assertSessionIsActive = async (user) => {
+  const userId = Number(user?.userId);
+  const sessionId = Number(user?.sessionId);
+
+  if (!Number.isInteger(userId) || userId <= 0 || !Number.isInteger(sessionId) || sessionId <= 0) {
+    throw boom.unauthorized("sesion invalida");
+  }
+
+  const db = await connect();
+  const [rows] = await db.query(
+    `SELECT id
+       FROM user_sessions
+      WHERE id = ?
+        AND user_id = ?
+        AND revoked_at IS NULL
+        AND expires_at > CURRENT_TIMESTAMP
+      LIMIT 1`,
+    [sessionId, userId]
+  );
+
+  if (!rows.length) {
+    throw boom.unauthorized("sesion revocada o expirada");
+  }
+};
+
+const verifyToken = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization || "";
     if (!authHeader.startsWith("Bearer ")) {
@@ -17,9 +43,10 @@ const verifyToken = (req, res, next) => {
     const token = authHeader.slice(7);
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded.user;
+    await assertSessionIsActive(req.user);
     next();
   } catch (error) {
-    next(boom.unauthorized("token invalido o expirado"));
+    next(boom.unauthorized(error?.message || "token invalido o expirado"));
   }
 };
 

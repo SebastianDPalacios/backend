@@ -1,10 +1,10 @@
 const { callProcedure, callProcedureWithoutData, connect } = require("../data-access");
 const { mapSpResult } = require("./sp-response");
 
-const listOrders = async ({ status, search, page, pageSize }) => {
+const listOrders = async ({ status, search, dateFrom, dateTo, page, pageSize }) => {
   const db = await connect();
   const currentPage = Math.max(Number(page || 1), 1);
-  const currentPageSize = Math.min(Math.max(Number(pageSize || 20), 1), 100);
+  const currentPageSize = Math.min(Math.max(Number(pageSize || 20), 1), 500);
   const offset = (currentPage - 1) * currentPageSize;
   const filters = [];
   const values = [];
@@ -17,6 +17,16 @@ const listOrders = async ({ status, search, page, pageSize }) => {
   if (search) {
     filters.push("(CAST(o.id AS CHAR) LIKE ? OR c.name LIKE ? OR r.name LIKE ?)");
     values.push(`%${search}%`, `%${search}%`, `%${search}%`);
+  }
+
+  if (dateFrom) {
+    filters.push("o.order_date >= ?");
+    values.push(String(dateFrom).slice(0, 10));
+  }
+
+  if (dateTo) {
+    filters.push("o.order_date <= ?");
+    values.push(String(dateTo).slice(0, 10));
   }
 
   const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";

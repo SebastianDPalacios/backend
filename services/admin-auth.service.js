@@ -39,7 +39,7 @@ const createUser = async (payload, actorUserId) => {
     payload.p_full_name || null,
     payload.p_phone || null,
     payload.p_role_code || null,
-    payload.p_must_change_password || null,
+    payload.p_must_change_password ?? null,
     actorUserId || null,
   ]);
   return mapSpResult(out);
@@ -110,8 +110,8 @@ const resetUserPasswordByAdmin = async (payload, actorUserId) => {
     payload.p_target_user_id,
     passwordHash,
     payload.p_new_password_algo || "bcrypt",
-    payload.p_force_change_next_login || null,
-    payload.p_revoke_all_sessions || null,
+    payload.p_force_change_next_login ?? null,
+    payload.p_revoke_all_sessions ?? null,
     actorUserId || null,
   ]);
   return mapSpResult(out);
@@ -135,7 +135,7 @@ const changeOwnPassword = async (payload, actorUserId) => {
     payload.p_expected_current_hash || null,
     passwordHash,
     payload.p_new_password_algo || "bcrypt",
-    payload.p_revoke_all_sessions || null,
+    payload.p_revoke_all_sessions ?? null,
     actorUserId || null,
   ]);
   return mapSpResult(out);

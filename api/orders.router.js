@@ -24,6 +24,8 @@ router.get("/", verifyToken, canManageOrders, async (req, res, next) => {
     const result = await listOrders({
       status: req.query.status,
       search: req.query.search,
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
       page: req.query.page,
       pageSize: req.query.pageSize,
     });

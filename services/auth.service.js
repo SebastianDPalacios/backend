@@ -60,6 +60,7 @@ const login = async ({ identifier, password, ipAddress, userAgent }) => {
   const accessToken = signToken({
     user: {
       userId: start.data.user_id,
+      sessionId: success.data.session_id,
       username: start.data.username,
       email: start.data.email,
       roles,
@@ -110,6 +111,7 @@ const refreshSession = async ({ sessionId, userId, refreshToken }) => {
   const accessToken = signToken({
     user: {
       userId,
+      sessionId,
       roles: permissions.data ? permissions.data.roles : [],
       permissions: permissions.data ? permissions.data.permissions : [],
     },
