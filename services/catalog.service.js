@@ -1,5 +1,65 @@
-const { callProcedure } = require("../data-access");
+const { callProcedure, connect } = require("../data-access");
 const { mapSpResult } = require("./sp-response");
+
+const getRows = (payload) => {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (Array.isArray(payload?.rows)) return payload.rows;
+  return [];
+};
+
+const withRows = (payload, rows) => {
+  if (Array.isArray(payload)) return rows;
+  if (Array.isArray(payload?.items)) return { ...payload, items: rows };
+  if (Array.isArray(payload?.rows)) return { ...payload, rows };
+  return payload;
+};
+
+const normalizePurchasePackage = (payload) => {
+  const name = String(payload.p_purchase_package_name || payload.purchase_package_name || "").trim();
+  const quantity = Number(payload.p_purchase_package_quantity ?? payload.purchase_package_quantity ?? 0);
+
+  return {
+    name: name || null,
+    quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : null,
+  };
+};
+
+const saveRawMaterialPurchasePackage = async (rawMaterialId, payload) => {
+  const packageData = normalizePurchasePackage(payload);
+  const db = await connect();
+
+  await db.query(
+    "UPDATE raw_materials SET purchase_package_name = ?, purchase_package_quantity = ? WHERE id = ?",
+    [packageData.name, packageData.quantity, rawMaterialId]
+  );
+};
+
+const enrichRawMaterialPackages = async (payload) => {
+  const rows = getRows(payload);
+  const ids = rows.map((row) => Number(row.id || 0)).filter((id) => id > 0);
+
+  if (!ids.length) {
+    return payload;
+  }
+
+  const placeholders = ids.map(() => "?").join(",");
+  const db = await connect();
+  const [packageRows] = await db.query(
+    `SELECT id, purchase_package_name, purchase_package_quantity FROM raw_materials WHERE id IN (${placeholders})`,
+    ids
+  );
+  const packageById = new Map(packageRows.map((row) => [Number(row.id), row]));
+
+  return withRows(
+    payload,
+    rows.map((row) => ({
+      ...row,
+      purchase_package_name: packageById.get(Number(row.id))?.purchase_package_name || null,
+      purchase_package_quantity: packageById.get(Number(row.id))?.purchase_package_quantity || null,
+    }))
+  );
+};
 
 const listBranches = async ({ onlyActive }) => {
   const out = await callProcedure("sp_branch_list", [Number(onlyActive || 0)]);
@@ -43,7 +103,16 @@ const listRawMaterials = async ({ onlyActive, categoryId, search, page, pageSize
     Number(page || 1),
     Number(pageSize || 20),
   ]);
-  return mapSpResult(out);
+  const result = mapSpResult(out);
+
+  if (result.code !== 1) {
+    return result;
+  }
+
+  return {
+    ...result,
+    data: await enrichRawMaterialPackages(result.data),
+  };
 };
 
 const listTaxRates = async ({ onlyActive }) => {
@@ -195,8 +264,8 @@ const createProduct = async (payload, actorUserId) => {
     payload.p_category_id || null,
     payload.p_tax_rate_id || null,
     payload.p_unit || null,
-    payload.p_base_price || null,
-    payload.p_min_stock || null,
+    payload.p_base_price ?? null,
+    payload.p_min_stock ?? null,
     payload.p_is_active || null,
     actorUserId || null,
   ]);
@@ -211,8 +280,8 @@ const updateProduct = async (payload, actorUserId) => {
     payload.p_category_id || null,
     payload.p_tax_rate_id || null,
     payload.p_unit || null,
-    payload.p_base_price || null,
-    payload.p_min_stock || null,
+    payload.p_base_price ?? null,
+    payload.p_min_stock ?? null,
     payload.p_is_active || null,
     actorUserId || null,
   ]);
@@ -229,19 +298,43 @@ const setProductStatus = async (payload, actorUserId) => {
 };
 
 const createRawMaterial = async (payload, actorUserId) => {
+  const shouldAutoGenerateSku = !payload.p_sku;
+  const temporarySku = shouldAutoGenerateSku ? `RM-TMP-${Date.now()}-${Math.floor(Math.random() * 1000)}` : payload.p_sku;
+
   const out = await callProcedure("sp_raw_material_create", [
-    payload.p_sku || null,
+    temporarySku,
     payload.p_name || null,
     payload.p_description || null,
     payload.p_category_id || null,
     payload.p_supplier_id || null,
     payload.p_unit || null,
-    payload.p_unit_cost || null,
-    payload.p_min_stock || null,
-    payload.p_is_active || null,
+    payload.p_unit_cost ?? null,
+    payload.p_min_stock ?? null,
+    payload.p_is_active ?? null,
     actorUserId || null,
   ]);
-  return mapSpResult(out);
+  const result = mapSpResult(out);
+
+  if (!shouldAutoGenerateSku || result.code !== 1 || !result.data?.raw_material_id) {
+    if (result.code === 1 && result.data?.raw_material_id) {
+      await saveRawMaterialPurchasePackage(Number(result.data.raw_material_id), payload);
+    }
+    return result;
+  }
+
+  const rawMaterialId = Number(result.data.raw_material_id);
+  const sku = `RM-${String(rawMaterialId).padStart(6, "0")}`;
+  const db = await connect();
+  await db.query("UPDATE raw_materials SET sku = ? WHERE id = ?", [sku, rawMaterialId]);
+  await saveRawMaterialPurchasePackage(rawMaterialId, payload);
+
+  return {
+    ...result,
+    data: {
+      ...result.data,
+      sku,
+    },
+  };
 };
 
 const updateRawMaterial = async (payload, actorUserId) => {
@@ -252,18 +345,24 @@ const updateRawMaterial = async (payload, actorUserId) => {
     payload.p_category_id || null,
     payload.p_supplier_id || null,
     payload.p_unit || null,
-    payload.p_unit_cost || null,
-    payload.p_min_stock || null,
-    payload.p_is_active || null,
+    payload.p_unit_cost ?? null,
+    payload.p_min_stock ?? null,
+    payload.p_is_active ?? null,
     actorUserId || null,
   ]);
-  return mapSpResult(out);
+  const result = mapSpResult(out);
+
+  if (result.code === 1) {
+    await saveRawMaterialPurchasePackage(Number(payload.p_raw_material_id), payload);
+  }
+
+  return result;
 };
 
 const setRawMaterialStatus = async (payload, actorUserId) => {
   const out = await callProcedure("sp_raw_material_set_status", [
     payload.p_raw_material_id,
-    payload.p_is_active || null,
+    payload.p_is_active ?? null,
     actorUserId || null,
   ]);
   return mapSpResult(out);

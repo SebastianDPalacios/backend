@@ -10,12 +10,108 @@ const {
   registerProductionOrderItemResult,
   listProductionBaseData,
   registerProductionResult,
+  registerProductionBatch,
+  listPendingPackaging,
+  createPackingReport,
+  listJustifiedShortages,
+  registerProductionDamage,
+  getRawMaterialUsageReport,
+  getPackingSummaryReport,
+  getProductionDayReport,
+  getProductionMonthReport,
+  createProductionPlan,
+  listProductionPlans,
+  startProductionPlanItem,
+  finishProductionPlanItem,
+  listUserNotifications,
+  markUserNotificationViewed,
   closeProductionOrder,
   cancelProductionOrder,
 } = require("../services/production.service");
 
 const router = express.Router();
 const canManageProduction = requirePermission("production.manage");
+
+router.get("/plans", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await listProductionPlans({
+      plannedDate: req.query.plannedDate || req.query.planned_date,
+      bakerEmployeeId: req.query.bakerEmployeeId || req.query.baker_employee_id,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/plans", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await createProductionPlan(req.body, req.user.userId);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/my-plans", verifyToken, async (req, res, next) => {
+  try {
+    const result = await listProductionPlans({
+      userId: req.user.userId,
+      plannedDate: req.query.plannedDate || req.query.planned_date,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/plans/items/:id/start", verifyToken, async (req, res, next) => {
+  try {
+    const result = await startProductionPlanItem({
+      productionPlanItemId: Number(req.params.id),
+      userId: req.user.userId,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/plans/items/:id/finish", verifyToken, async (req, res, next) => {
+  try {
+    const result = await finishProductionPlanItem({
+      productionPlanItemId: Number(req.params.id),
+      userId: req.user.userId,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/notifications", verifyToken, async (req, res, next) => {
+  try {
+    const result = await listUserNotifications({
+      userId: req.user.userId,
+      onlyUnread: req.query.onlyUnread === "1",
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.patch("/notifications/:id/viewed", verifyToken, async (req, res, next) => {
+  try {
+    const result = await markUserNotificationViewed({
+      notificationId: Number(req.params.id),
+      userId: req.user.userId,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
 
 router.get("/orders", verifyToken, canManageProduction, async (req, res, next) => {
   try {
@@ -128,6 +224,119 @@ router.get("/base-data", verifyToken, canManageProduction, async (req, res, next
 router.post("/results", verifyToken, canManageProduction, async (req, res, next) => {
   try {
     const result = await registerProductionResult(req.body, req.user.userId);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/batches", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await registerProductionBatch(req.body, req.user.userId);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/packaging/pending", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await listPendingPackaging({
+      branchId: req.query.branchId || req.query.branch_id,
+      search: req.query.search,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/packaging/reports", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await createPackingReport(req.body, req.user.userId);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/packaging/shortages", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await listJustifiedShortages({
+      branchId: req.query.branchId || req.query.branch_id,
+      productId: req.query.productId || req.query.product_id,
+      missingReason: req.query.missingReason || req.query.missing_reason,
+      search: req.query.search,
+      dateFrom: req.query.dateFrom || req.query.date_from,
+      dateTo: req.query.dateTo || req.query.date_to,
+      page: req.query.page,
+      pageSize: req.query.pageSize,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/damages", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await registerProductionDamage(req.body, req.user.userId);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/reports/raw-material-usage", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await getRawMaterialUsageReport({
+      dateFrom: req.query.dateFrom || req.query.date_from,
+      dateTo: req.query.dateTo || req.query.date_to,
+      branchId: req.query.branchId || req.query.branch_id,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/reports/packing-summary", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await getPackingSummaryReport({
+      dateFrom: req.query.dateFrom || req.query.date_from,
+      dateTo: req.query.dateTo || req.query.date_to,
+      branchId: req.query.branchId || req.query.branch_id,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/reports/day", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await getProductionDayReport({
+      date: req.query.date,
+      dateFrom: req.query.dateFrom || req.query.date_from,
+      dateTo: req.query.dateTo || req.query.date_to,
+      branchId: req.query.branchId || req.query.branch_id,
+      recipeId: req.query.recipeId || req.query.recipe_id,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/reports/month", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await getProductionMonthReport({
+      month: req.query.month,
+      dateFrom: req.query.dateFrom || req.query.date_from,
+      dateTo: req.query.dateTo || req.query.date_to,
+      branchId: req.query.branchId || req.query.branch_id,
+      recipeId: req.query.recipeId || req.query.recipe_id,
+    });
     res.json(result);
   } catch (error) {
     next(error);

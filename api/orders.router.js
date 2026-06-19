@@ -3,21 +3,51 @@ const { verifyToken, requirePermission } = require("../middlewares/auth.handler"
 const {
   listOrders,
   listOrderItems,
+  listProductionReservations,
+  listProductionReservationOptions,
   listOrderBaseData,
+  listSellerCustomerAssignments,
+  assignCustomerToSeller,
+  syncSellerCustomers,
+  unassignCustomerFromSeller,
+  getSalesSettings,
+  updateSalesSettings,
   createOrder,
+  getOrderPrintData,
+  confirmOrderPrint,
   upsertOrderItem,
+  createProductionReservation,
+  deliverProductionReservation,
+  releaseProductionReservation,
   confirmOrder,
   cancelOrder,
   dispatchOrder,
+  deliverOrder,
+  listSalesCommissions,
+  getDailySalesSettlement,
+  listSalesReturnOptions,
+  listSalesReturns,
+  createSalesReturn,
+  authorizeSalesReturn,
+  rejectSalesReturn,
   createProductionFromOrder,
   createPurchaseOrder,
   listPendingPurchaseOrders,
+  listPurchaseOrderHistory,
+  getPurchaseOrderDetail,
   receivePurchaseOrder,
 } = require("../services/orders.service");
 
 const router = express.Router();
 const canManageOrders = requirePermission("orders.manage");
 const canManageInventory = requirePermission("inventory.manage");
+const canConfigureSales = requirePermission("roles.manage");
+const hasElevatedCustomerAccess = (user = {}) => {
+  const roles = Array.isArray(user.roles) ? user.roles : [];
+  const roleCodes = roles.map((role) => (typeof role === "string" ? role : role?.code)).filter(Boolean);
+
+  return roleCodes.some((code) => ["ADMIN", "SUPER_ADMIN"].includes(code));
+};
 
 router.get("/", verifyToken, canManageOrders, async (req, res, next) => {
   try {
@@ -28,6 +58,8 @@ router.get("/", verifyToken, canManageOrders, async (req, res, next) => {
       dateTo: req.query.dateTo,
       page: req.query.page,
       pageSize: req.query.pageSize,
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
     });
     res.json(result);
   } catch (error) {
@@ -43,6 +75,8 @@ router.get("/base-data", verifyToken, canManageOrders, async (req, res, next) =>
       page: req.query.page,
       pageSize: req.query.pageSize,
       refDate: req.query.refDate,
+      actorUserId: req.user.userId,
+      canViewAllCustomers: hasElevatedCustomerAccess(req.user),
     });
     res.json(result);
   } catch (error) {
@@ -52,7 +86,166 @@ router.get("/base-data", verifyToken, canManageOrders, async (req, res, next) =>
 
 router.post("/", verifyToken, canManageOrders, async (req, res, next) => {
   try {
-    const result = await createOrder(req.body, req.user.userId);
+    const result = await createOrder(req.body, req.user.userId, {
+      canViewAllCustomers: hasElevatedCustomerAccess(req.user),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/settings/sales", verifyToken, canConfigureSales, async (req, res, next) => {
+  try {
+    const result = await getSalesSettings();
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/seller-customer-assignments", verifyToken, canConfigureSales, async (req, res, next) => {
+  try {
+    const result = await listSellerCustomerAssignments();
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.put("/seller-customer-assignments/:customerId", verifyToken, canConfigureSales, async (req, res, next) => {
+  try {
+    const result = await assignCustomerToSeller(
+      {
+        customerId: Number(req.params.customerId),
+        salesAgentUserId: Number(req.body?.sales_agent_user_id),
+      },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.put("/seller-customer-assignments/seller/:sellerId", verifyToken, canConfigureSales, async (req, res, next) => {
+  try {
+    const result = await syncSellerCustomers(
+      {
+        salesAgentUserId: Number(req.params.sellerId),
+        customerIds: req.body?.customer_ids,
+      },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.delete("/seller-customer-assignments/:customerId", verifyToken, canConfigureSales, async (req, res, next) => {
+  try {
+    const result = await unassignCustomerFromSeller(
+      { customerId: Number(req.params.customerId) },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/commissions", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await listSalesCommissions({
+      salesAgentUserId: req.query.salesAgentUserId,
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/commissions/daily-settlement", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await getDailySalesSettlement({
+      salesAgentUserId: req.query.salesAgentUserId,
+      settlementDate: req.query.date,
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/returns/options", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await listSalesReturnOptions({
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/returns", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await listSalesReturns({
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
+      status: req.query.status,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/returns", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await createSalesReturn(req.body, req.user.userId);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/returns/:id/authorize", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await authorizeSalesReturn(
+      { salesReturnId: Number(req.params.id) },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/returns/:id/reject", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await rejectSalesReturn(
+      {
+        salesReturnId: Number(req.params.id),
+        reason: req.body?.reason,
+      },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.put("/settings/sales", verifyToken, canConfigureSales, async (req, res, next) => {
+  try {
+    const result = await updateSalesSettings(req.body, req.user.userId);
     res.json(result);
   } catch (error) {
     next(error);
@@ -66,6 +259,34 @@ router.get("/purchase-orders/pending", verifyToken, canManageInventory, async (r
       search: req.query.search,
       page: req.query.page,
       pageSize: req.query.pageSize,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/purchase-orders/history", verifyToken, canManageInventory, async (req, res, next) => {
+  try {
+    const result = await listPurchaseOrderHistory({
+      branchId: req.query.branchId,
+      supplierId: req.query.supplierId,
+      search: req.query.search,
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
+      page: req.query.page,
+      pageSize: req.query.pageSize,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/purchase-orders/:id/detail", verifyToken, canManageInventory, async (req, res, next) => {
+  try {
+    const result = await getPurchaseOrderDetail({
+      purchaseOrderId: Number(req.params.id),
     });
     res.json(result);
   } catch (error) {
@@ -87,6 +308,86 @@ router.get("/:id/items", verifyToken, canManageOrders, async (req, res, next) =>
     const result = await listOrderItems({
       orderId: Number(req.params.id),
     });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/:id/print-data", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await getOrderPrintData({
+      orderId: Number(req.params.id),
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/:id/confirm-print", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await confirmOrderPrint({
+      orderId: Number(req.params.id),
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/:id/production-reservations", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await listProductionReservations({ orderId: Number(req.params.id) });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/:id/production-reservation-options", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await listProductionReservationOptions({ orderId: Number(req.params.id) });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/:id/production-reservations", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await createProductionReservation(
+      { ...req.body, p_order_id: Number(req.params.id) },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/production-reservations/:id/deliver", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await deliverProductionReservation(
+      { reservationId: Number(req.params.id) },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/production-reservations/:id/release", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await releaseProductionReservation(
+      { reservationId: Number(req.params.id) },
+      req.user.userId
+    );
     res.json(result);
   } catch (error) {
     next(error);
@@ -132,6 +433,18 @@ router.post("/:id/cancel", verifyToken, canManageOrders, async (req, res, next) 
 router.post("/:id/dispatch", verifyToken, canManageOrders, async (req, res, next) => {
   try {
     const result = await dispatchOrder(
+      { p_order_id: Number(req.params.id) },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/:id/deliver", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await deliverOrder(
       { p_order_id: Number(req.params.id) },
       req.user.userId
     );

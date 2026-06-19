@@ -41,6 +41,32 @@ const enrichStock = (payload, stockRows, itemKey) => {
   );
 };
 
+const enrichRawMaterialPackages = async (payload) => {
+  const rows = getRows(payload);
+  const ids = rows.map((row) => Number(row.id || 0)).filter((id) => id > 0);
+
+  if (!ids.length) {
+    return payload;
+  }
+
+  const placeholders = ids.map(() => "?").join(",");
+  const db = await connect();
+  const [packageRows] = await db.query(
+    `SELECT id, purchase_package_name, purchase_package_quantity FROM raw_materials WHERE id IN (${placeholders})`,
+    ids
+  );
+  const packageById = new Map(packageRows.map((row) => [Number(row.id), row]));
+
+  return withItems(
+    payload,
+    rows.map((row) => ({
+      ...row,
+      purchase_package_name: packageById.get(Number(row.id))?.purchase_package_name || null,
+      purchase_package_quantity: packageById.get(Number(row.id))?.purchase_package_quantity || null,
+    }))
+  );
+};
+
 const MAX_INVENTORY_QUANTITY = 99999999999.999;
 
 const listInventoryBaseData = async ({ onlyActive, search, page, pageSize, branchId }) => {
@@ -92,7 +118,7 @@ const listInventoryBaseData = async ({ onlyActive, search, page, pageSize, branc
   const branchRows = getRows(branches.data);
   const selectedBranchId = Number(branchId || branchRows[0]?.id || 0);
   let productsData = products.data;
-  let rawMaterialsData = rawMaterials.data;
+  let rawMaterialsData = await enrichRawMaterialPackages(rawMaterials.data);
 
   if (selectedBranchId > 0) {
     const db = await connect();
@@ -108,7 +134,7 @@ const listInventoryBaseData = async ({ onlyActive, search, page, pageSize, branc
     ]);
 
     productsData = enrichStock(products.data, productStockRows[0], "product_id");
-    rawMaterialsData = enrichStock(rawMaterials.data, rawMaterialStockRows[0], "raw_material_id");
+    rawMaterialsData = enrichStock(rawMaterialsData, rawMaterialStockRows[0], "raw_material_id");
   }
 
   return {
@@ -158,7 +184,136 @@ const applyInventoryMovement = async (payload, actorUserId) => {
   return mapSpResult(out);
 };
 
+const listInventoryMovements = async ({ branchId, itemType, movementType, search, dateFrom, dateTo, page, pageSize } = {}) => {
+  const db = await connect();
+  const filters = [];
+  const params = [];
+  const limit = Math.min(Math.max(Number(pageSize || 12), 1), 100);
+  const currentPage = Math.max(Number(page || 1), 1);
+  const offset = (currentPage - 1) * limit;
+
+  if (branchId) {
+    filters.push("im.branch_id = ?");
+    params.push(Number(branchId));
+  }
+
+  if (itemType && itemType !== "all") {
+    filters.push("im.item_type = ?");
+    params.push(itemType);
+  }
+
+  if (movementType && movementType !== "all") {
+    filters.push("im.movement_type = ?");
+    params.push(movementType);
+  }
+
+  if (dateFrom) {
+    filters.push("DATE(im.moved_at) >= ?");
+    params.push(String(dateFrom).slice(0, 10));
+  }
+
+  if (dateTo) {
+    filters.push("DATE(im.moved_at) <= ?");
+    params.push(String(dateTo).slice(0, 10));
+  }
+
+  if (search) {
+    filters.push(
+      `(rm.name LIKE ?
+        OR p.name LIKE ?
+        OR b.name LIKE ?
+        OR im.notes LIKE ?
+        OR po.invoice_number LIKE ?
+        OR s.name LIKE ?
+        OR CAST(im.reference_id AS CHAR) LIKE ?)`
+    );
+    const like = `%${search}%`;
+    params.push(like, like, like, like, like, like, like);
+  }
+
+  const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const [rows] = await db.query(
+    `
+      SELECT
+        im.id,
+        im.branch_id,
+        b.name AS branch_name,
+        im.item_type,
+        im.raw_material_id,
+        im.product_id,
+        COALESCE(rm.name, p.name) AS item_name,
+        COALESCE(rm.unit, p.unit, 'unit') AS item_unit,
+        im.movement_type,
+        im.quantity,
+        im.unit_cost,
+        im.reference_type,
+        im.reference_id,
+        im.notes,
+        im.moved_at,
+        im.created_by,
+        u.full_name AS created_by_name,
+        po.invoice_number,
+        po.order_date AS purchase_order_date,
+        s.name AS supplier_name,
+        pb.produced_date,
+        rb.name AS production_recipe_name,
+        pom.concept AS output_material_concept,
+        pp.name AS output_product_name
+      FROM inventory_movements im
+      INNER JOIN branches b ON b.id = im.branch_id
+      LEFT JOIN raw_materials rm ON rm.id = im.raw_material_id
+      LEFT JOIN products p ON p.id = im.product_id
+      LEFT JOIN users u ON u.id = im.created_by
+      LEFT JOIN purchase_orders po
+        ON im.reference_type = 'purchase_order'
+       AND po.id = im.reference_id
+      LEFT JOIN suppliers s ON s.id = po.supplier_id
+      LEFT JOIN production_batches pb
+        ON im.reference_type = 'production_batch'
+       AND pb.id = im.reference_id
+      LEFT JOIN recipes r ON r.id = pb.recipe_id
+      LEFT JOIN products rb ON rb.id = r.product_id
+      LEFT JOIN production_output_materials pom
+        ON im.reference_type = 'production_output_material'
+       AND pom.id = im.reference_id
+      LEFT JOIN products pp ON pp.id = pom.product_id
+      ${where}
+      ORDER BY im.moved_at DESC, im.id DESC
+      LIMIT ? OFFSET ?
+    `,
+    [...params, limit, offset]
+  );
+
+  const [countRows] = await db.query(
+    `
+      SELECT COUNT(*) AS total
+      FROM inventory_movements im
+      INNER JOIN branches b ON b.id = im.branch_id
+      LEFT JOIN raw_materials rm ON rm.id = im.raw_material_id
+      LEFT JOIN products p ON p.id = im.product_id
+      LEFT JOIN purchase_orders po
+        ON im.reference_type = 'purchase_order'
+       AND po.id = im.reference_id
+      LEFT JOIN suppliers s ON s.id = po.supplier_id
+      ${where}
+    `,
+    params
+  );
+
+  return {
+    code: 1,
+    message: "movimientos de inventario listados",
+    data: {
+      items: rows,
+      page: currentPage,
+      pageSize: limit,
+      total: Number(countRows[0]?.total || 0),
+    },
+  };
+};
+
 module.exports = {
   listInventoryBaseData,
   applyInventoryMovement,
+  listInventoryMovements,
 };

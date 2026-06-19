@@ -3,7 +3,6 @@ const { verifyToken, requirePermission } = require("../middlewares/auth.handler"
 const {
   listBranches,
   listCustomers,
-  listRoutes,
   listProducts,
   listRawMaterials,
   listTaxRates,
@@ -32,7 +31,6 @@ const router = express.Router();
 const canManageProducts = requirePermission("products.manage");
 const canManageMaterials = requirePermission("materials.manage");
 const canManageCustomers = requirePermission("customers.manage");
-const canManageRoutes = requirePermission("routes.manage");
 
 router.get("/branches", verifyToken, async (req, res, next) => {
   try {
@@ -50,18 +48,6 @@ router.get("/customers", verifyToken, canManageCustomers, async (req, res, next)
       search: req.query.search,
       page: req.query.page,
       pageSize: req.query.pageSize,
-    });
-    res.json(result);
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.get("/routes", verifyToken, canManageRoutes, async (req, res, next) => {
-  try {
-    const result = await listRoutes({
-      onlyActive: req.query.onlyActive,
-      refDate: req.query.refDate,
     });
     res.json(result);
   } catch (error) {
