@@ -52,7 +52,9 @@ const enrichRawMaterialPackages = async (payload) => {
   const placeholders = ids.map(() => "?").join(",");
   const db = await connect();
   const [packageRows] = await db.query(
-    `SELECT id, purchase_package_name, purchase_package_quantity FROM raw_materials WHERE id IN (${placeholders})`,
+    `SELECT id, purchase_package_name, purchase_package_quantity, inventory_usage_type
+       FROM raw_materials
+      WHERE id IN (${placeholders})`,
     ids
   );
   const packageById = new Map(packageRows.map((row) => [Number(row.id), row]));
@@ -63,6 +65,7 @@ const enrichRawMaterialPackages = async (payload) => {
       ...row,
       purchase_package_name: packageById.get(Number(row.id))?.purchase_package_name || null,
       purchase_package_quantity: packageById.get(Number(row.id))?.purchase_package_quantity || null,
+      inventory_usage_type: packageById.get(Number(row.id))?.inventory_usage_type || "production",
     }))
   );
 };

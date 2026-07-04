@@ -1,6 +1,6 @@
 const LINE_TYPES = Object.freeze(["sale", "bonus", "gift", "exchange"]);
 const CAPTURE_MODES = Object.freeze(["quantity", "amount"]);
-const EDITABLE_ORDER_STATUSES = Object.freeze(["draft", "confirmed"]);
+const EDITABLE_ORDER_STATUSES = Object.freeze(["draft", "confirmed", "ready", "dispatched"]);
 
 const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 const roundQuantity = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 1000) / 1000;

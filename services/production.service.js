@@ -1378,6 +1378,11 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
         pbo.product_id,
         p.name AS product_name,
         p.sku AS product_sku,
+        p.units_per_bag,
+        CASE
+          WHEN p.units_per_bag IS NULL OR p.units_per_bag <= 0 THEN NULL
+          ELSE COALESCE(SUM(pbo.produced_quantity), 0) / p.units_per_bag
+        END AS bags_count,
         COUNT(DISTINCT pb.id) AS batches_count,
         COALESCE(SUM(pbo.produced_quantity), 0) AS produced_quantity,
         COALESCE(SUM(pbo.packed_quantity), 0) AS packed_quantity,
@@ -1393,7 +1398,7 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
       INNER JOIN production_batch_outputs pbo ON pbo.production_batch_id = pb.id
       INNER JOIN products p ON p.id = pbo.product_id
       ${whereClause}
-      GROUP BY pbo.product_id, p.name, p.sku
+      GROUP BY pbo.product_id, p.name, p.sku, p.units_per_bag
       ORDER BY p.name
     `,
     values
@@ -1550,6 +1555,183 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
     [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
   );
 
+  const [flourDailyRows] = await db.query(
+    `
+      SELECT
+        x.usage_date,
+        x.raw_material_id,
+        x.raw_material_name,
+        x.raw_material_unit,
+        x.category_id,
+        x.category_name,
+        x.purchase_package_name,
+        x.purchase_package_quantity,
+        x.total_quantity,
+        x.total_grams,
+        x.total_grams / 1000 AS total_kilos,
+        CASE
+          WHEN x.purchase_package_quantity IS NULL OR x.purchase_package_quantity <= 0 THEN NULL
+          ELSE x.total_quantity / x.purchase_package_quantity
+        END AS bags_used
+      FROM (
+        SELECT
+          DATE(COALESCE(pb_base.produced_date, pb_pom.produced_date, im.moved_at)) AS usage_date,
+          im.raw_material_id,
+          rm.name AS raw_material_name,
+          rm.unit AS raw_material_unit,
+          rm.category_id,
+          rmc.name AS category_name,
+          rm.purchase_package_name,
+          rm.purchase_package_quantity,
+          COALESCE(SUM(im.quantity), 0) AS total_quantity,
+          COALESCE(SUM(
+            CASE rm.unit
+              WHEN 'kg' THEN im.quantity * 1000
+              WHEN 'lb' THEN im.quantity * 453.59237
+              ELSE im.quantity
+            END
+          ), 0) AS total_grams
+        FROM inventory_movements im
+        INNER JOIN raw_materials rm ON rm.id = im.raw_material_id
+        LEFT JOIN raw_material_categories rmc ON rmc.id = rm.category_id
+        LEFT JOIN production_batches pb_base
+          ON im.reference_type = 'production_batch'
+         AND pb_base.id = im.reference_id
+        LEFT JOIN production_output_materials pom_ref
+          ON im.reference_type = 'production_output_material'
+         AND pom_ref.id = im.reference_id
+        LEFT JOIN production_batches pb_pom ON pb_pom.id = pom_ref.production_batch_id
+        WHERE im.item_type = 'raw_material'
+          AND im.movement_type = 'production_out'
+          AND im.reference_type IN ('production_batch', 'production_output_material')
+          AND DATE(im.moved_at) >= ?
+          AND DATE(im.moved_at) <= ?
+          AND (? IS NULL OR im.branch_id = ?)
+          AND (? IS NULL OR COALESCE(pb_base.recipe_id, pb_pom.recipe_id) = ?)
+          AND (
+            LOWER(rm.name) LIKE '%harina%'
+            OR LOWER(COALESCE(rmc.name, '')) LIKE '%harina%'
+          )
+        GROUP BY
+          usage_date,
+          im.raw_material_id,
+          rm.name,
+          rm.unit,
+          rm.category_id,
+          rmc.name,
+          rm.purchase_package_name,
+          rm.purchase_package_quantity
+      ) x
+      ORDER BY x.usage_date, x.raw_material_name
+    `,
+    [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
+  );
+
+  const [returnRows] = await db.query(
+    `
+      SELECT
+        sri.returned_product_id AS product_id,
+        returned.name AS product_name,
+        returned.sku AS product_sku,
+        sr.sales_agent_user_id,
+        seller.full_name AS sales_agent_name,
+        COALESCE(SUM(sri.quantity), 0) AS returned_quantity,
+        COALESCE(SUM(sri.returned_sale_value), 0) AS returned_value
+      FROM sales_returns sr
+      INNER JOIN sales_return_items sri ON sri.sales_return_id = sr.id
+      INNER JOIN products returned ON returned.id = sri.returned_product_id
+      INNER JOIN orders o ON o.id = sr.order_id
+      INNER JOIN users seller ON seller.id = sr.sales_agent_user_id
+      WHERE sr.status = 'completed'
+        AND DATE(sr.authorized_at) >= ?
+        AND DATE(sr.authorized_at) <= ?
+        AND (? IS NULL OR o.branch_id = ?)
+      GROUP BY
+        sri.returned_product_id,
+        returned.name,
+        returned.sku,
+        sr.sales_agent_user_id,
+        seller.full_name
+      ORDER BY returned.name, seller.full_name
+    `,
+    [reportDateFrom, reportDateTo, branchId || null, branchId || null]
+  );
+
+  const [rawInventoryRows] = await db.query(
+    `
+      SELECT
+        rm.id,
+        rm.name AS item_name,
+        rm.sku,
+        rmc.name AS category_name,
+        rm.unit,
+        COALESCE(rm.unit_cost, 0) AS unit_cost,
+        COALESCE(SUM(srm.quantity_on_hand), 0) AS quantity_on_hand,
+        COALESCE(SUM(srm.quantity_on_hand * COALESCE(rm.unit_cost, 0)), 0) AS total_value
+      FROM raw_materials rm
+      INNER JOIN raw_material_categories rmc ON rmc.id = rm.category_id
+      LEFT JOIN stock_raw_materials srm
+        ON srm.raw_material_id = rm.id
+       AND (? IS NULL OR srm.branch_id = ?)
+      WHERE rm.deleted_at IS NULL
+        AND COALESCE(rm.inventory_usage_type, 'production') = 'production'
+        AND rmc.name NOT IN ('Rollos', 'Bolsas')
+      GROUP BY rm.id, rm.name, rm.sku, rmc.name, rm.unit, rm.unit_cost
+      ORDER BY rmc.name, rm.name
+    `,
+    [branchId || null, branchId || null]
+  );
+
+  const [productInventoryRows] = await db.query(
+    `
+      SELECT
+        p.id,
+        p.name AS item_name,
+        p.sku,
+        pc.name AS category_name,
+        p.unit,
+        COALESCE(p.base_price, 0) AS unit_cost,
+        COALESCE(SUM(sp.quantity_on_hand), 0) AS quantity_on_hand,
+        COALESCE(SUM(sp.quantity_on_hand * COALESCE(p.base_price, 0)), 0) AS total_value
+      FROM products p
+      INNER JOIN product_categories pc ON pc.id = p.category_id
+      LEFT JOIN stock_products sp
+        ON sp.product_id = p.id
+       AND (? IS NULL OR sp.branch_id = ?)
+      WHERE p.deleted_at IS NULL
+      GROUP BY p.id, p.name, p.sku, pc.name, p.unit, p.base_price
+      ORDER BY pc.name, p.name
+    `,
+    [branchId || null, branchId || null]
+  );
+
+  const [packagingInventoryRows] = await db.query(
+    `
+      SELECT
+        rm.id,
+        rm.name AS item_name,
+        rm.sku,
+        rmc.name AS category_name,
+        rm.unit,
+        COALESCE(rm.unit_cost, 0) AS unit_cost,
+        COALESCE(SUM(srm.quantity_on_hand), 0) AS quantity_on_hand,
+        COALESCE(SUM(srm.quantity_on_hand * COALESCE(rm.unit_cost, 0)), 0) AS total_value
+      FROM raw_materials rm
+      INNER JOIN raw_material_categories rmc ON rmc.id = rm.category_id
+      LEFT JOIN stock_raw_materials srm
+        ON srm.raw_material_id = rm.id
+       AND (? IS NULL OR srm.branch_id = ?)
+      WHERE rm.deleted_at IS NULL
+        AND (
+          COALESCE(rm.inventory_usage_type, 'production') = 'packaging'
+          OR rmc.name IN ('Rollos', 'Bolsas')
+        )
+      GROUP BY rm.id, rm.name, rm.sku, rmc.name, rm.unit, rm.unit_cost
+      ORDER BY rmc.name, rm.name
+    `,
+    [branchId || null, branchId || null]
+  );
+
   return {
     code: 1,
     message: "reporte mensual de produccion generado",
@@ -1562,7 +1744,15 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
       batches: dayReport.data?.batches || [],
       products: dayReport.data?.products || [],
       packers: dayReport.data?.packers || [],
+      raw_materials_usage: rawMaterialsUsage,
       recipe_materials_usage: recipeMaterialRows,
+      flour_daily_usage: flourDailyRows,
+      returns_summary: returnRows,
+      inventory_snapshot: {
+        raw_materials: rawInventoryRows,
+        finished_products: productInventoryRows,
+        packaging: packagingInventoryRows,
+      },
     },
   };
 };

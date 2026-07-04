@@ -10,6 +10,22 @@ const {
   validateBonusAllowance,
 } = require("../domain/sales-rules");
 
+const isPastryCategoryName = (categoryName) => {
+  return String(categoryName || "").toLowerCase().includes("pasteler");
+};
+
+const calculateBonusEligibleGrandTotal = (items) => {
+  return items.reduce((total, item) => {
+    if (item.line_type !== "sale" && item.lineType !== "sale") {
+      return total;
+    }
+    if (isPastryCategoryName(item.category_name || item.categoryName)) {
+      return total;
+    }
+    return total + Number(item.line_total || item.lineTotal || 0);
+  }, 0);
+};
+
 const notifyOrderCreated = async (
   connection,
   { orderId, customerId, actorUserId, grandTotal }
@@ -98,6 +114,9 @@ const listOrders = async ({
         b.name AS branch_name,
         o.customer_id,
         c.name AS customer_name,
+        c.phone AS customer_phone,
+        c.address AS customer_address,
+        c.neighborhood AS customer_neighborhood,
         o.sales_agent_user_id,
         seller.full_name AS sales_agent_name,
         o.order_date,
@@ -719,7 +738,7 @@ const listOrderBaseData = async ({
   }
 
   const [customerRows] = await db.query(
-    `SELECT c.id, c.tax_id, c.name, c.email, c.phone, c.address, c.credit_limit
+    `SELECT c.id, c.tax_id, c.name, c.email, c.phone, c.address, c.neighborhood, c.credit_limit
      FROM customers c
      WHERE ${customerFilters.join(" AND ")}
      ORDER BY c.name, c.id
@@ -746,19 +765,29 @@ const listOrderBaseData = async ({
   }
 
   const [productTaxRows] = await db.query(
-    `SELECT p.id, t.rate_percent AS tax_percent
+    `SELECT
+       p.id,
+       p.category_id,
+       pc.name AS category_name,
+       t.rate_percent AS tax_percent
      FROM products p
+     LEFT JOIN product_categories pc ON pc.id = p.category_id
      INNER JOIN tax_rates t ON t.id = p.tax_rate_id
      WHERE p.deleted_at IS NULL`
   );
-  const taxPercentByProduct = new Map(
-    productTaxRows.map((row) => [Number(row.id), Number(row.tax_percent || 0)])
+  const productMetaById = new Map(
+    productTaxRows.map((row) => [Number(row.id), row])
   );
   if (Array.isArray(products.data?.items)) {
-    products.data.items = products.data.items.map((product) => ({
-      ...product,
-      tax_percent: taxPercentByProduct.get(Number(product.id)) || 0,
-    }));
+    products.data.items = products.data.items.map((product) => {
+      const meta = productMetaById.get(Number(product.id)) || {};
+      return {
+        ...product,
+        category_id: meta.category_id || product.category_id || null,
+        category_name: meta.category_name || product.category_name || null,
+        tax_percent: Number(meta.tax_percent || 0),
+      };
+    });
   }
 
   return {
@@ -1325,8 +1354,14 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         const productId = Number(item.product_id || item.p_product_id || 0);
         const lineType = normalizeLineType(item.line_type || item.p_line_type || "sale");
         const [products] = await connection.query(
-          `SELECT p.id, p.unit, p.base_price, t.rate_percent
+          `SELECT
+             p.id,
+             p.unit,
+             p.base_price,
+             pc.name AS category_name,
+             t.rate_percent
            FROM products p
+           LEFT JOIN product_categories pc ON pc.id = p.category_id
            INNER JOIN tax_rates t ON t.id = p.tax_rate_id
            WHERE p.id = ?
              AND p.is_active = 1
@@ -1339,10 +1374,19 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           await connection.rollback();
           return { code: 0, message: "uno de los productos no es valido", data: null };
         }
+        if (lineType === "bonus" && isPastryCategoryName(products[0].category_name)) {
+          await connection.rollback();
+          return {
+            code: 0,
+            message: "los productos de pasteleria ya incluyen vendaje y no permiten vendaje adicional",
+            data: null,
+          };
+        }
 
         try {
           normalizedItems.push({
             productId,
+            categoryName: products[0].category_name || null,
             ...calculateOrderLine({
               unit: products[0].unit,
               unitPrice: products[0].base_price,
@@ -1376,6 +1420,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           line_tax: item.lineTax,
           line_total: item.lineTotal,
           commercial_value: item.commercialValue,
+          category_name: item.categoryName,
         }))
       );
       if (!normalizedItems.some((item) => item.lineType === "sale")) {
@@ -1384,7 +1429,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
       }
       try {
         validateBonusAllowance({
-          grandTotal: totals.grandTotal,
+          grandTotal: calculateBonusEligibleGrandTotal(normalizedItems),
           bonusTotal: totals.bonusTotal,
           bonusPercent: settings.bonus_percent,
           bonusMinimumAmount: settings.bonus_minimum_amount,
@@ -1511,6 +1556,7 @@ const getOrderPrintData = async ({
        c.tax_id AS customer_identification,
        c.phone AS customer_phone,
        c.address AS customer_address,
+       c.neighborhood AS customer_neighborhood,
        o.sales_agent_user_id,
        seller.full_name AS sales_agent_name,
        o.order_date,
@@ -1548,6 +1594,7 @@ const getOrderPrintData = async ({
        oi.product_id,
        p.sku AS product_sku,
        p.name AS product_name,
+       pc.name AS category_name,
        oi.line_type,
        oi.capture_mode,
        oi.requested_amount,
@@ -1557,8 +1604,9 @@ const getOrderPrintData = async ({
        oi.commercial_value
      FROM order_items oi
      INNER JOIN products p ON p.id = oi.product_id
+     LEFT JOIN product_categories pc ON pc.id = p.category_id
      WHERE oi.order_id = ?
-     ORDER BY FIELD(oi.line_type, 'sale', 'bonus', 'gift', 'exchange'), p.name`,
+     ORDER BY pc.name, FIELD(oi.line_type, 'sale', 'bonus', 'gift', 'exchange'), p.name`,
     [Number(orderId)]
   );
 
@@ -1700,7 +1748,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
       await connection.rollback();
       return {
         code: 0,
-        message: "el pedido ya fue enviado a despacho y no permite cambios",
+        message: "el pedido ya fue entregado o cancelado y no permite cambios",
         data: null,
       };
     }
@@ -1744,8 +1792,13 @@ const upsertOrderItem = async (payload, actorUserId) => {
     } else {
       const [products] = await connection.query(
         `SELECT
-           p.id, p.unit, p.base_price, t.rate_percent
+           p.id,
+           p.unit,
+           p.base_price,
+           pc.name AS category_name,
+           t.rate_percent
          FROM products p
+         LEFT JOIN product_categories pc ON pc.id = p.category_id
          INNER JOIN tax_rates t ON t.id = p.tax_rate_id
          WHERE p.id = ?
            AND p.is_active = 1
@@ -1758,6 +1811,14 @@ const upsertOrderItem = async (payload, actorUserId) => {
       if (!products.length) {
         await connection.rollback();
         return { code: 0, message: "producto no encontrado o inactivo", data: null };
+      }
+      if (lineType === "bonus" && isPastryCategoryName(products[0].category_name)) {
+        await connection.rollback();
+        return {
+          code: 0,
+          message: "los productos de pasteleria ya incluyen vendaje y no permiten vendaje adicional",
+          data: null,
+        };
       }
 
       let calculated;
@@ -1859,16 +1920,23 @@ const upsertOrderItem = async (payload, actorUserId) => {
 
     const [itemRows] = await connection.query(
       `SELECT
-         line_type, line_subtotal, line_tax, line_total, commercial_value
-       FROM order_items
-       WHERE order_id = ?`,
+         oi.line_type,
+         oi.line_subtotal,
+         oi.line_tax,
+         oi.line_total,
+         oi.commercial_value,
+         pc.name AS category_name
+       FROM order_items oi
+       INNER JOIN products p ON p.id = oi.product_id
+       LEFT JOIN product_categories pc ON pc.id = p.category_id
+       WHERE oi.order_id = ?`,
       [orderId]
     );
     const totals = calculateOrderTotals(itemRows);
 
     try {
       validateBonusAllowance({
-        grandTotal: totals.grandTotal,
+        grandTotal: calculateBonusEligibleGrandTotal(itemRows),
         bonusTotal: totals.bonusTotal,
         bonusPercent: orders[0].bonus_percent,
         bonusMinimumAmount: orders[0].bonus_minimum_amount,
@@ -1972,9 +2040,17 @@ const confirmOrder = async (payload, actorUserId) => {
     }
 
     const [items] = await connection.query(
-      `SELECT line_type, line_subtotal, line_tax, line_total, commercial_value
-       FROM order_items
-       WHERE order_id = ?`,
+      `SELECT
+         oi.line_type,
+         oi.line_subtotal,
+         oi.line_tax,
+         oi.line_total,
+         oi.commercial_value,
+         pc.name AS category_name
+       FROM order_items oi
+       INNER JOIN products p ON p.id = oi.product_id
+       LEFT JOIN product_categories pc ON pc.id = p.category_id
+       WHERE oi.order_id = ?`,
       [orderId]
     );
     const totals = calculateOrderTotals(items);
@@ -1984,10 +2060,18 @@ const confirmOrder = async (payload, actorUserId) => {
       await connection.rollback();
       return { code: 0, message: "agrega al menos un producto de venta antes de confirmar", data: null };
     }
+    if (items.some((item) => item.line_type === "bonus" && isPastryCategoryName(item.category_name))) {
+      await connection.rollback();
+      return {
+        code: 0,
+        message: "los productos de pasteleria ya incluyen vendaje y no permiten vendaje adicional",
+        data: null,
+      };
+    }
 
     try {
       validateBonusAllowance({
-        grandTotal: totals.grandTotal,
+        grandTotal: calculateBonusEligibleGrandTotal(items),
         bonusTotal: totals.bonusTotal,
         bonusPercent: orders[0].bonus_percent,
         bonusMinimumAmount: orders[0].bonus_minimum_amount,
@@ -2362,46 +2446,63 @@ const getDailySalesSettlement = async ({
   const date = String(settlementDate || new Date().toISOString().slice(0, 10)).slice(0, 10);
   const requestedSellerId = Number(salesAgentUserId || 0);
   const sellerId = canViewAll ? requestedSellerId : Number(actorUserId || 0);
+  const [sellers] = canViewAll
+    ? await db.query(
+        `SELECT DISTINCT u.id, u.full_name
+         FROM users u
+         INNER JOIN user_roles ur ON ur.user_id = u.id
+         INNER JOIN roles r ON r.id = ur.role_id
+         WHERE r.code = 'VENTAS'
+           AND u.status = 'active'
+           AND u.deleted_at IS NULL
+         ORDER BY u.full_name`
+      )
+    : await db.query(
+        `SELECT u.id, u.full_name
+         FROM users u
+         WHERE u.id = ?
+           AND u.status = 'active'
+           AND u.deleted_at IS NULL
+         LIMIT 1`,
+        [sellerId]
+      );
 
   if (!sellerId) {
-    const [sellers] = await db.query(
-      `SELECT DISTINCT u.id, u.full_name
-       FROM users u
-       INNER JOIN user_roles ur ON ur.user_id = u.id
-       INNER JOIN roles r ON r.id = ur.role_id
-       WHERE r.code = 'VENTAS'
-         AND u.status = 'active'
-         AND u.deleted_at IS NULL
-       ORDER BY u.full_name`
-    );
-    return {
-      code: 0,
-      message: "selecciona un vendedor para consultar la liquidacion",
-      data: { sellers },
-    };
+    if (!canViewAll) {
+      return {
+        code: 0,
+        message: "selecciona un vendedor para consultar la liquidacion",
+        data: { sellers },
+      };
+    }
   }
 
-  const [sellerRows] = await db.query(
-    `SELECT u.id, u.full_name
-     FROM users u
-     INNER JOIN user_roles ur ON ur.user_id = u.id
-     INNER JOIN roles r ON r.id = ur.role_id
-     WHERE u.id = ?
-       AND r.code = 'VENTAS'
-       AND u.status = 'active'
-       AND u.deleted_at IS NULL
-     LIMIT 1`,
-    [sellerId]
-  );
+  const sellerRows = sellerId
+    ? sellers.filter((seller) => Number(seller.id) === sellerId)
+    : [{ id: null, full_name: "Todos los vendedores" }];
 
   if (!sellerRows.length) {
     return { code: 0, message: "vendedor no encontrado o inactivo", data: null };
+  }
+
+  const filters = [
+    "DATE(sc.delivered_at) = ?",
+    "sc.status IN ('accrued', 'adjusted')",
+  ];
+  const values = [date];
+
+  if (sellerId) {
+    filters.unshift("sc.sales_agent_user_id = ?");
+    values.unshift(sellerId);
   }
 
   const [rows] = await db.query(
     `SELECT
        sc.id AS commission_id,
        sc.order_id,
+       sc.sales_agent_user_id,
+       u.full_name AS sales_agent_name,
+       o.order_date,
        o.customer_id,
        c.name AS customer_name,
        c.address AS customer_address,
@@ -2417,11 +2518,10 @@ const getDailySalesSettlement = async ({
      FROM sales_commissions sc
      INNER JOIN orders o ON o.id = sc.order_id
      INNER JOIN customers c ON c.id = o.customer_id
-     WHERE sc.sales_agent_user_id = ?
-       AND DATE(sc.delivered_at) = ?
-       AND sc.status IN ('accrued', 'adjusted')
-     ORDER BY c.name, sc.delivered_at, sc.order_id`,
-    [sellerId, date]
+     INNER JOIN users u ON u.id = sc.sales_agent_user_id
+     WHERE ${filters.join(" AND ")}
+     ORDER BY u.full_name, c.name, sc.delivered_at, sc.order_id`,
+    values
   );
 
   const summary = rows.reduce(
@@ -2441,19 +2541,6 @@ const getDailySalesSettlement = async ({
       commission_amount: 0,
     }
   );
-
-  const [sellers] = canViewAll
-    ? await db.query(
-        `SELECT DISTINCT u.id, u.full_name
-         FROM users u
-         INNER JOIN user_roles ur ON ur.user_id = u.id
-         INNER JOIN roles r ON r.id = ur.role_id
-         WHERE r.code = 'VENTAS'
-           AND u.status = 'active'
-           AND u.deleted_at IS NULL
-         ORDER BY u.full_name`
-      )
-    : [sellerRows];
 
   return {
     code: 1,
@@ -2501,6 +2588,7 @@ const listSalesReturnOptions = async ({ actorUserId, canViewAll = false } = {}) 
        c.name AS customer_name,
        o.sales_agent_user_id,
        u.full_name AS sales_agent_name,
+       o.order_date,
        o.actual_delivered_at,
        DATE_ADD(o.actual_delivered_at, INTERVAL 15 DAY) AS product_expires_at,
        DATE_ADD(o.actual_delivered_at, INTERVAL 17 DAY) AS report_deadline_at
@@ -2593,6 +2681,7 @@ const listSalesReturns = async ({ actorUserId, canViewAll = false, status } = {}
        seller.full_name AS sales_agent_name,
        o.customer_id,
        c.name AS customer_name,
+       o.order_date,
        o.branch_id,
        b.name AS branch_name,
        sr.status,
@@ -2860,7 +2949,7 @@ const createSalesReturn = async (payload, actorUserId) => {
   }
 };
 
-const authorizeSalesReturn = async ({ salesReturnId }, actorUserId) => {
+const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, actorUserId) => {
   const db = await connect();
   const connection = await db.getConnection();
 
@@ -2883,11 +2972,11 @@ const authorizeSalesReturn = async ({ salesReturnId }, actorUserId) => {
       await connection.rollback();
       return { code: 0, message: "la devolucion ya fue procesada", data: null };
     }
-    if (Number(salesReturn.sales_agent_user_id) !== Number(actorUserId)) {
+    if (!canAuthorize) {
       await connection.rollback();
       return {
         code: 0,
-        message: "solo el vendedor asignado al pedido puede autorizar el cambio",
+        message: "solo un rol administrativo puede autorizar el cambio",
         data: null,
       };
     }
@@ -3051,7 +3140,7 @@ const authorizeSalesReturn = async ({ salesReturnId }, actorUserId) => {
   }
 };
 
-const rejectSalesReturn = async ({ salesReturnId, reason }, actorUserId) => {
+const rejectSalesReturn = async ({ salesReturnId, reason, canAuthorize = false }, actorUserId) => {
   const rejectionReason = String(reason || "").trim();
   if (rejectionReason.length < 5) {
     return { code: 0, message: "indica el motivo del rechazo", data: null };
@@ -3076,11 +3165,11 @@ const rejectSalesReturn = async ({ salesReturnId, reason }, actorUserId) => {
       await connection.rollback();
       return { code: 0, message: "la devolucion ya fue procesada", data: null };
     }
-    if (Number(returns[0].sales_agent_user_id) !== Number(actorUserId)) {
+    if (!canAuthorize) {
       await connection.rollback();
       return {
         code: 0,
-        message: "solo el vendedor asignado al pedido puede rechazar el cambio",
+        message: "solo un rol administrativo puede rechazar el cambio",
         data: null,
       };
     }

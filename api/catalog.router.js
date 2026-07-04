@@ -21,6 +21,7 @@ const {
   updateSupplier,
   createProduct,
   updateProduct,
+  updateProductYield,
   setProductStatus,
   createRawMaterial,
   updateRawMaterial,
@@ -249,6 +250,18 @@ router.post("/products", verifyToken, canManageProducts, async (req, res, next) 
 router.put("/products/:id", verifyToken, canManageProducts, async (req, res, next) => {
   try {
     const result = await updateProduct(
+      { ...req.body, p_product_id: Number(req.params.id) },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.patch("/products/:id/yield", verifyToken, canManageProducts, async (req, res, next) => {
+  try {
+    const result = await updateProductYield(
       { ...req.body, p_product_id: Number(req.params.id) },
       req.user.userId
     );

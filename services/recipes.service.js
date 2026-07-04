@@ -193,6 +193,9 @@ const getRecipeDetail = async ({ recipeId }) => {
 const getRecipeBaseData = async ({ onlyActive } = {}) => {
   const db = await connect();
   const activeFilter = onlyActive ? "WHERE is_active = 1" : "";
+  const rawMaterialFilter = onlyActive
+    ? "WHERE is_active = 1 AND COALESCE(inventory_usage_type, 'production') = 'production'"
+    : "WHERE COALESCE(inventory_usage_type, 'production') = 'production'";
 
   const [products] = await db.query(`
     SELECT
@@ -221,7 +224,7 @@ const getRecipeBaseData = async ({ onlyActive } = {}) => {
       purchase_package_quantity,
       is_active
     FROM raw_materials
-    ${activeFilter}
+    ${rawMaterialFilter}
     ORDER BY name
   `);
 

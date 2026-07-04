@@ -42,11 +42,16 @@ const router = express.Router();
 const canManageOrders = requirePermission("orders.manage");
 const canManageInventory = requirePermission("inventory.manage");
 const canConfigureSales = requirePermission("roles.manage");
+const administrativeRoleCodes = ["ADMIN", "SUPER_ADMIN", "ADMINISTRATIVO", "ADMINISTRATIVE"];
+
 const hasElevatedCustomerAccess = (user = {}) => {
   const roles = Array.isArray(user.roles) ? user.roles : [];
-  const roleCodes = roles.map((role) => (typeof role === "string" ? role : role?.code)).filter(Boolean);
+  const roleCodes = roles
+    .map((role) => (typeof role === "string" ? role : role?.code))
+    .filter(Boolean)
+    .map((role) => String(role).trim().toUpperCase());
 
-  return roleCodes.some((code) => ["ADMIN", "SUPER_ADMIN"].includes(code));
+  return roleCodes.some((code) => administrativeRoleCodes.includes(code));
 };
 
 router.get("/", verifyToken, canManageOrders, async (req, res, next) => {
@@ -219,7 +224,10 @@ router.post("/returns", verifyToken, canManageOrders, async (req, res, next) => 
 router.post("/returns/:id/authorize", verifyToken, canManageOrders, async (req, res, next) => {
   try {
     const result = await authorizeSalesReturn(
-      { salesReturnId: Number(req.params.id) },
+      {
+        salesReturnId: Number(req.params.id),
+        canAuthorize: hasElevatedCustomerAccess(req.user),
+      },
       req.user.userId
     );
     res.json(result);
@@ -234,6 +242,7 @@ router.post("/returns/:id/reject", verifyToken, canManageOrders, async (req, res
       {
         salesReturnId: Number(req.params.id),
         reason: req.body?.reason,
+        canAuthorize: hasElevatedCustomerAccess(req.user),
       },
       req.user.userId
     );

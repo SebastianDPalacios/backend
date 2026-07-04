@@ -35,6 +35,19 @@ const saveRawMaterialPurchasePackage = async (rawMaterialId, payload) => {
   );
 };
 
+const normalizeInventoryUsageType = (payload) => {
+  const value = String(payload.p_inventory_usage_type || payload.inventory_usage_type || "").trim();
+  return value === "packaging" ? "packaging" : "production";
+};
+
+const saveRawMaterialInventoryUsage = async (rawMaterialId, payload) => {
+  const db = await connect();
+  await db.query(
+    "UPDATE raw_materials SET inventory_usage_type = ? WHERE id = ?",
+    [normalizeInventoryUsageType(payload), rawMaterialId]
+  );
+};
+
 const enrichRawMaterialPackages = async (payload) => {
   const rows = getRows(payload);
   const ids = rows.map((row) => Number(row.id || 0)).filter((id) => id > 0);
@@ -46,7 +59,9 @@ const enrichRawMaterialPackages = async (payload) => {
   const placeholders = ids.map(() => "?").join(",");
   const db = await connect();
   const [packageRows] = await db.query(
-    `SELECT id, purchase_package_name, purchase_package_quantity FROM raw_materials WHERE id IN (${placeholders})`,
+    `SELECT id, purchase_package_name, purchase_package_quantity, inventory_usage_type
+       FROM raw_materials
+      WHERE id IN (${placeholders})`,
     ids
   );
   const packageById = new Map(packageRows.map((row) => [Number(row.id), row]));
@@ -57,6 +72,7 @@ const enrichRawMaterialPackages = async (payload) => {
       ...row,
       purchase_package_name: packageById.get(Number(row.id))?.purchase_package_name || null,
       purchase_package_quantity: packageById.get(Number(row.id))?.purchase_package_quantity || null,
+      inventory_usage_type: packageById.get(Number(row.id))?.inventory_usage_type || "production",
     }))
   );
 };
@@ -266,6 +282,7 @@ const createProduct = async (payload, actorUserId) => {
     payload.p_unit || null,
     payload.p_base_price ?? null,
     payload.p_min_stock ?? null,
+    payload.p_units_per_bag ?? null,
     payload.p_is_active || null,
     actorUserId || null,
   ]);
@@ -282,7 +299,17 @@ const updateProduct = async (payload, actorUserId) => {
     payload.p_unit || null,
     payload.p_base_price ?? null,
     payload.p_min_stock ?? null,
+    payload.p_units_per_bag ?? null,
     payload.p_is_active || null,
+    actorUserId || null,
+  ]);
+  return mapSpResult(out);
+};
+
+const updateProductYield = async (payload, actorUserId) => {
+  const out = await callProcedure("sp_product_yield_update", [
+    payload.p_product_id,
+    payload.p_units_per_bag ?? null,
     actorUserId || null,
   ]);
   return mapSpResult(out);
@@ -318,6 +345,7 @@ const createRawMaterial = async (payload, actorUserId) => {
   if (!shouldAutoGenerateSku || result.code !== 1 || !result.data?.raw_material_id) {
     if (result.code === 1 && result.data?.raw_material_id) {
       await saveRawMaterialPurchasePackage(Number(result.data.raw_material_id), payload);
+      await saveRawMaterialInventoryUsage(Number(result.data.raw_material_id), payload);
     }
     return result;
   }
@@ -327,6 +355,7 @@ const createRawMaterial = async (payload, actorUserId) => {
   const db = await connect();
   await db.query("UPDATE raw_materials SET sku = ? WHERE id = ?", [sku, rawMaterialId]);
   await saveRawMaterialPurchasePackage(rawMaterialId, payload);
+  await saveRawMaterialInventoryUsage(rawMaterialId, payload);
 
   return {
     ...result,
@@ -354,6 +383,7 @@ const updateRawMaterial = async (payload, actorUserId) => {
 
   if (result.code === 1) {
     await saveRawMaterialPurchasePackage(Number(payload.p_raw_material_id), payload);
+    await saveRawMaterialInventoryUsage(Number(payload.p_raw_material_id), payload);
   }
 
   return result;
@@ -390,6 +420,7 @@ module.exports = {
   updateSupplier,
   createProduct,
   updateProduct,
+  updateProductYield,
   setProductStatus,
   createRawMaterial,
   updateRawMaterial,
