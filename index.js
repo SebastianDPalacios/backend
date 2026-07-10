@@ -26,6 +26,7 @@ app.use("/api/users", require("./api/users.router"));
 app.use("/api/employees", require("./api/employees.router"));
 app.use("/api/catalog", require("./api/catalog.router"));
 app.use("/api/orders", require("./api/orders.router"));
+app.use("/api/dashboard", require("./api/dashboard.router"));
 app.use("/api/production", require("./api/production.router"));
 app.use("/api/inventory", require("./api/inventory.router"));
 app.use("/api/commercial", require("./api/commercial.router"));
@@ -34,6 +35,7 @@ app.use("/api/rbac", require("./api/rbac.router"));
 app.use("/api/admin-auth", require("./api/admin-auth.router"));
 app.use("/api/reports", require("./api/reports.router"));
 app.use("/api/standard", require("./api/standard.router"));
+app.use("/api/settings", require("./api/settings.router"));
 
 app.use(logErrors);
 app.use(boomErrorHandler);
