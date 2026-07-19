@@ -1,12 +1,14 @@
-const express = require("express");
+﻿const express = require("express");
 const { verifyToken, requirePermission } = require("../middlewares/auth.handler");
 const {
   listRoles,
   listPermissions,
+  listUserViewAccess,
   createRole,
   updateRole,
   createPermission,
   setRolePermissions,
+  setUserPermissions,
 } = require("../services/rbac.service");
 
 const router = express.Router();
@@ -64,6 +66,27 @@ router.put("/roles/:id/permissions", verifyToken, canManageRoles, async (req, re
   try {
     const result = await setRolePermissions(
       { ...req.body, p_role_id: Number(req.params.id) },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/view-access/users", verifyToken, canManageRoles, async (req, res, next) => {
+  try {
+    const result = await listUserViewAccess();
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.put("/users/:id/permissions", verifyToken, canManageRoles, async (req, res, next) => {
+  try {
+    const result = await setUserPermissions(
+      { ...req.body, p_user_id: Number(req.params.id) },
       req.user.userId
     );
     res.json(result);

@@ -1,4 +1,4 @@
-const boom = require("@hapi/boom");
+﻿const boom = require("@hapi/boom");
 const { connect } = require("../data-access");
 
 const ORDER_RECEIPT_KEY = "order_receipt";
@@ -13,6 +13,15 @@ const defaultOrderReceiptSettings = {
   showSeller: true,
   showDeliveryDate: true,
   customerTitle: "CLIENTE",
+  showCustomerName: true,
+  showCustomerIdentification: true,
+  showCustomerAddress: true,
+  showCustomerNeighborhood: true,
+  showCustomerPhone: true,
+  customerIdentificationLabel: "Identificacion",
+  customerAddressLabel: "Direccion",
+  customerNeighborhoodLabel: "Barrio/Zona",
+  customerPhoneLabel: "Tel",
   detailTitle: "DETALLE SOLICITADO",
   policyTitle: "POLITICA DE CAMBIOS",
   policyText:
@@ -23,6 +32,10 @@ const defaultOrderReceiptSettings = {
   headerFontSize: 24,
   customerFontSize: 20,
   customerContactFontSize: 16,
+  customerIdentificationFontSize: 13,
+  customerAddressFontSize: 16,
+  customerNeighborhoodFontSize: 15,
+  customerPhoneFontSize: 16,
   productFontSize: 13,
   quantityFontSize: 20,
   totalFontSize: 17,
@@ -102,6 +115,15 @@ const sanitizeOrderReceiptSettings = (payload = {}) => {
     showSeller: toBoolean(payload.showSeller, defaultOrderReceiptSettings.showSeller),
     showDeliveryDate: toBoolean(payload.showDeliveryDate, defaultOrderReceiptSettings.showDeliveryDate),
     customerTitle: trimText(payload.customerTitle, 60, defaultOrderReceiptSettings.customerTitle),
+    showCustomerName: toBoolean(payload.showCustomerName, defaultOrderReceiptSettings.showCustomerName),
+    showCustomerIdentification: toBoolean(payload.showCustomerIdentification, defaultOrderReceiptSettings.showCustomerIdentification),
+    showCustomerAddress: toBoolean(payload.showCustomerAddress, defaultOrderReceiptSettings.showCustomerAddress),
+    showCustomerNeighborhood: toBoolean(payload.showCustomerNeighborhood, defaultOrderReceiptSettings.showCustomerNeighborhood),
+    showCustomerPhone: toBoolean(payload.showCustomerPhone, defaultOrderReceiptSettings.showCustomerPhone),
+    customerIdentificationLabel: trimText(payload.customerIdentificationLabel, 40, defaultOrderReceiptSettings.customerIdentificationLabel),
+    customerAddressLabel: trimText(payload.customerAddressLabel, 40, defaultOrderReceiptSettings.customerAddressLabel),
+    customerNeighborhoodLabel: trimText(payload.customerNeighborhoodLabel, 40, defaultOrderReceiptSettings.customerNeighborhoodLabel),
+    customerPhoneLabel: trimText(payload.customerPhoneLabel, 40, defaultOrderReceiptSettings.customerPhoneLabel),
     detailTitle: trimText(payload.detailTitle, 80, defaultOrderReceiptSettings.detailTitle),
     policyTitle: trimText(payload.policyTitle, 80, defaultOrderReceiptSettings.policyTitle),
     policyText: trimText(payload.policyText, 900, defaultOrderReceiptSettings.policyText),
@@ -111,6 +133,10 @@ const sanitizeOrderReceiptSettings = (payload = {}) => {
     headerFontSize: numberBetween(payload.headerFontSize, defaultOrderReceiptSettings.headerFontSize, 18, 34),
     customerFontSize: numberBetween(payload.customerFontSize, defaultOrderReceiptSettings.customerFontSize, 16, 30),
     customerContactFontSize: numberBetween(payload.customerContactFontSize, defaultOrderReceiptSettings.customerContactFontSize, 12, 24),
+    customerIdentificationFontSize: numberBetween(payload.customerIdentificationFontSize, defaultOrderReceiptSettings.customerIdentificationFontSize, 10, 24),
+    customerAddressFontSize: numberBetween(payload.customerAddressFontSize, defaultOrderReceiptSettings.customerAddressFontSize, 12, 28),
+    customerNeighborhoodFontSize: numberBetween(payload.customerNeighborhoodFontSize, defaultOrderReceiptSettings.customerNeighborhoodFontSize, 12, 26),
+    customerPhoneFontSize: numberBetween(payload.customerPhoneFontSize, defaultOrderReceiptSettings.customerPhoneFontSize, 12, 28),
     productFontSize: numberBetween(payload.productFontSize, defaultOrderReceiptSettings.productFontSize, 11, 22),
     quantityFontSize: numberBetween(payload.quantityFontSize, defaultOrderReceiptSettings.quantityFontSize, 16, 34),
     totalFontSize: numberBetween(payload.totalFontSize, defaultOrderReceiptSettings.totalFontSize, 15, 30),
@@ -167,3 +193,4 @@ module.exports = {
   getPosTicketSettings,
   updatePosTicketSettings,
 };
+

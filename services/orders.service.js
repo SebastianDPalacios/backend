@@ -63,6 +63,134 @@ const notifyOrderCreated = async (
   );
 };
 
+const ensureCustomerCreditAccount = async (connection, customerId) => {
+  await connection.query(
+    `INSERT IGNORE INTO customer_credit_accounts (customer_id, balance_amount)
+     VALUES (?, 0)`,
+    [Number(customerId)]
+  );
+};
+
+const addCustomerCreditMovement = async (
+  connection,
+  {
+    customerId,
+    movementType,
+    amount,
+    salesReturnId = null,
+    orderId = null,
+    notes = null,
+    metadata = null,
+    actorUserId = null,
+  }
+) => {
+  const normalizedAmount = roundMoney(amount);
+  if (normalizedAmount <= 0) {
+    return { code: 0, message: "el saldo debe ser mayor que cero", balanceAfter: 0 };
+  }
+
+  await ensureCustomerCreditAccount(connection, customerId);
+  const [accounts] = await connection.query(
+    `SELECT id, balance_amount
+     FROM customer_credit_accounts
+     WHERE customer_id = ?
+     FOR UPDATE`,
+    [Number(customerId)]
+  );
+  const currentBalance = Number(accounts[0]?.balance_amount || 0);
+  const balanceAfter =
+    movementType === "redeemed"
+      ? roundMoney(currentBalance - normalizedAmount)
+      : roundMoney(currentBalance + normalizedAmount);
+
+  if (balanceAfter < 0) {
+    return {
+      code: 0,
+      message: "el saldo a favor del cliente no es suficiente",
+      balanceAfter: currentBalance,
+    };
+  }
+
+  await connection.query(
+    `UPDATE customer_credit_accounts
+     SET balance_amount = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE customer_id = ?`,
+    [balanceAfter, Number(customerId)]
+  );
+  await connection.query(
+    `INSERT INTO customer_credit_ledger (
+       customer_id, movement_type, amount, balance_before, balance_after,
+       sales_return_id, order_id, notes, metadata_json, created_by
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      Number(customerId),
+      movementType,
+      normalizedAmount,
+      currentBalance,
+      balanceAfter,
+      salesReturnId,
+      orderId,
+      notes,
+      metadata ? JSON.stringify(metadata) : null,
+      actorUserId || null,
+    ]
+  );
+
+  return { code: 1, message: "saldo actualizado", balanceAfter };
+};
+
+const getCustomerCreditBalance = async ({ customerId, actorUserId, canViewAll = false } = {}) => {
+  const db = await connect();
+  const id = Number(customerId || 0);
+  if (!id) {
+    return { code: 0, message: "selecciona un cliente", data: null };
+  }
+
+  const [customers] = await db.query(
+    `SELECT c.id, c.name, COALESCE(cca.balance_amount, 0) AS balance_amount
+     FROM customers c
+     LEFT JOIN customer_credit_accounts cca ON cca.customer_id = c.id
+     WHERE c.id = ?
+       AND c.deleted_at IS NULL
+       AND (
+         ? = 1
+         OR EXISTS (
+           SELECT 1
+           FROM seller_customer_assignments sca
+           WHERE sca.customer_id = c.id
+             AND sca.sales_agent_user_id = ?
+             AND sca.is_active = 1
+         )
+       )
+     LIMIT 1`,
+    [id, canViewAll ? 1 : 0, Number(actorUserId || 0)]
+  );
+
+  if (!customers.length) {
+    return { code: 0, message: "cliente no encontrado o sin acceso", data: null };
+  }
+
+  const [ledger] = await db.query(
+    `SELECT id, movement_type, amount, balance_before, balance_after, sales_return_id, order_id, notes, metadata_json, created_at
+     FROM customer_credit_ledger
+     WHERE customer_id = ?
+     ORDER BY created_at DESC, id DESC
+     LIMIT 30`,
+    [id]
+  );
+
+  return {
+    code: 1,
+    message: "saldo a favor consultado",
+    data: {
+      customer: customers[0],
+      balance_amount: roundMoney(customers[0].balance_amount),
+      ledger,
+    },
+  };
+};
 const listOrders = async ({
   status,
   search,
@@ -1348,11 +1476,19 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
          FOR UPDATE`
       );
       const settings = settingsRows[0];
-      const normalizedItems = [];
+      let normalizedItems = [];
 
       for (const item of items) {
         const productId = Number(item.product_id || item.p_product_id || 0);
         const lineType = normalizeLineType(item.line_type || item.p_line_type || "sale");
+        if (lineType === "gift") {
+          await connection.rollback();
+          return {
+            code: 0,
+            message: "los obsequios se registran en el flujo independiente",
+            data: null,
+          };
+        }
         const [products] = await connection.query(
           `SELECT
              p.id,
@@ -1403,16 +1539,30 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         }
       }
 
-      const duplicateKeys = new Set();
+      const aggregatedItems = new Map();
       for (const item of normalizedItems) {
         const key = `${item.productId}:${item.lineType}`;
-        if (duplicateKeys.has(key)) {
-          await connection.rollback();
-          return { code: 0, message: "no repitas el mismo producto con el mismo tipo", data: null };
+        const existing = aggregatedItems.get(key);
+        if (!existing) {
+          aggregatedItems.set(key, { ...item });
+          continue;
         }
-        duplicateKeys.add(key);
-      }
 
+        existing.quantity = Math.round(
+          (Number(existing.quantity || 0) + Number(item.quantity || 0) + Number.EPSILON) * 1000
+        ) / 1000;
+        existing.lineSubtotal = roundMoney(Number(existing.lineSubtotal || 0) + Number(item.lineSubtotal || 0));
+        existing.lineTax = roundMoney(Number(existing.lineTax || 0) + Number(item.lineTax || 0));
+        existing.lineTotal = roundMoney(Number(existing.lineTotal || 0) + Number(item.lineTotal || 0));
+        existing.commercialValue = roundMoney(
+          Number(existing.commercialValue || 0) + Number(item.commercialValue || 0)
+        );
+        existing.requestedAmount = existing.requestedAmount !== null && item.requestedAmount !== null
+          ? roundMoney(Number(existing.requestedAmount || 0) + Number(item.requestedAmount || 0))
+          : null;
+        existing.captureMode = existing.captureMode === item.captureMode ? existing.captureMode : "quantity";
+      }
+      normalizedItems = Array.from(aggregatedItems.values());
       const totals = calculateOrderTotals(
         normalizedItems.map((item) => ({
           line_type: item.lineType,
@@ -1439,14 +1589,37 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         return { code: 0, message: error.message, data: null };
       }
 
+      const creditRedeemedAmount = roundMoney(payload.p_credit_redeemed_amount || 0);
+      if (creditRedeemedAmount < 0) {
+        await connection.rollback();
+        return { code: 0, message: "el saldo a favor no puede ser negativo", data: null };
+      }
+      if (creditRedeemedAmount > roundMoney(totals.grandTotal)) {
+        await connection.rollback();
+        return { code: 0, message: "el saldo a favor no puede superar el total vendido", data: null };
+      }
+      if (creditRedeemedAmount > 0) {
+        await ensureCustomerCreditAccount(connection, customerId);
+        const [creditRows] = await connection.query(
+          `SELECT balance_amount
+           FROM customer_credit_accounts
+           WHERE customer_id = ?
+           FOR UPDATE`,
+          [customerId]
+        );
+        if (Number(creditRows[0]?.balance_amount || 0) < creditRedeemedAmount) {
+          await connection.rollback();
+          return { code: 0, message: "el saldo a favor del cliente no es suficiente", data: null };
+        }
+      }
       const [orderResult] = await connection.query(
         `INSERT INTO orders (
            branch_id, customer_id, sales_agent_user_id, route_id,
            order_date, delivery_date, status, subtotal, tax_total, grand_total,
            bonus_percent, bonus_minimum_amount, seller_commission_percent,
-           bonus_total, gift_total, exchange_total, notes, created_by
+           bonus_total, gift_total, exchange_total, credit_redeemed_amount, notes, created_by
          )
-         VALUES (?, ?, ?, NULL, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, NULL, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           branchId,
           customerId,
@@ -1462,6 +1635,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           roundMoney(totals.bonusTotal),
           roundMoney(totals.giftTotal),
           roundMoney(totals.exchangeTotal),
+          creditRedeemedAmount,
           payload.p_notes || null,
           actorUserId || null,
         ]
@@ -1496,7 +1670,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
       await connection.query(
         `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
          VALUES (?, 'order.create_atomic', 'orders', ?, JSON_OBJECT(
-           'customer_id', ?, 'items_count', ?, 'grand_total', ?, 'bonus_total', ?
+           'customer_id', ?, 'items_count', ?, 'grand_total', ?, 'bonus_total', ?, 'credit_redeemed_amount', ?
          ))`,
         [
           actorUserId || null,
@@ -1505,6 +1679,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           normalizedItems.length,
           roundMoney(totals.grandTotal),
           roundMoney(totals.bonusTotal),
+          creditRedeemedAmount,
         ]
       );
       await notifyOrderCreated(connection, {
@@ -1521,6 +1696,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           order_id: orderId,
           grand_total: roundMoney(totals.grandTotal),
           bonus_total: roundMoney(totals.bonusTotal),
+          credit_redeemed_amount: creditRedeemedAmount,
         },
       };
     } catch (error) {
@@ -1710,6 +1886,114 @@ const confirmOrderPrint = async (
   }
 };
 
+const recalculateDeliveredOrderCommission = async ({ connection, orderId, order, actorUserId }) => {
+  const [deliveredTotalsRows] = await connection.query(
+    `SELECT
+       COALESCE(SUM(CASE WHEN line_type = 'sale' THEN line_total ELSE 0 END), 0)
+         AS delivered_sales_total,
+       COALESCE(SUM(CASE WHEN line_type = 'bonus' THEN commercial_value ELSE 0 END), 0)
+         AS excluded_bonus_total,
+       COALESCE(SUM(CASE WHEN line_type = 'gift' THEN commercial_value ELSE 0 END), 0)
+         AS excluded_gift_total,
+       COALESCE(SUM(CASE WHEN line_type = 'exchange' THEN commercial_value ELSE 0 END), 0)
+         AS excluded_exchange_total
+     FROM order_items
+     WHERE order_id = ?`,
+    [orderId]
+  );
+
+  const deliveredTotals = deliveredTotalsRows[0] || {};
+  const [commissionRows] = await connection.query(
+    `SELECT id, returned_sales_total, status, delivered_at
+     FROM sales_commissions
+     WHERE order_id = ?
+     FOR UPDATE`,
+    [orderId]
+  );
+  const returnedSalesTotal = roundMoney(commissionRows[0]?.returned_sales_total || 0);
+
+  const deliveredCommission = calculateDeliveredCommission({
+    deliveredSalesTotal: deliveredTotals.delivered_sales_total,
+    returnedSalesTotal,
+    commissionPercent: order.seller_commission_percent,
+  });
+
+  if (deliveredCommission.deliveredSalesTotal <= 0) {
+    throw new Error("el pedido entregado debe conservar al menos una venta cobrada");
+  }
+
+  const creditRedeemedAmount = roundMoney(order.credit_redeemed_amount || 0);
+  if (creditRedeemedAmount > deliveredCommission.deliveredSalesTotal) {
+    throw new Error("el saldo a favor aplicado no puede superar el nuevo valor vendido");
+  }
+
+  if (commissionRows.length) {
+    await connection.query(
+      `UPDATE sales_commissions
+       SET delivered_sales_total = ?,
+           returned_sales_total = ?,
+           excluded_bonus_total = ?,
+           excluded_gift_total = ?,
+           excluded_exchange_total = ?,
+           commission_base = ?,
+           commission_percent = ?,
+           commission_amount = ?,
+           status = CASE
+             WHEN ? > 0 OR status = 'adjusted' THEN 'adjusted'
+             ELSE status
+           END,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [
+        deliveredCommission.deliveredSalesTotal,
+        deliveredCommission.returnedSalesTotal,
+        roundMoney(deliveredTotals.excluded_bonus_total),
+        roundMoney(deliveredTotals.excluded_gift_total),
+        roundMoney(deliveredTotals.excluded_exchange_total),
+        deliveredCommission.commissionBase,
+        roundMoney(order.seller_commission_percent),
+        deliveredCommission.commissionAmount,
+        deliveredCommission.returnedSalesTotal,
+        commissionRows[0].id,
+      ]
+    );
+  } else {
+    await connection.query(
+      `INSERT INTO sales_commissions (
+         order_id, sales_agent_user_id, delivered_sales_total,
+         returned_sales_total, excluded_bonus_total, excluded_gift_total,
+         excluded_exchange_total, commission_base, commission_percent,
+         commission_amount, status, delivered_at, created_by
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accrued', ?, ?)`,
+      [
+        orderId,
+        order.sales_agent_user_id,
+        deliveredCommission.deliveredSalesTotal,
+        deliveredCommission.returnedSalesTotal,
+        roundMoney(deliveredTotals.excluded_bonus_total),
+        roundMoney(deliveredTotals.excluded_gift_total),
+        roundMoney(deliveredTotals.excluded_exchange_total),
+        deliveredCommission.commissionBase,
+        roundMoney(order.seller_commission_percent),
+        deliveredCommission.commissionAmount,
+        order.actual_delivered_at || new Date(),
+        actorUserId || null,
+      ]
+    );
+  }
+
+  await connection.query(
+    `UPDATE orders
+     SET commission_base = ?,
+         commission_total = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [deliveredCommission.commissionBase, deliveredCommission.commissionAmount, orderId]
+  );
+
+  return deliveredCommission;
+};
 const upsertOrderItem = async (payload, actorUserId) => {
   const orderId = Number(payload.p_order_id || 0);
   const productId = Number(payload.p_product_id || 0);
@@ -1724,6 +2008,14 @@ const upsertOrderItem = async (payload, actorUserId) => {
     return { code: 0, message: "selecciona un producto", data: null };
   }
 
+  if (lineType === "gift" || previousLineType === "gift") {
+    return {
+      code: 0,
+      message: "los obsequios se registran en el flujo independiente",
+      data: null,
+    };
+  }
+
   const db = await connect();
   const connection = await db.getConnection();
 
@@ -1732,7 +2024,9 @@ const upsertOrderItem = async (payload, actorUserId) => {
 
     const [orders] = await connection.query(
       `SELECT
-         id, status, bonus_percent, bonus_minimum_amount
+         id, status, bonus_percent, bonus_minimum_amount,
+         sales_agent_user_id, seller_commission_percent, credit_redeemed_amount,
+         actual_delivered_at
        FROM orders
        WHERE id = ?
        FOR UPDATE`,
@@ -1748,7 +2042,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
       await connection.rollback();
       return {
         code: 0,
-        message: "el pedido ya fue entregado o cancelado y no permite cambios",
+        message: "el pedido esta cancelado y no permite cambios",
         data: null,
       };
     }
@@ -1966,7 +2260,19 @@ const upsertOrderItem = async (payload, actorUserId) => {
         orderId,
       ]
     );
-
+    if (orders[0].status === "delivered") {
+      try {
+        await recalculateDeliveredOrderCommission({
+          connection,
+          orderId,
+          order: orders[0],
+          actorUserId,
+        });
+      } catch (error) {
+        await connection.rollback();
+        return { code: 0, message: error.message, data: null };
+      }
+    }
     await connection.query(
       `INSERT INTO audit_logs (
          actor_user_id, action, entity_name, entity_id, metadata_json
@@ -2023,7 +2329,10 @@ const confirmOrder = async (payload, actorUserId) => {
   try {
     await connection.beginTransaction();
     const [orders] = await connection.query(
-      `SELECT id, status, bonus_percent, bonus_minimum_amount
+      `SELECT
+         id, status, bonus_percent, bonus_minimum_amount,
+         sales_agent_user_id, seller_commission_percent, credit_redeemed_amount,
+         actual_delivered_at
        FROM orders
        WHERE id = ?
        FOR UPDATE`,
@@ -2212,7 +2521,7 @@ const deliverOrder = async (payload, actorUserId) => {
     await connection.beginTransaction();
     const [orders] = await connection.query(
       `SELECT
-         id, status, sales_agent_user_id, seller_commission_percent
+         id, customer_id, status, sales_agent_user_id, seller_commission_percent, credit_redeemed_amount
        FROM orders
        WHERE id = ?
        FOR UPDATE`,
@@ -2271,6 +2580,28 @@ const deliverOrder = async (payload, actorUserId) => {
       return { code: 0, message: "el pedido no tiene ventas cobradas para entregar", data: null };
     }
 
+    const creditRedeemedAmount = roundMoney(order.credit_redeemed_amount || 0);
+    if (creditRedeemedAmount > 0) {
+      if (creditRedeemedAmount > commission.deliveredSalesTotal) {
+        await connection.rollback();
+        return { code: 0, message: "el saldo a favor no puede superar el valor vendido", data: null };
+      }
+
+      const creditResult = await addCustomerCreditMovement(connection, {
+        customerId: order.customer_id,
+        movementType: "redeemed",
+        amount: creditRedeemedAmount,
+        orderId,
+        notes: `Redimido en pedido ${orderId}`,
+        metadata: { source: "order_delivery", order_id: orderId },
+        actorUserId,
+      });
+      if (creditResult.code !== 1) {
+        await connection.rollback();
+        return { code: 0, message: creditResult.message, data: null };
+      }
+    }
+
     const deliveredAt = new Date();
     await connection.query(
       `INSERT INTO sales_commissions (
@@ -2322,7 +2653,8 @@ const deliverOrder = async (payload, actorUserId) => {
          'excluded_exchange_total', ?,
          'commission_base', ?,
          'commission_percent', ?,
-         'commission_amount', ?
+         'commission_amount', ?,
+         'credit_redeemed_amount', ?
        ))`,
       [
         actorUserId || null,
@@ -2334,6 +2666,7 @@ const deliverOrder = async (payload, actorUserId) => {
         commission.commissionBase,
         roundMoney(order.seller_commission_percent),
         commission.commissionAmount,
+        creditRedeemedAmount,
       ]
     );
 
@@ -2345,6 +2678,7 @@ const deliverOrder = async (payload, actorUserId) => {
         order_id: orderId,
         commission_base: commission.commissionBase,
         commission_amount: commission.commissionAmount,
+        credit_redeemed_amount: creditRedeemedAmount,
       },
     };
   } catch (error) {
@@ -2358,6 +2692,372 @@ const deliverOrder = async (payload, actorUserId) => {
   }
 };
 
+const updateOrderDeliveryDate = async ({ orderId, deliveryDate }, actorUserId) => {
+  const toSqlDateValue = (value) => {
+    if (!value) {
+      return "";
+    }
+
+    if (value instanceof Date) {
+      return value.toISOString().slice(0, 10);
+    }
+
+    return String(value).slice(0, 10);
+  };
+
+  const normalizedOrderId = Number(orderId || 0);
+  const normalizedDate = toSqlDateValue(deliveryDate);
+
+  if (!Number.isInteger(normalizedOrderId) || normalizedOrderId <= 0) {
+    return { code: 0, message: "pedido invalido", data: null };
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)) {
+    return { code: 0, message: "fecha de entrega invalida", data: null };
+  }
+
+  const db = await connect();
+  const connection = await db.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const [orders] = await connection.query(
+      `SELECT id, order_date, delivery_date, status, actual_delivered_at
+       FROM orders
+       WHERE id = ?
+       FOR UPDATE`,
+      [normalizedOrderId]
+    );
+
+    if (!orders.length) {
+      await connection.rollback();
+      return { code: 0, message: "pedido no encontrado", data: null };
+    }
+
+    const order = orders[0];
+    const orderDate = toSqlDateValue(order.order_date);
+
+    if (order.status === "cancelled") {
+      await connection.rollback();
+      return { code: 0, message: "no se puede editar la fecha de un pedido cancelado", data: null };
+    }
+
+    if (orderDate && normalizedDate < orderDate) {
+      await connection.rollback();
+      return { code: 0, message: "la fecha de entrega no puede ser menor a la fecha del pedido", data: null };
+    }
+
+    await connection.query(
+      `UPDATE orders
+       SET delivery_date = ?,
+           actual_delivered_at = CASE
+             WHEN status = 'delivered' THEN TIMESTAMP(?, COALESCE(TIME(actual_delivered_at), CURTIME()))
+             ELSE actual_delivered_at
+           END,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [normalizedDate, normalizedDate, normalizedOrderId]
+    );
+
+    await connection.query(
+      `UPDATE sales_commissions
+       SET delivered_at = TIMESTAMP(?, COALESCE(TIME(delivered_at), CURTIME()))
+       WHERE order_id = ?
+         AND status IN ('accrued', 'adjusted')`,
+      [normalizedDate, normalizedOrderId]
+    );
+
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'order.delivery_date.update', 'orders', ?, JSON_OBJECT(
+         'old_delivery_date', ?,
+         'new_delivery_date', ?,
+         'status', ?,
+         'synced_actual_delivery', ?
+       ))`,
+      [
+        actorUserId || null,
+        String(normalizedOrderId),
+        order.delivery_date ? toSqlDateValue(order.delivery_date) : null,
+        normalizedDate,
+        order.status,
+        order.status === "delivered" ? 1 : 0,
+      ]
+    );
+
+    await connection.commit();
+
+    return {
+      code: 1,
+      message: "fecha de entrega actualizada",
+      data: {
+        order_id: normalizedOrderId,
+        delivery_date: normalizedDate,
+        actual_delivered_at: order.status === "delivered" ? normalizedDate : order.actual_delivered_at,
+      },
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+const listSalesGifts = async ({ salesAgentUserId, dateFrom, dateTo, actorUserId, canViewAll = false } = {}) => {
+  const db = await connect();
+  const filters = ["sg.status = 'registered'"];
+  const values = [];
+  const requestedSellerId = Number(salesAgentUserId || 0);
+
+  if (canViewAll) {
+    if (requestedSellerId) {
+      filters.push("sg.sales_agent_user_id = ?");
+      values.push(requestedSellerId);
+    }
+  } else {
+    filters.push("sg.sales_agent_user_id = ?");
+    values.push(Number(actorUserId || 0));
+  }
+
+  if (dateFrom) {
+    filters.push("sg.gift_date >= ?");
+    values.push(String(dateFrom).slice(0, 10));
+  }
+  if (dateTo) {
+    filters.push("sg.gift_date <= ?");
+    values.push(String(dateTo).slice(0, 10));
+  }
+
+  const [gifts] = await db.query(
+    `SELECT
+       sg.id,
+       sg.branch_id,
+       b.name AS branch_name,
+       sg.customer_id,
+       c.name AS customer_name,
+       c.phone AS customer_phone,
+       c.address AS customer_address,
+       sg.sales_agent_user_id,
+       u.full_name AS sales_agent_name,
+       sg.gift_date,
+       sg.total_commercial_value,
+       sg.notes,
+       sg.created_by,
+       creator.full_name AS created_by_name,
+       sg.created_at
+     FROM sales_gifts sg
+     INNER JOIN branches b ON b.id = sg.branch_id
+     INNER JOIN customers c ON c.id = sg.customer_id
+     LEFT JOIN users u ON u.id = sg.sales_agent_user_id
+     LEFT JOIN users creator ON creator.id = sg.created_by
+     WHERE ${filters.join(" AND ")}
+     ORDER BY sg.gift_date DESC, sg.id DESC`,
+    values
+  );
+
+  const giftIds = gifts.map((gift) => Number(gift.id));
+  let items = [];
+  if (giftIds.length) {
+    const placeholders = giftIds.map(() => "?").join(",");
+    [items] = await db.query(
+      `SELECT
+         sgi.sales_gift_id,
+         sgi.product_id,
+         p.name AS product_name,
+         p.sku,
+         pc.name AS category_name,
+         sgi.quantity,
+         sgi.unit_price,
+         sgi.tax_percent,
+         sgi.commercial_value
+       FROM sales_gift_items sgi
+       INNER JOIN products p ON p.id = sgi.product_id
+       LEFT JOIN product_categories pc ON pc.id = p.category_id
+       WHERE sgi.sales_gift_id IN (${placeholders})
+       ORDER BY pc.name, p.name`,
+      giftIds
+    );
+  }
+
+  const itemsByGift = items.reduce((acc, item) => {
+    const key = Number(item.sales_gift_id);
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(item);
+    return acc;
+  }, {});
+
+  const summary = gifts.reduce(
+    (acc, gift) => {
+      acc.gift_count += 1;
+      acc.gift_total += Number(gift.total_commercial_value || 0);
+      return acc;
+    },
+    { gift_count: 0, gift_total: 0 }
+  );
+
+  return {
+    code: 1,
+    message: "obsequios listados",
+    data: {
+      items: gifts.map((gift) => ({ ...gift, items: itemsByGift[Number(gift.id)] || [] })),
+      summary: {
+        gift_count: summary.gift_count,
+        gift_total: roundMoney(summary.gift_total),
+      },
+    },
+  };
+};
+
+const createSalesGift = async (payload, actorUserId, { canViewAllCustomers = false } = {}) => {
+  const branchId = Number(payload.p_branch_id || payload.branch_id || 0);
+  const customerId = Number(payload.p_customer_id || payload.customer_id || 0);
+  const giftDate = String(payload.p_gift_date || payload.gift_date || new Date().toISOString().slice(0, 10)).slice(0, 10);
+  const notes = String(payload.p_notes || payload.notes || "").trim();
+  const items = Array.isArray(payload.p_items_json) ? payload.p_items_json : [];
+
+  if (!branchId || !customerId || !giftDate) {
+    return { code: 0, message: "sucursal, cliente y fecha son obligatorios", data: null };
+  }
+  if (!items.length) {
+    return { code: 0, message: "agrega al menos un producto de obsequio", data: null };
+  }
+  if (notes.length > 255) {
+    return { code: 0, message: "las notas permiten maximo 255 caracteres", data: null };
+  }
+
+  const db = await connect();
+  const connection = await db.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const [branches] = await connection.query(
+      "SELECT id FROM branches WHERE id = ? AND is_active = 1 LIMIT 1",
+      [branchId]
+    );
+    if (!branches.length) {
+      await connection.rollback();
+      return { code: 0, message: "sucursal no encontrada o inactiva", data: null };
+    }
+
+    const [customers] = await connection.query(
+      `SELECT c.id
+       FROM customers c
+       WHERE c.id = ?
+         AND c.status = 'active'
+         AND c.deleted_at IS NULL
+         AND (
+           ? = 1
+           OR EXISTS (
+             SELECT 1
+             FROM seller_customer_assignments sca
+             WHERE sca.customer_id = c.id
+               AND sca.sales_agent_user_id = ?
+               AND sca.is_active = 1
+           )
+         )
+       LIMIT 1`,
+      [customerId, canViewAllCustomers ? 1 : 0, Number(actorUserId || 0)]
+    );
+    if (!customers.length) {
+      await connection.rollback();
+      return { code: 0, message: "cliente no asignado al vendedor o inactivo", data: null };
+    }
+
+    const normalizedItems = [];
+    const productKeys = new Set();
+    for (const item of items) {
+      const productId = Number(item.product_id || item.p_product_id || 0);
+      const quantity = Number(item.quantity ?? item.p_quantity ?? 0);
+      if (!productId || quantity <= 0) {
+        await connection.rollback();
+        return { code: 0, message: "producto y cantidad de obsequio son obligatorios", data: null };
+      }
+      if (productKeys.has(productId)) {
+        await connection.rollback();
+        return { code: 0, message: "no repitas el mismo producto en el obsequio", data: null };
+      }
+      productKeys.add(productId);
+
+      const [products] = await connection.query(
+        `SELECT p.id, p.unit, p.base_price, t.rate_percent
+         FROM products p
+         INNER JOIN tax_rates t ON t.id = p.tax_rate_id
+         WHERE p.id = ?
+           AND p.is_active = 1
+           AND p.deleted_at IS NULL
+           AND t.is_active = 1
+         LIMIT 1`,
+        [productId]
+      );
+      if (!products.length) {
+        await connection.rollback();
+        return { code: 0, message: "uno de los productos no es valido", data: null };
+      }
+      if (String(products[0].unit) === "unit" && !Number.isInteger(quantity)) {
+        await connection.rollback();
+        return { code: 0, message: "los productos por unidad requieren cantidad entera", data: null };
+      }
+
+      const unitPrice = Number(products[0].base_price || 0);
+      const taxPercent = Number(products[0].rate_percent || 0);
+      const commercialValue = roundMoney(quantity * unitPrice * (1 + taxPercent / 100));
+      normalizedItems.push({ productId, quantity, unitPrice, taxPercent, commercialValue });
+    }
+
+    const totalCommercialValue = roundMoney(
+      normalizedItems.reduce((sum, item) => sum + Number(item.commercialValue || 0), 0)
+    );
+
+    const [giftResult] = await connection.query(
+      `INSERT INTO sales_gifts (
+         branch_id, customer_id, sales_agent_user_id, gift_date,
+         total_commercial_value, notes, created_by
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        branchId,
+        customerId,
+        Number(actorUserId || 0) || null,
+        giftDate,
+        totalCommercialValue,
+        notes || null,
+        Number(actorUserId || 0) || null,
+      ]
+    );
+    const giftId = Number(giftResult.insertId);
+
+    for (const item of normalizedItems) {
+      await connection.query(
+        `INSERT INTO sales_gift_items (
+           sales_gift_id, product_id, quantity, unit_price, tax_percent, commercial_value
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+        [giftId, item.productId, item.quantity, item.unitPrice, item.taxPercent, item.commercialValue]
+      );
+    }
+
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'sales_gift.create', 'sales_gifts', ?, JSON_OBJECT('customer_id', ?, 'gift_date', ?, 'total_commercial_value', ?))`,
+      [actorUserId || null, String(giftId), customerId, giftDate, totalCommercialValue]
+    );
+
+    await connection.commit();
+    return {
+      code: 1,
+      message: "obsequio registrado",
+      data: {
+        sales_gift_id: giftId,
+        total_commercial_value: totalCommercialValue,
+      },
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
 const listSalesCommissions = async ({ salesAgentUserId, dateFrom, dateTo } = {}) => {
   const db = await connect();
   const filters = ["sc.status IN ('accrued','adjusted')"];
@@ -2409,6 +3109,7 @@ const listSalesCommissions = async ({ salesAgentUserId, dateFrom, dateTo } = {})
       acc.returned_sales_total += Number(row.returned_sales_total || 0);
       acc.commission_base += Number(row.commission_base || 0);
       acc.commission_amount += Number(row.commission_amount || 0);
+      acc.credit_redeemed_amount += Number(row.credit_redeemed_amount || 0);
       return acc;
     },
     {
@@ -2417,6 +3118,7 @@ const listSalesCommissions = async ({ salesAgentUserId, dateFrom, dateTo } = {})
       returned_sales_total: 0,
       commission_base: 0,
       commission_amount: 0,
+      credit_redeemed_amount: 0,
     }
   );
 
@@ -2512,7 +3214,9 @@ const getDailySalesSettlement = async ({
        sc.commission_base,
        sc.commission_percent,
        sc.commission_amount,
-       ROUND(sc.delivered_sales_total - sc.commission_amount, 2) AS amount_to_deliver,
+       o.credit_redeemed_amount,
+       ROUND(sc.delivered_sales_total - COALESCE(o.credit_redeemed_amount, 0), 2) AS collected_sales_total,
+       ROUND(sc.delivered_sales_total - COALESCE(o.credit_redeemed_amount, 0) - sc.commission_amount, 2) AS amount_to_deliver,
        sc.status,
        sc.delivered_at
      FROM sales_commissions sc
@@ -2524,6 +3228,62 @@ const getDailySalesSettlement = async ({
     values
   );
 
+  const giftFilters = ["sg.gift_date = ?", "sg.status = 'registered'"];
+  const giftValues = [date];
+  if (sellerId) {
+    giftFilters.unshift("sg.sales_agent_user_id = ?");
+    giftValues.unshift(sellerId);
+  }
+
+  const [giftRows] = await db.query(
+    `SELECT
+       sg.id AS sales_gift_id,
+       sg.customer_id,
+       c.name AS customer_name,
+       sg.sales_agent_user_id,
+       u.full_name AS sales_agent_name,
+       sg.gift_date,
+       sg.total_commercial_value,
+       sg.notes,
+       GROUP_CONCAT(CONCAT(p.name, ' x ', TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM sgi.quantity))) ORDER BY p.name SEPARATOR ', ') AS products_summary
+     FROM sales_gifts sg
+     INNER JOIN customers c ON c.id = sg.customer_id
+     LEFT JOIN users u ON u.id = sg.sales_agent_user_id
+     INNER JOIN sales_gift_items sgi ON sgi.sales_gift_id = sg.id
+     INNER JOIN products p ON p.id = sgi.product_id
+     WHERE ${giftFilters.join(" AND ")}
+     GROUP BY sg.id
+     ORDER BY u.full_name, c.name, sg.id`,
+    giftValues
+  );
+    const creditFilters = ["DATE(ccl.created_at) = ?", "ccl.movement_type = 'generated'"];
+  const creditValues = [date];
+  if (sellerId) {
+    creditFilters.unshift("sr.sales_agent_user_id = ?");
+    creditValues.unshift(sellerId);
+  }
+
+  const [creditGeneratedRows] = await db.query(
+    `SELECT
+       ccl.id,
+       ccl.customer_id,
+       c.name AS customer_name,
+       ccl.amount,
+       ccl.balance_after,
+       ccl.sales_return_id,
+       sr.order_id,
+       sr.sales_agent_user_id,
+       u.full_name AS sales_agent_name,
+       ccl.created_at
+     FROM customer_credit_ledger ccl
+     INNER JOIN sales_returns sr ON sr.id = ccl.sales_return_id
+     INNER JOIN customers c ON c.id = ccl.customer_id
+     INNER JOIN users u ON u.id = sr.sales_agent_user_id
+     WHERE ${creditFilters.join(" AND ")}
+     ORDER BY u.full_name, c.name, ccl.created_at`,
+    creditValues
+  );
+
   const summary = rows.reduce(
     (acc, row) => {
       acc.order_count += 1;
@@ -2531,6 +3291,8 @@ const getDailySalesSettlement = async ({
       acc.returned_sales_total += Number(row.returned_sales_total || 0);
       acc.commission_base += Number(row.commission_base || 0);
       acc.commission_amount += Number(row.commission_amount || 0);
+      acc.credit_redeemed_amount += Number(row.credit_redeemed_amount || 0);
+      acc.collected_sales_total += Number(row.collected_sales_total || 0);
       return acc;
     },
     {
@@ -2539,6 +3301,8 @@ const getDailySalesSettlement = async ({
       returned_sales_total: 0,
       commission_base: 0,
       commission_amount: 0,
+      credit_redeemed_amount: 0,
+      collected_sales_total: 0,
     }
   );
 
@@ -2556,10 +3320,21 @@ const getDailySalesSettlement = async ({
         returned_sales_total: roundMoney(summary.returned_sales_total),
         commission_base: roundMoney(summary.commission_base),
         commission_amount: roundMoney(summary.commission_amount),
+        credit_redeemed_amount: roundMoney(summary.credit_redeemed_amount),
+        collected_sales_total: roundMoney(summary.collected_sales_total),
         amount_to_deliver: roundMoney(
-          summary.delivered_sales_total - summary.commission_amount
+          summary.collected_sales_total - summary.commission_amount
+        ),
+        gift_count: giftRows.length,
+        gift_total: roundMoney(
+          giftRows.reduce((total, gift) => total + Number(gift.total_commercial_value || 0), 0)
+        ),
+        credit_generated_total: roundMoney(
+          creditGeneratedRows.reduce((total, credit) => total + Number(credit.amount || 0), 0)
         ),
       },
+      gifts: giftRows,
+      credits_generated: creditGeneratedRows,
     },
   };
 };
@@ -2689,6 +3464,7 @@ const listSalesReturns = async ({ actorUserId, canViewAll = false, status } = {}
        sr.product_expires_at,
        sr.report_deadline_at,
        sr.notes,
+       sr.credit_amount,
        sr.authorized_by,
        authorizer.full_name AS authorized_by_name,
        sr.authorized_at,
@@ -2724,11 +3500,12 @@ const listSalesReturns = async ({ actorUserId, canViewAll = false, status } = {}
          sri.quantity,
          sri.returned_sale_value,
          sri.returned_commercial_value,
+         sri.credit_amount,
          sri.replacement_commercial_value,
          sri.notes
        FROM sales_return_items sri
        INNER JOIN products returned ON returned.id = sri.returned_product_id
-       INNER JOIN products replacement ON replacement.id = sri.replacement_product_id
+       LEFT JOIN products replacement ON replacement.id = sri.replacement_product_id
        WHERE sri.sales_return_id IN (${placeholders})
        ORDER BY sri.id`,
       returnIds
@@ -2797,14 +3574,13 @@ const createSalesReturn = async (payload, actorUserId) => {
     const seenItems = new Set();
     for (const input of inputItems) {
       const orderItemId = Number(input.order_item_id || 0);
-      const replacementProductId = Number(input.replacement_product_id || 0);
       const quantity = Number(input.quantity || 0);
       const reason = String(input.reason || "");
-      const uniqueKey = `${orderItemId}:${replacementProductId}`;
+      const uniqueKey = String(orderItemId);
 
-      if (!orderItemId || !replacementProductId || !Number.isFinite(quantity) || quantity <= 0) {
+      if (!orderItemId || !Number.isFinite(quantity) || quantity <= 0) {
         await connection.rollback();
-        return { code: 0, message: "revisa producto devuelto, reemplazo y cantidad", data: null };
+        return { code: 0, message: "revisa producto devuelto y cantidad", data: null };
       }
       if (!RETURN_REASONS.has(reason)) {
         await connection.rollback();
@@ -2812,7 +3588,7 @@ const createSalesReturn = async (payload, actorUserId) => {
       }
       if (seenItems.has(uniqueKey)) {
         await connection.rollback();
-        return { code: 0, message: "no repitas el mismo producto y reemplazo", data: null };
+        return { code: 0, message: "no repitas el mismo producto devuelto", data: null };
       }
       seenItems.add(uniqueKey);
 
@@ -2850,20 +3626,6 @@ const createSalesReturn = async (payload, actorUserId) => {
         };
       }
 
-      const [replacementRows] = await connection.query(
-        `SELECT id, base_price
-         FROM products
-         WHERE id = ?
-           AND is_active = 1
-           AND deleted_at IS NULL
-         LIMIT 1`,
-        [replacementProductId]
-      );
-      if (!replacementRows.length) {
-        await connection.rollback();
-        return { code: 0, message: "el producto de reemplazo no esta disponible", data: null };
-      }
-
       const original = orderItems[0];
       const returnedCommercialValue = roundMoney(
         (Number(original.commercial_value || original.line_total || 0) /
@@ -2873,7 +3635,6 @@ const createSalesReturn = async (payload, actorUserId) => {
       normalizedItems.push({
         orderItemId,
         returnedProductId: Number(original.product_id),
-        replacementProductId,
         reason,
         quantity,
         returnedSaleValue:
@@ -2881,23 +3642,28 @@ const createSalesReturn = async (payload, actorUserId) => {
             ? roundMoney((Number(original.line_total || 0) / Number(original.quantity || 1)) * quantity)
             : 0,
         returnedCommercialValue,
-        replacementCommercialValue: roundMoney(Number(replacementRows[0].base_price || 0) * quantity),
+        creditAmount: returnedCommercialValue,
+        replacementCommercialValue: 0,
         notes: String(input.notes || "").trim() || null,
       });
     }
 
+    const creditAmount = roundMoney(
+      normalizedItems.reduce((total, item) => total + Number(item.creditAmount || 0), 0)
+    );
     const [result] = await connection.query(
       `INSERT INTO sales_returns (
          order_id, sales_agent_user_id, status, reported_at,
-         product_expires_at, report_deadline_at, notes, created_by
+         product_expires_at, report_deadline_at, notes, credit_amount, created_by
        )
-       VALUES (?, ?, 'pending_authorization', CURRENT_TIMESTAMP, ?, ?, ?, ?)`,
+       VALUES (?, ?, 'pending_authorization', CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)`,
       [
         orderId,
         orders[0].sales_agent_user_id,
         orders[0].product_expires_at,
         orders[0].report_deadline_at,
         String(payload.p_notes || "").trim() || null,
+        creditAmount,
         actorUserId || null,
       ]
     );
@@ -2908,18 +3674,18 @@ const createSalesReturn = async (payload, actorUserId) => {
         `INSERT INTO sales_return_items (
            sales_return_id, order_item_id, returned_product_id,
            replacement_product_id, reason, quantity, returned_sale_value,
-           returned_commercial_value, replacement_commercial_value, notes
+           returned_commercial_value, credit_amount, replacement_commercial_value, notes
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`,
         [
           salesReturnId,
           item.orderItemId,
           item.returnedProductId,
-          item.replacementProductId,
           item.reason,
           item.quantity,
           item.returnedSaleValue,
           item.returnedCommercialValue,
+          item.creditAmount,
           item.replacementCommercialValue,
           item.notes,
         ]
@@ -2930,16 +3696,17 @@ const createSalesReturn = async (payload, actorUserId) => {
       `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
        VALUES (?, 'sales_return.create', 'sales_returns', ?, JSON_OBJECT(
          'order_id', ?,
-         'items_count', ?
+         'items_count', ?,
+         'credit_amount', ?
        ))`,
-      [actorUserId || null, String(salesReturnId), orderId, normalizedItems.length]
+      [actorUserId || null, String(salesReturnId), orderId, normalizedItems.length, creditAmount]
     );
 
     await connection.commit();
     return {
       code: 1,
       message: "devolucion reportada y pendiente de autorizacion",
-      data: { sales_return_id: salesReturnId },
+      data: { sales_return_id: salesReturnId, credit_amount: creditAmount },
     };
   } catch (error) {
     await connection.rollback();
@@ -2948,7 +3715,6 @@ const createSalesReturn = async (payload, actorUserId) => {
     connection.release();
   }
 };
-
 const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, actorUserId) => {
   const db = await connect();
   const connection = await db.getConnection();
@@ -2956,7 +3722,7 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
   try {
     await connection.beginTransaction();
     const [returns] = await connection.query(
-      `SELECT sr.id, sr.order_id, sr.sales_agent_user_id, sr.status, o.branch_id
+      `SELECT sr.id, sr.order_id, sr.sales_agent_user_id, sr.status, o.branch_id, o.customer_id
        FROM sales_returns sr
        INNER JOIN orders o ON o.id = sr.order_id
        WHERE sr.id = ?
@@ -2993,46 +3759,6 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
       return { code: 0, message: "la devolucion no tiene productos", data: null };
     }
 
-    const replacementTotals = items.reduce((acc, item) => {
-      const productId = Number(item.replacement_product_id);
-      acc[productId] = (acc[productId] || 0) + Number(item.quantity || 0);
-      return acc;
-    }, {});
-
-    for (const [productIdText, quantity] of Object.entries(replacementTotals)) {
-      const productId = Number(productIdText);
-      await connection.query(
-        `INSERT IGNORE INTO stock_products (
-           branch_id, product_id, quantity_on_hand, min_stock
-         ) VALUES (?, ?, 0, 0)`,
-        [salesReturn.branch_id, productId]
-      );
-      const [stockRows] = await connection.query(
-        `SELECT quantity_on_hand
-         FROM stock_products
-         WHERE branch_id = ?
-           AND product_id = ?
-         FOR UPDATE`,
-        [salesReturn.branch_id, productId]
-      );
-      if (Number(stockRows[0]?.quantity_on_hand || 0) < quantity) {
-        await connection.rollback();
-        return {
-          code: 0,
-          message: `stock insuficiente para entregar el reemplazo del producto ${productId}`,
-          data: null,
-        };
-      }
-      await connection.query(
-        `UPDATE stock_products
-         SET quantity_on_hand = quantity_on_hand - ?,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE branch_id = ?
-           AND product_id = ?`,
-        [quantity, salesReturn.branch_id, productId]
-      );
-    }
-
     for (const item of items) {
       await connection.query(
         `INSERT INTO inventory_movements (
@@ -3050,26 +3776,42 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
           actorUserId,
         ]
       );
-      await connection.query(
-        `INSERT INTO inventory_movements (
-           branch_id, item_type, raw_material_id, product_id, movement_type,
-           quantity, unit_cost, reference_type, reference_id, notes, created_by
-         )
-         VALUES (?, 'product', NULL, ?, 'exchange_out', ?, NULL,
-           'sales_return', ?, 'Producto entregado como reemplazo', ?)`,
-        [
-          salesReturn.branch_id,
-          item.replacement_product_id,
-          item.quantity,
-          salesReturn.id,
-          actorUserId,
-        ]
-      );
     }
 
     const returnedSalesTotal = roundMoney(
       items.reduce((total, item) => total + Number(item.returned_sale_value || 0), 0)
     );
+    const creditAmount = roundMoney(
+      items.reduce(
+        (total, item) => total + Number(item.credit_amount || item.returned_commercial_value || 0),
+        0
+      )
+    );
+
+    if (creditAmount <= 0) {
+      await connection.rollback();
+      return { code: 0, message: "la devolucion no tiene saldo a favor para generar", data: null };
+    }
+
+    const creditResult = await addCustomerCreditMovement(connection, {
+      customerId: salesReturn.customer_id,
+      movementType: "generated",
+      amount: creditAmount,
+      salesReturnId: salesReturn.id,
+      notes: `Saldo generado por devolucion ${salesReturn.id}`,
+      metadata: {
+        source: "sales_return",
+        sales_return_id: salesReturn.id,
+        order_id: salesReturn.order_id,
+        returned_sales_total: returnedSalesTotal,
+      },
+      actorUserId,
+    });
+    if (creditResult.code !== 1) {
+      await connection.rollback();
+      return { code: 0, message: creditResult.message, data: null };
+    }
+
     const [commissionRows] = await connection.query(
       `SELECT *
        FROM sales_commissions
@@ -3111,26 +3853,28 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
     await connection.query(
       `UPDATE sales_returns
        SET status = 'completed',
+           credit_amount = ?,
            authorized_by = ?,
            authorized_at = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [actorUserId, salesReturn.id]
+      [creditAmount, actorUserId, salesReturn.id]
     );
     await connection.query(
       `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
        VALUES (?, 'sales_return.authorize', 'sales_returns', ?, JSON_OBJECT(
          'order_id', ?,
-         'returned_sales_total', ?
+         'returned_sales_total', ?,
+         'credit_amount', ?
        ))`,
-      [actorUserId, String(salesReturn.id), salesReturn.order_id, returnedSalesTotal]
+      [actorUserId, String(salesReturn.id), salesReturn.order_id, returnedSalesTotal, creditAmount]
     );
 
     await connection.commit();
     return {
       code: 1,
-      message: "devolucion autorizada y reemplazo registrado",
-      data: { sales_return_id: Number(salesReturn.id) },
+      message: "devolucion autorizada y saldo a favor generado",
+      data: { sales_return_id: Number(salesReturn.id), credit_amount: creditAmount },
     };
   } catch (error) {
     await connection.rollback();
@@ -3139,7 +3883,6 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
     connection.release();
   }
 };
-
 const rejectSalesReturn = async ({ salesReturnId, reason, canAuthorize = false }, actorUserId) => {
   const rejectionReason = String(reason || "").trim();
   if (rejectionReason.length < 5) {
@@ -3717,6 +4460,7 @@ const getPurchaseOrderDetail = async ({ purchaseOrderId }) => {
 };
 
 module.exports = {
+  getCustomerCreditBalance,
   listOrders,
   listOrderItems,
   listProductionReservations,
@@ -3739,8 +4483,11 @@ module.exports = {
   cancelOrder,
   dispatchOrder,
   deliverOrder,
+  updateOrderDeliveryDate,
   listSalesCommissions,
+  listSalesGifts,
   getDailySalesSettlement,
+  createSalesGift,
   listSalesReturnOptions,
   listSalesReturns,
   createSalesReturn,
@@ -3753,3 +4500,26 @@ module.exports = {
   getPurchaseOrderDetail,
   receivePurchaseOrder,
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

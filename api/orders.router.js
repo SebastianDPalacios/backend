@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const { verifyToken, requirePermission } = require("../middlewares/auth.handler");
 const {
   listOrders,
@@ -23,8 +23,12 @@ const {
   cancelOrder,
   dispatchOrder,
   deliverOrder,
+  updateOrderDeliveryDate,
   listSalesCommissions,
+  listSalesGifts,
   getDailySalesSettlement,
+  createSalesGift,
+  getCustomerCreditBalance,
   listSalesReturnOptions,
   listSalesReturns,
   createSalesReturn,
@@ -187,6 +191,44 @@ router.get("/commissions/daily-settlement", verifyToken, canManageOrders, async 
   }
 });
 
+router.get("/gifts", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await listSalesGifts({
+      salesAgentUserId: req.query.salesAgentUserId,
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/gifts", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await createSalesGift(req.body, req.user.userId, {
+      canViewAllCustomers: hasElevatedCustomerAccess(req.user),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/customer-credits/:customerId", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await getCustomerCreditBalance({
+      customerId: req.params.customerId,
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
 router.get("/returns/options", verifyToken, canManageOrders, async (req, res, next) => {
   try {
     const result = await listSalesReturnOptions({
@@ -403,6 +445,20 @@ router.post("/production-reservations/:id/release", verifyToken, canManageOrders
   }
 });
 
+router.put("/:id/delivery-date", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await updateOrderDeliveryDate(
+      {
+        orderId: Number(req.params.id),
+        deliveryDate: req.body?.delivery_date,
+      },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
 router.post("/:id/items", verifyToken, canManageOrders, async (req, res, next) => {
   try {
     const result = await upsertOrderItem(
@@ -488,3 +544,6 @@ router.post("/purchase-orders/:id/receive", verifyToken, canManageInventory, asy
 });
 
 module.exports = router;
+
+
+

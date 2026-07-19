@@ -1,6 +1,6 @@
-const crypto = require("crypto");
+﻿const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
-const { callProcedure } = require("../data-access");
+const { callProcedure, connect } = require("../data-access");
 const { signToken } = require("../middlewares/auth.handler");
 const { mapSpResult } = require("./sp-response");
 
@@ -11,6 +11,21 @@ const addDaysAsSqlDatetime = (days) => {
   date.setDate(date.getDate() + Number(days));
   const pad = (n) => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+};
+const getActiveEmployeeForUser = async (userId) => {
+  const db = await connect();
+  const [rows] = await db.query(
+    `SELECT id, employee_code, job_type, custom_job_title, status
+       FROM employees
+      WHERE user_id = ?
+        AND deleted_at IS NULL
+        AND status = 'active'
+      ORDER BY id DESC
+      LIMIT 1`,
+    [userId]
+  );
+
+  return rows[0] || null;
 };
 
 const login = async ({ identifier, password, ipAddress, userAgent }) => {
@@ -55,6 +70,7 @@ const login = async ({ identifier, password, ipAddress, userAgent }) => {
 
   const permissionsOut = await callProcedure("sp_permission_list_by_user", [start.data.user_id]);
   const permissions = mapSpResult(permissionsOut);
+  const employee = await getActiveEmployeeForUser(start.data.user_id);
   const roles = permissions.data ? permissions.data.roles : [];
   const permissionCodes = permissions.data ? permissions.data.permissions : [];
   const accessToken = signToken({
@@ -65,6 +81,7 @@ const login = async ({ identifier, password, ipAddress, userAgent }) => {
       email: start.data.email,
       roles,
       permissions: permissionCodes,
+      employee,
     },
   });
 
@@ -80,6 +97,7 @@ const login = async ({ identifier, password, ipAddress, userAgent }) => {
         username: start.data.username,
         email: start.data.email,
         must_change_password: success.data.must_change_password,
+        employee,
       },
       roles,
       permissions: permissionCodes,
@@ -108,12 +126,14 @@ const refreshSession = async ({ sessionId, userId, refreshToken }) => {
 
   const permissionsOut = await callProcedure("sp_permission_list_by_user", [userId]);
   const permissions = mapSpResult(permissionsOut);
+  const employee = await getActiveEmployeeForUser(userId);
   const accessToken = signToken({
     user: {
       userId,
       sessionId,
       roles: permissions.data ? permissions.data.roles : [],
       permissions: permissions.data ? permissions.data.permissions : [],
+      employee,
     },
   });
   return {
@@ -138,3 +158,6 @@ module.exports = {
   refreshSession,
   logout,
 };
+
+
+

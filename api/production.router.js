@@ -9,13 +9,16 @@ const {
   cancelProductionOrderItem,
   registerProductionOrderItemResult,
   listProductionBaseData,
+  listMyProductionBaseData,
   registerProductionResult,
   registerProductionBatch,
+  registerMyProductionBatch,
   listPendingPackaging,
   createPackingReport,
   listJustifiedShortages,
   registerProductionDamage,
   getRawMaterialUsageReport,
+  getRawMaterialUsageByProductReport,
   getPackingSummaryReport,
   getProductionDayReport,
   getProductionMonthReport,
@@ -31,6 +34,8 @@ const {
 
 const router = express.Router();
 const canManageProduction = requirePermission("production.manage");
+const canRegisterBakerProduction = requirePermission("production.baker", "production.manage");
+const canRegisterPackaging = requirePermission("production.packaging", "production.manage");
 
 router.get("/plans", verifyToken, canManageProduction, async (req, res, next) => {
   try {
@@ -53,7 +58,7 @@ router.post("/plans", verifyToken, canManageProduction, async (req, res, next) =
   }
 });
 
-router.get("/my-plans", verifyToken, async (req, res, next) => {
+router.get("/my-plans", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
   try {
     const result = await listProductionPlans({
       userId: req.user.userId,
@@ -65,7 +70,24 @@ router.get("/my-plans", verifyToken, async (req, res, next) => {
   }
 });
 
-router.post("/plans/items/:id/start", verifyToken, async (req, res, next) => {
+router.get("/my-base-data", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
+  try {
+    const result = await listMyProductionBaseData({ userId: req.user.userId });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/my-batches", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
+  try {
+    const result = await registerMyProductionBatch(req.body, req.user.userId);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+router.post("/plans/items/:id/start", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
   try {
     const result = await startProductionPlanItem({
       productionPlanItemId: Number(req.params.id),
@@ -77,7 +99,7 @@ router.post("/plans/items/:id/start", verifyToken, async (req, res, next) => {
   }
 });
 
-router.post("/plans/items/:id/finish", verifyToken, async (req, res, next) => {
+router.post("/plans/items/:id/finish", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
   try {
     const result = await finishProductionPlanItem({
       productionPlanItemId: Number(req.params.id),
@@ -239,7 +261,7 @@ router.post("/batches", verifyToken, canManageProduction, async (req, res, next)
   }
 });
 
-router.get("/packaging/pending", verifyToken, canManageProduction, async (req, res, next) => {
+router.get("/packaging/pending", verifyToken, canRegisterPackaging, async (req, res, next) => {
   try {
     const result = await listPendingPackaging({
       branchId: req.query.branchId || req.query.branch_id,
@@ -251,7 +273,7 @@ router.get("/packaging/pending", verifyToken, canManageProduction, async (req, r
   }
 });
 
-router.post("/packaging/reports", verifyToken, canManageProduction, async (req, res, next) => {
+router.post("/packaging/reports", verifyToken, canRegisterPackaging, async (req, res, next) => {
   try {
     const result = await createPackingReport(req.body, req.user.userId);
     res.json(result);
@@ -278,7 +300,7 @@ router.get("/packaging/shortages", verifyToken, canManageProduction, async (req,
   }
 });
 
-router.post("/damages", verifyToken, canManageProduction, async (req, res, next) => {
+router.post("/damages", verifyToken, canRegisterPackaging, async (req, res, next) => {
   try {
     const result = await registerProductionDamage(req.body, req.user.userId);
     res.json(result);
@@ -300,6 +322,21 @@ router.get("/reports/raw-material-usage", verifyToken, canManageProduction, asyn
   }
 });
 
+router.get("/reports/raw-material-usage-by-product", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await getRawMaterialUsageByProductReport({
+      dateFrom: req.query.dateFrom || req.query.date_from,
+      dateTo: req.query.dateTo || req.query.date_to,
+      branchId: req.query.branchId || req.query.branch_id,
+      recipeId: req.query.recipeId || req.query.recipe_id,
+      productId: req.query.productId || req.query.product_id,
+      rawMaterialId: req.query.rawMaterialId || req.query.raw_material_id,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
 router.get("/reports/packing-summary", verifyToken, canManageProduction, async (req, res, next) => {
   try {
     const result = await getPackingSummaryReport({
@@ -368,3 +405,8 @@ router.post("/orders/:id/cancel", verifyToken, canManageProduction, async (req, 
 });
 
 module.exports = router;
+
+
+
+
+
