@@ -42,6 +42,26 @@ const defaultOrderReceiptSettings = {
   showExtraLegend: false,
   extraLegendTitle: "LEYENDA ADICIONAL",
   extraLegendText: "",
+  settlementPrint: {
+    pageWidthMm: 80,
+    pageMarginMm: 3,
+    bodyWidthMm: 74,
+    bodyFontSize: 10.5,
+    titleFontSize: 20,
+    metaFontSize: 12,
+    customerFontSize: 11.5,
+    mutedFontSize: 10,
+    totalsFontSize: 11.5,
+    deliverFontSize: 15,
+    footerFontSize: 9,
+    showGrossSale: true,
+    showCreditApplied: true,
+    showCollectedSale: true,
+    showReturns: true,
+    showCreditGenerated: true,
+    showGifts: true,
+    showCommission: true,
+  },
 };
 
 const parseSettings = (value) => {
@@ -105,6 +125,8 @@ const sanitizeOrderReceiptSettings = (payload = {}) => {
     ? payload.fontScale
     : defaultOrderReceiptSettings.fontScale;
 
+  const settlementPrint = payload.settlementPrint || {};
+
   return {
     businessName: trimText(payload.businessName, 80, defaultOrderReceiptSettings.businessName),
     businessSubtitle: trimText(payload.businessSubtitle, 140),
@@ -143,6 +165,26 @@ const sanitizeOrderReceiptSettings = (payload = {}) => {
     showExtraLegend: toBoolean(payload.showExtraLegend, defaultOrderReceiptSettings.showExtraLegend),
     extraLegendTitle: trimText(payload.extraLegendTitle, 80, defaultOrderReceiptSettings.extraLegendTitle),
     extraLegendText: trimText(payload.extraLegendText, 900),
+    settlementPrint: {
+      pageWidthMm: numberBetween(settlementPrint.pageWidthMm, 80, 58, 120),
+      pageMarginMm: numberBetween(settlementPrint.pageMarginMm, 3, 0, 10),
+      bodyWidthMm: numberBetween(settlementPrint.bodyWidthMm, 74, 38, 110),
+      bodyFontSize: numberBetween(settlementPrint.bodyFontSize, 10.5, 8, 18),
+      titleFontSize: numberBetween(settlementPrint.titleFontSize, 20, 14, 32),
+      metaFontSize: numberBetween(settlementPrint.metaFontSize, 12, 9, 20),
+      customerFontSize: numberBetween(settlementPrint.customerFontSize, 11.5, 9, 22),
+      mutedFontSize: numberBetween(settlementPrint.mutedFontSize, 10, 8, 16),
+      totalsFontSize: numberBetween(settlementPrint.totalsFontSize, 11.5, 9, 20),
+      deliverFontSize: numberBetween(settlementPrint.deliverFontSize, 15, 12, 28),
+      footerFontSize: numberBetween(settlementPrint.footerFontSize, 9, 7, 14),
+      showGrossSale: toBoolean(settlementPrint.showGrossSale, true),
+      showCreditApplied: toBoolean(settlementPrint.showCreditApplied, true),
+      showCollectedSale: toBoolean(settlementPrint.showCollectedSale, true),
+      showReturns: toBoolean(settlementPrint.showReturns, true),
+      showCreditGenerated: toBoolean(settlementPrint.showCreditGenerated, true),
+      showGifts: toBoolean(settlementPrint.showGifts, true),
+      showCommission: toBoolean(settlementPrint.showCommission, true),
+    },
   };
 };
 

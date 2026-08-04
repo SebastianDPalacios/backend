@@ -2046,6 +2046,19 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
     [reportDateFrom, reportDateTo, branchId || null, branchId || null]
   );
 
+  const [salesUsers] = await db.query(
+    `SELECT DISTINCT
+       u.id AS sales_agent_user_id,
+       u.full_name AS sales_agent_name
+     FROM users u
+     INNER JOIN user_roles ur ON ur.user_id = u.id
+     INNER JOIN roles r ON r.id = ur.role_id
+     WHERE r.code = 'VENTAS'
+       AND u.status = 'active'
+       AND u.deleted_at IS NULL
+     ORDER BY u.full_name, u.id`
+  );
+
   const [rawInventoryRows] = await db.query(
     `
       SELECT
@@ -2137,6 +2150,7 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
       recipe_materials_usage: recipeMaterialRows,
       flour_daily_usage: flourDailyRows,
       returns_summary: returnRows,
+      sales_users: salesUsers,
       inventory_snapshot: {
         raw_materials: rawInventoryRows,
         finished_products: productInventoryRows,
