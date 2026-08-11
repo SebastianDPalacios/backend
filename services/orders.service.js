@@ -897,10 +897,10 @@ const listOrderBaseData = async ({
        p.id,
        p.category_id,
        pc.name AS category_name,
-       t.rate_percent AS tax_percent
+       COALESCE(t.rate_percent, 0) AS tax_percent
      FROM products p
      LEFT JOIN product_categories pc ON pc.id = p.category_id
-     INNER JOIN tax_rates t ON t.id = p.tax_rate_id
+     LEFT JOIN tax_rates t ON t.id = p.tax_rate_id
      WHERE p.deleted_at IS NULL`
   );
   const productMetaById = new Map(
@@ -1495,14 +1495,13 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
              p.unit,
              p.base_price,
              pc.name AS category_name,
-             t.rate_percent
+             COALESCE(t.rate_percent, 0) AS rate_percent
            FROM products p
            LEFT JOIN product_categories pc ON pc.id = p.category_id
-           INNER JOIN tax_rates t ON t.id = p.tax_rate_id
+           LEFT JOIN tax_rates t ON t.id = p.tax_rate_id AND t.is_active = 1
            WHERE p.id = ?
              AND p.is_active = 1
              AND p.deleted_at IS NULL
-             AND t.is_active = 1
            LIMIT 1`,
           [productId]
         );
@@ -2090,14 +2089,13 @@ const upsertOrderItem = async (payload, actorUserId) => {
            p.unit,
            p.base_price,
            pc.name AS category_name,
-           t.rate_percent
+           COALESCE(t.rate_percent, 0) AS rate_percent
          FROM products p
          LEFT JOIN product_categories pc ON pc.id = p.category_id
-         INNER JOIN tax_rates t ON t.id = p.tax_rate_id
+         LEFT JOIN tax_rates t ON t.id = p.tax_rate_id AND t.is_active = 1
          WHERE p.id = ?
            AND p.is_active = 1
            AND p.deleted_at IS NULL
-           AND t.is_active = 1
          LIMIT 1`,
         [productId]
       );
@@ -2981,13 +2979,12 @@ const createSalesGift = async (payload, actorUserId, { canViewAllCustomers = fal
       productKeys.add(productId);
 
       const [products] = await connection.query(
-        `SELECT p.id, p.unit, p.base_price, t.rate_percent
+        `SELECT p.id, p.unit, p.base_price, COALESCE(t.rate_percent, 0) AS rate_percent
          FROM products p
-         INNER JOIN tax_rates t ON t.id = p.tax_rate_id
+         LEFT JOIN tax_rates t ON t.id = p.tax_rate_id AND t.is_active = 1
          WHERE p.id = ?
            AND p.is_active = 1
            AND p.deleted_at IS NULL
-           AND t.is_active = 1
          LIMIT 1`,
         [productId]
       );

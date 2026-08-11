@@ -5,9 +5,41 @@ const {
   updateCustomer,
   setCustomerStatus,
 } = require("../services/commercial.service");
+const {
+  listSellerCustomerAssignments,
+  assignCustomerToSeller,
+  unassignCustomerFromSeller,
+} = require("../services/orders.service");
 
 const router = express.Router();
 const canManageCustomers = requirePermission("customers.manage");
+
+router.get("/customer-assignments", verifyToken, canManageCustomers, async (req, res, next) => {
+  try {
+    res.json(await listSellerCustomerAssignments());
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.put("/customer-assignments/:customerId", verifyToken, canManageCustomers, async (req, res, next) => {
+  try {
+    res.json(await assignCustomerToSeller({
+      customerId: Number(req.params.customerId),
+      salesAgentUserId: Number(req.body?.sales_agent_user_id),
+    }, req.user.userId));
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.delete("/customer-assignments/:customerId", verifyToken, canManageCustomers, async (req, res, next) => {
+  try {
+    res.json(await unassignCustomerFromSeller({ customerId: Number(req.params.customerId) }, req.user.userId));
+  } catch (error) {
+    next(error);
+  }
+});
 
 router.post("/customers", verifyToken, canManageCustomers, async (req, res, next) => {
   try {
