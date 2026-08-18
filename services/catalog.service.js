@@ -108,7 +108,15 @@ const listProducts = async ({ onlyActive, categoryId, search, page, pageSize }) 
     Number(page || 1),
     Number(pageSize || 20),
   ]);
-  return mapSpResult(out);
+  const result = mapSpResult(out);
+  if (result.code === 1 && Array.isArray(result.data?.items) && result.data.items.length) {
+    const db = await connect();
+    const ids = result.data.items.map((item) => Number(item.id)).filter(Boolean);
+    const [rows] = await db.query(`SELECT id, includes_bonus FROM products WHERE id IN (${ids.map(() => "?").join(",")})`, ids);
+    const flags = new Map(rows.map((row) => [Number(row.id), Number(row.includes_bonus || 0)]));
+    result.data.items = result.data.items.map((item) => ({ ...item, includes_bonus: flags.get(Number(item.id)) || 0 }));
+  }
+  return result;
 };
 
 const listRawMaterials = async ({ onlyActive, categoryId, search, page, pageSize }) => {
@@ -286,7 +294,12 @@ const createProduct = async (payload, actorUserId) => {
     payload.p_is_active || null,
     actorUserId || null,
   ]);
-  return mapSpResult(out);
+  const result = mapSpResult(out);
+  if (result.code === 1 && result.data?.product_id) {
+    const db = await connect();
+    await db.query("UPDATE products SET includes_bonus = ? WHERE id = ?", [Number(payload.p_includes_bonus || 0), Number(result.data.product_id)]);
+  }
+  return result;
 };
 
 const updateProduct = async (payload, actorUserId) => {
@@ -303,7 +316,12 @@ const updateProduct = async (payload, actorUserId) => {
     payload.p_is_active || null,
     actorUserId || null,
   ]);
-  return mapSpResult(out);
+  const result = mapSpResult(out);
+  if (result.code === 1) {
+    const db = await connect();
+    await db.query("UPDATE products SET includes_bonus = ? WHERE id = ?", [Number(payload.p_includes_bonus || 0), Number(payload.p_product_id)]);
+  }
+  return result;
 };
 
 const updateProductYield = async (payload, actorUserId) => {

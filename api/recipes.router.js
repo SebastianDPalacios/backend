@@ -13,6 +13,7 @@ const {
   addRecipeOutput,
   removeRecipeOutput,
   listRecipeOutputs,
+  deleteRecipeFamily,
 } = require("../services/recipes.service");
 
 const router = express.Router();
@@ -57,6 +58,14 @@ router.get("/:id", verifyToken, canManageRecipes, async (req, res, next) => {
       recipeId: Number(req.params.id),
     });
     res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.delete("/:id", verifyToken, canManageRecipes, async (req, res, next) => {
+  try {
+    res.json(await deleteRecipeFamily({ recipeId: Number(req.params.id) }, req.user.userId));
   } catch (error) {
     next(error);
   }

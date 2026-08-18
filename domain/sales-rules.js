@@ -117,12 +117,15 @@ const validateBonusAllowance = ({
   bonusTotal,
   bonusPercent,
   bonusMinimumAmount,
+  bonusMaxCompanyLossAmount = 0,
+  bonusLineCount = 0,
 }) => {
   const chargedTotal = roundMoney(grandTotal);
   const appliedBonus = roundMoney(bonusTotal);
   const minimum = roundMoney(bonusMinimumAmount);
   const allowedBonus = chargedTotal >= minimum
-    ? roundMoney(chargedTotal * (Number(bonusPercent || 0) / 100))
+    ? roundMoney(chargedTotal * (Number(bonusPercent || 0) / 100)
+        + Number(bonusMaxCompanyLossAmount || 0) * Number(bonusLineCount || 0))
     : 0;
 
   if (appliedBonus > allowedBonus) {

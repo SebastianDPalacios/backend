@@ -441,6 +441,62 @@ const listRecipeOutputs = async (payload) => {
   return mapSpResult(out);
 };
 
+const deleteRecipeFamily = async ({ recipeId }, actorUserId) => {
+  const db = await connect();
+  const connection = await db.getConnection();
+  await connection.beginTransaction();
+  try {
+    const [recipeRows] = await connection.query(
+      `SELECT id, COALESCE(recipe_family_id, id) AS family_id
+         FROM recipes WHERE id = ? LIMIT 1 FOR UPDATE`,
+      [Number(recipeId)]
+    );
+    if (!recipeRows.length) {
+      await connection.rollback();
+      return { code: 0, message: "receta no encontrada", data: null };
+    }
+
+    const familyId = Number(recipeRows[0].family_id);
+    const [versions] = await connection.query(
+      `SELECT id FROM recipes
+        WHERE id = ? OR recipe_family_id = ?
+        ORDER BY id FOR UPDATE`,
+      [familyId, familyId]
+    );
+    const versionIds = versions.map((row) => Number(row.id));
+    const placeholders = versionIds.map(() => "?").join(",");
+    const usageChecks = [
+      ["production_batches", "lotes de produccion"],
+      ["production_plan_items", "planes de produccion"],
+      ["production_order_items", "ordenes de produccion"],
+    ];
+    for (const [tableName, label] of usageChecks) {
+      const [usageRows] = await connection.query(
+        `SELECT COUNT(*) AS total FROM ${tableName} WHERE recipe_id IN (${placeholders})`,
+        versionIds
+      );
+      if (Number(usageRows[0]?.total || 0) > 0) {
+        await connection.rollback();
+        return { code: 0, message: `No se puede eliminar: la receta tiene ${label} asociados.`, data: null };
+      }
+    }
+
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'recipe.family.delete', 'recipes', ?, JSON_OBJECT('version_ids', ?))`,
+      [actorUserId || null, String(familyId), JSON.stringify(versionIds)]
+    );
+    await connection.query(`DELETE FROM recipes WHERE id IN (${placeholders})`, versionIds);
+    await connection.commit();
+    return { code: 1, message: "receta y todas sus versiones eliminadas", data: { family_id: familyId, deleted_versions: versionIds.length } };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
 module.exports = {
   createRecipe,
   listRecipes,
@@ -454,4 +510,5 @@ module.exports = {
   addRecipeOutput,
   removeRecipeOutput,
   listRecipeOutputs,
+  deleteRecipeFamily,
 };

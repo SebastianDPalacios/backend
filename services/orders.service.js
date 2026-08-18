@@ -260,6 +260,8 @@ const listOrders = async ({
         o.bonus_total,
         o.gift_total,
         o.exchange_total,
+        o.credit_redeemed_amount,
+        ROUND(o.grand_total + o.exchange_total - LEAST(o.credit_redeemed_amount, o.exchange_total), 2) AS amount_to_collect,
         o.commission_base,
         o.commission_total,
         o.print_count,
@@ -877,6 +879,7 @@ const listOrderBaseData = async ({
     `SELECT
        bonus_percent,
        bonus_minimum_amount,
+       bonus_max_company_loss_amount,
        external_seller_commission_percent
      FROM sales_settings
      WHERE id = 1`
@@ -896,6 +899,7 @@ const listOrderBaseData = async ({
     `SELECT
        p.id,
        p.category_id,
+       p.includes_bonus,
        pc.name AS category_name,
        COALESCE(t.rate_percent, 0) AS tax_percent
      FROM products p
@@ -914,6 +918,7 @@ const listOrderBaseData = async ({
         category_id: meta.category_id || product.category_id || null,
         category_name: meta.category_name || product.category_name || null,
         tax_percent: Number(meta.tax_percent || 0),
+        includes_bonus: Number(meta.includes_bonus || 0),
       };
     });
   }
@@ -1332,6 +1337,7 @@ const getSalesSettings = async () => {
     `SELECT
        bonus_percent,
        bonus_minimum_amount,
+       bonus_max_company_loss_amount,
        external_seller_commission_percent,
        updated_at
      FROM sales_settings
@@ -1348,6 +1354,7 @@ const getSalesSettings = async () => {
 const updateSalesSettings = async (payload, actorUserId) => {
   const bonusPercent = Number(payload.bonus_percent);
   const bonusMinimumAmount = Number(payload.bonus_minimum_amount);
+  const bonusMaxCompanyLossAmount = Number(payload.bonus_max_company_loss_amount);
   const commissionPercent = Number(payload.external_seller_commission_percent);
 
   if (!Number.isFinite(bonusPercent) || bonusPercent < 0 || bonusPercent > 100) {
@@ -1355,6 +1362,9 @@ const updateSalesSettings = async (payload, actorUserId) => {
   }
   if (!Number.isFinite(bonusMinimumAmount) || bonusMinimumAmount < 0) {
     return { code: 0, message: "la compra minima para vendaje no puede ser negativa", data: null };
+  }
+  if (!Number.isFinite(bonusMaxCompanyLossAmount) || bonusMaxCompanyLossAmount < 0) {
+    return { code: 0, message: "el margen maximo de perdida no puede ser negativo", data: null };
   }
   if (!Number.isFinite(commissionPercent) || commissionPercent < 0 || commissionPercent > 100) {
     return { code: 0, message: "la comision debe estar entre 0 y 100", data: null };
@@ -1368,12 +1378,14 @@ const updateSalesSettings = async (payload, actorUserId) => {
       `UPDATE sales_settings
        SET bonus_percent = ?,
            bonus_minimum_amount = ?,
+           bonus_max_company_loss_amount = ?,
            external_seller_commission_percent = ?,
            updated_by = ?
        WHERE id = 1`,
       [
         roundMoney(bonusPercent),
         roundMoney(bonusMinimumAmount),
+        roundMoney(bonusMaxCompanyLossAmount),
         roundMoney(commissionPercent),
         actorUserId || null,
       ]
@@ -1387,6 +1399,7 @@ const updateSalesSettings = async (payload, actorUserId) => {
          JSON_OBJECT(
            'bonus_percent', ?,
            'bonus_minimum_amount', ?,
+           'bonus_max_company_loss_amount', ?,
            'external_seller_commission_percent', ?
          )
        )`,
@@ -1394,6 +1407,7 @@ const updateSalesSettings = async (payload, actorUserId) => {
         actorUserId || null,
         roundMoney(bonusPercent),
         roundMoney(bonusMinimumAmount),
+        roundMoney(bonusMaxCompanyLossAmount),
         roundMoney(commissionPercent),
       ]
     );
@@ -1470,7 +1484,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
       }
 
       const [settingsRows] = await connection.query(
-        `SELECT bonus_percent, bonus_minimum_amount, external_seller_commission_percent
+        `SELECT bonus_percent, bonus_minimum_amount, bonus_max_company_loss_amount, external_seller_commission_percent
          FROM sales_settings
          WHERE id = 1
          FOR UPDATE`
@@ -1572,9 +1586,9 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           category_name: item.categoryName,
         }))
       );
-      if (!normalizedItems.some((item) => item.lineType === "sale")) {
+      if (!normalizedItems.some((item) => ["sale", "exchange"].includes(item.lineType))) {
         await connection.rollback();
-        return { code: 0, message: "agrega al menos un producto de venta", data: null };
+        return { code: 0, message: "agrega al menos un producto de venta o cambio", data: null };
       }
       try {
         validateBonusAllowance({
@@ -1582,22 +1596,16 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           bonusTotal: totals.bonusTotal,
           bonusPercent: settings.bonus_percent,
           bonusMinimumAmount: settings.bonus_minimum_amount,
+          bonusMaxCompanyLossAmount: settings.bonus_max_company_loss_amount,
+          bonusLineCount: normalizedItems.filter((item) => item.lineType === "bonus").length,
         });
       } catch (error) {
         await connection.rollback();
         return { code: 0, message: error.message, data: null };
       }
 
-      const creditRedeemedAmount = roundMoney(payload.p_credit_redeemed_amount || 0);
-      if (creditRedeemedAmount < 0) {
-        await connection.rollback();
-        return { code: 0, message: "el saldo a favor no puede ser negativo", data: null };
-      }
-      if (creditRedeemedAmount > roundMoney(totals.grandTotal)) {
-        await connection.rollback();
-        return { code: 0, message: "el saldo a favor no puede superar el total vendido", data: null };
-      }
-      if (creditRedeemedAmount > 0) {
+      let creditRedeemedAmount = 0;
+      if (roundMoney(totals.exchangeTotal) > 0) {
         await ensureCustomerCreditAccount(connection, customerId);
         const [creditRows] = await connection.query(
           `SELECT balance_amount
@@ -1606,19 +1614,19 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
            FOR UPDATE`,
           [customerId]
         );
-        if (Number(creditRows[0]?.balance_amount || 0) < creditRedeemedAmount) {
-          await connection.rollback();
-          return { code: 0, message: "el saldo a favor del cliente no es suficiente", data: null };
-        }
+        creditRedeemedAmount = Math.min(
+          roundMoney(creditRows[0]?.balance_amount || 0),
+          roundMoney(totals.exchangeTotal)
+        );
       }
       const [orderResult] = await connection.query(
         `INSERT INTO orders (
            branch_id, customer_id, sales_agent_user_id, route_id,
            order_date, delivery_date, status, subtotal, tax_total, grand_total,
-           bonus_percent, bonus_minimum_amount, seller_commission_percent,
+           bonus_percent, bonus_minimum_amount, bonus_max_company_loss_amount, seller_commission_percent,
            bonus_total, gift_total, exchange_total, credit_redeemed_amount, notes, created_by
          )
-         VALUES (?, ?, ?, NULL, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, NULL, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           branchId,
           customerId,
@@ -1630,6 +1638,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           roundMoney(totals.grandTotal),
           roundMoney(settings.bonus_percent),
           roundMoney(settings.bonus_minimum_amount),
+          roundMoney(settings.bonus_max_company_loss_amount),
           roundMoney(settings.external_seller_commission_percent),
           roundMoney(totals.bonusTotal),
           roundMoney(totals.giftTotal),
@@ -1743,6 +1752,8 @@ const getOrderPrintData = async ({
        o.bonus_total,
        o.gift_total,
        o.exchange_total,
+       o.credit_redeemed_amount,
+       ROUND(o.grand_total + o.exchange_total - LEAST(o.credit_redeemed_amount, o.exchange_total), 2) AS amount_to_collect,
        o.notes,
        o.print_count,
        o.last_printed_at,
@@ -1917,13 +1928,9 @@ const recalculateDeliveredOrderCommission = async ({ connection, orderId, order,
     commissionPercent: order.seller_commission_percent,
   });
 
-  if (deliveredCommission.deliveredSalesTotal <= 0) {
-    throw new Error("el pedido entregado debe conservar al menos una venta cobrada");
-  }
-
   const creditRedeemedAmount = roundMoney(order.credit_redeemed_amount || 0);
-  if (creditRedeemedAmount > deliveredCommission.deliveredSalesTotal) {
-    throw new Error("el saldo a favor aplicado no puede superar el nuevo valor vendido");
+  if (creditRedeemedAmount > roundMoney(deliveredTotals.excluded_exchange_total)) {
+    throw new Error("el saldo a favor aplicado no puede superar el valor de los cambios");
   }
 
   if (commissionRows.length) {
@@ -2023,7 +2030,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
 
     const [orders] = await connection.query(
       `SELECT
-         id, status, bonus_percent, bonus_minimum_amount,
+         id, customer_id, status, bonus_percent, bonus_minimum_amount, bonus_max_company_loss_amount,
          sales_agent_user_id, seller_commission_percent, credit_redeemed_amount,
          actual_delivered_at
        FROM orders
@@ -2226,12 +2233,40 @@ const upsertOrderItem = async (payload, actorUserId) => {
     );
     const totals = calculateOrderTotals(itemRows);
 
+    let creditRedeemedAmount = roundMoney(orders[0].credit_redeemed_amount || 0);
+    if (orders[0].status !== "delivered") {
+      creditRedeemedAmount = 0;
+      if (roundMoney(totals.exchangeTotal) > 0) {
+        await ensureCustomerCreditAccount(connection, orders[0].customer_id);
+        const [creditRows] = await connection.query(
+          `SELECT balance_amount
+           FROM customer_credit_accounts
+           WHERE customer_id = ?
+           FOR UPDATE`,
+          [orders[0].customer_id]
+        );
+        creditRedeemedAmount = Math.min(
+          roundMoney(creditRows[0]?.balance_amount || 0),
+          roundMoney(totals.exchangeTotal)
+        );
+      }
+    } else if (creditRedeemedAmount > roundMoney(totals.exchangeTotal)) {
+      await connection.rollback();
+      return {
+        code: 0,
+        message: "el cambio no puede quedar por debajo del saldo a favor ya redimido",
+        data: null,
+      };
+    }
+
     try {
       validateBonusAllowance({
         grandTotal: calculateBonusEligibleGrandTotal(itemRows),
         bonusTotal: totals.bonusTotal,
         bonusPercent: orders[0].bonus_percent,
         bonusMinimumAmount: orders[0].bonus_minimum_amount,
+        bonusMaxCompanyLossAmount: orders[0].bonus_max_company_loss_amount,
+        bonusLineCount: itemRows.filter((item) => item.line_type === "bonus").length,
       });
     } catch (error) {
       await connection.rollback();
@@ -2246,6 +2281,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
            bonus_total = ?,
            gift_total = ?,
            exchange_total = ?,
+           credit_redeemed_amount = ?,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [
@@ -2255,6 +2291,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
         roundMoney(totals.bonusTotal),
         roundMoney(totals.giftTotal),
         roundMoney(totals.exchangeTotal),
+        creditRedeemedAmount,
         orderId,
       ]
     );
@@ -2328,7 +2365,7 @@ const confirmOrder = async (payload, actorUserId) => {
     await connection.beginTransaction();
     const [orders] = await connection.query(
       `SELECT
-         id, status, bonus_percent, bonus_minimum_amount,
+         id, customer_id, status, bonus_percent, bonus_minimum_amount, bonus_max_company_loss_amount,
          sales_agent_user_id, seller_commission_percent, credit_redeemed_amount,
          actual_delivered_at
        FROM orders
@@ -2361,11 +2398,11 @@ const confirmOrder = async (payload, actorUserId) => {
       [orderId]
     );
     const totals = calculateOrderTotals(items);
-    const saleItems = items.filter((item) => item.line_type === "sale").length;
+    const chargeableItems = items.filter((item) => ["sale", "exchange"].includes(item.line_type)).length;
 
-    if (saleItems === 0) {
+    if (chargeableItems === 0) {
       await connection.rollback();
-      return { code: 0, message: "agrega al menos un producto de venta antes de confirmar", data: null };
+      return { code: 0, message: "agrega al menos un producto de venta o cambio antes de confirmar", data: null };
     }
     if (items.some((item) => item.line_type === "bonus" && isPastryCategoryName(item.category_name))) {
       await connection.rollback();
@@ -2382,10 +2419,28 @@ const confirmOrder = async (payload, actorUserId) => {
         bonusTotal: totals.bonusTotal,
         bonusPercent: orders[0].bonus_percent,
         bonusMinimumAmount: orders[0].bonus_minimum_amount,
+        bonusMaxCompanyLossAmount: orders[0].bonus_max_company_loss_amount,
+        bonusLineCount: items.filter((item) => item.line_type === "bonus").length,
       });
     } catch (error) {
       await connection.rollback();
       return { code: 0, message: error.message, data: null };
+    }
+
+    let creditRedeemedAmount = 0;
+    if (roundMoney(totals.exchangeTotal) > 0) {
+      await ensureCustomerCreditAccount(connection, orders[0].customer_id);
+      const [creditRows] = await connection.query(
+        `SELECT balance_amount
+         FROM customer_credit_accounts
+         WHERE customer_id = ?
+         FOR UPDATE`,
+        [orders[0].customer_id]
+      );
+      creditRedeemedAmount = Math.min(
+        roundMoney(creditRows[0]?.balance_amount || 0),
+        roundMoney(totals.exchangeTotal)
+      );
     }
 
     await connection.query(
@@ -2397,6 +2452,7 @@ const confirmOrder = async (payload, actorUserId) => {
            bonus_total = ?,
            gift_total = ?,
            exchange_total = ?,
+           credit_redeemed_amount = ?,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [
@@ -2406,6 +2462,7 @@ const confirmOrder = async (payload, actorUserId) => {
         roundMoney(totals.bonusTotal),
         roundMoney(totals.giftTotal),
         roundMoney(totals.exchangeTotal),
+        creditRedeemedAmount,
         orderId,
       ]
     );
@@ -2573,18 +2630,22 @@ const deliverOrder = async (payload, actorUserId) => {
       return { code: 0, message: error.message, data: null };
     }
 
-    if (commission.deliveredSalesTotal <= 0) {
-      await connection.rollback();
-      return { code: 0, message: "el pedido no tiene ventas cobradas para entregar", data: null };
+    let creditRedeemedAmount = 0;
+    if (roundMoney(totals.excluded_exchange_total) > 0) {
+      await ensureCustomerCreditAccount(connection, order.customer_id);
+      const [creditRows] = await connection.query(
+        `SELECT balance_amount
+         FROM customer_credit_accounts
+         WHERE customer_id = ?
+         FOR UPDATE`,
+        [order.customer_id]
+      );
+      creditRedeemedAmount = Math.min(
+        roundMoney(creditRows[0]?.balance_amount || 0),
+        roundMoney(totals.excluded_exchange_total)
+      );
     }
-
-    const creditRedeemedAmount = roundMoney(order.credit_redeemed_amount || 0);
     if (creditRedeemedAmount > 0) {
-      if (creditRedeemedAmount > commission.deliveredSalesTotal) {
-        await connection.rollback();
-        return { code: 0, message: "el saldo a favor no puede superar el valor vendido", data: null };
-      }
-
       const creditResult = await addCustomerCreditMovement(connection, {
         customerId: order.customer_id,
         movementType: "redeemed",
@@ -2631,6 +2692,7 @@ const deliverOrder = async (payload, actorUserId) => {
            delivered_by = ?,
            commission_base = ?,
            commission_total = ?,
+           credit_redeemed_amount = ?,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [
@@ -2638,6 +2700,7 @@ const deliverOrder = async (payload, actorUserId) => {
         actorUserId || null,
         commission.commissionBase,
         commission.commissionAmount,
+        creditRedeemedAmount,
         orderId,
       ]
     );
@@ -3211,9 +3274,11 @@ const getDailySalesSettlement = async ({
        sc.commission_base,
        sc.commission_percent,
        sc.commission_amount,
+       sc.excluded_exchange_total AS exchange_total,
        o.credit_redeemed_amount,
-       ROUND(sc.delivered_sales_total - COALESCE(o.credit_redeemed_amount, 0), 2) AS collected_sales_total,
-       ROUND(sc.delivered_sales_total - COALESCE(o.credit_redeemed_amount, 0) - sc.commission_amount, 2) AS amount_to_deliver,
+       ROUND(sc.delivered_sales_total, 2) AS collected_sales_total,
+       ROUND(GREATEST(sc.excluded_exchange_total - COALESCE(o.credit_redeemed_amount, 0), 0), 2) AS exchange_collected_total,
+       ROUND(sc.delivered_sales_total + sc.excluded_exchange_total - COALESCE(o.credit_redeemed_amount, 0) - sc.commission_amount, 2) AS amount_to_deliver,
        sc.status,
        sc.delivered_at
      FROM sales_commissions sc
@@ -3290,6 +3355,8 @@ const getDailySalesSettlement = async ({
       acc.commission_amount += Number(row.commission_amount || 0);
       acc.credit_redeemed_amount += Number(row.credit_redeemed_amount || 0);
       acc.collected_sales_total += Number(row.collected_sales_total || 0);
+      acc.exchange_total += Number(row.exchange_total || 0);
+      acc.exchange_collected_total += Number(row.exchange_collected_total || 0);
       return acc;
     },
     {
@@ -3300,6 +3367,8 @@ const getDailySalesSettlement = async ({
       commission_amount: 0,
       credit_redeemed_amount: 0,
       collected_sales_total: 0,
+      exchange_total: 0,
+      exchange_collected_total: 0,
     }
   );
 
@@ -3319,8 +3388,10 @@ const getDailySalesSettlement = async ({
         commission_amount: roundMoney(summary.commission_amount),
         credit_redeemed_amount: roundMoney(summary.credit_redeemed_amount),
         collected_sales_total: roundMoney(summary.collected_sales_total),
+        exchange_total: roundMoney(summary.exchange_total),
+        exchange_collected_total: roundMoney(summary.exchange_collected_total),
         amount_to_deliver: roundMoney(
-          summary.collected_sales_total - summary.commission_amount
+          summary.collected_sales_total + summary.exchange_collected_total - summary.commission_amount
         ),
         gift_count: giftRows.length,
         gift_total: roundMoney(
