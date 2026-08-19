@@ -68,8 +68,16 @@ const calculateOrderLine = ({
 
   const lineSubtotalReference = roundMoney(calculatedQuantity * price);
   const lineTaxReference = roundMoney(lineSubtotalReference * (taxRate / 100));
-  const commercialValue = roundMoney(lineSubtotalReference + lineTaxReference);
+  const calculatedCommercialValue = roundMoney(lineSubtotalReference + lineTaxReference);
+  const usesRequestedValue = mode === "amount" && ["sale", "exchange"].includes(type);
+  const commercialValue = usesRequestedValue ? normalizedRequestedAmount : calculatedCommercialValue;
   const isCharged = type === "sale";
+  const chargedSubtotal = usesRequestedValue && isCharged
+    ? roundMoney(commercialValue / (1 + taxRate / 100))
+    : lineSubtotalReference;
+  const chargedTax = usesRequestedValue && isCharged
+    ? roundMoney(commercialValue - chargedSubtotal)
+    : lineTaxReference;
 
   return {
     lineType: type,
@@ -78,8 +86,8 @@ const calculateOrderLine = ({
     quantity: calculatedQuantity,
     unitPrice: roundMoney(price),
     taxPercent: roundMoney(taxRate),
-    lineSubtotal: isCharged ? lineSubtotalReference : 0,
-    lineTax: isCharged ? lineTaxReference : 0,
+    lineSubtotal: isCharged ? chargedSubtotal : 0,
+    lineTax: isCharged ? chargedTax : 0,
     lineTotal: isCharged ? commercialValue : 0,
     commercialValue,
   };
