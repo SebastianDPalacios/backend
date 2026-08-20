@@ -58,6 +58,13 @@ const hasElevatedCustomerAccess = (user = {}) => {
   return roleCodes.some((code) => administrativeRoleCodes.includes(code));
 };
 
+const requireAdministrativeRole = (req, res, next) => {
+  if (!hasElevatedCustomerAccess(req.user)) {
+    return res.status(403).json({ code: 0, message: "solo un administrador puede eliminar pedidos", data: null });
+  }
+  return next();
+};
+
 router.get("/", verifyToken, canManageOrders, async (req, res, next) => {
   try {
     const result = await listOrders({
@@ -483,7 +490,7 @@ router.post("/:id/confirm", verifyToken, canManageOrders, async (req, res, next)
   }
 });
 
-router.post("/:id/cancel", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/:id/cancel", verifyToken, canManageOrders, requireAdministrativeRole, async (req, res, next) => {
   try {
     const result = await cancelOrder(
       { ...req.body, p_order_id: Number(req.params.id) },
