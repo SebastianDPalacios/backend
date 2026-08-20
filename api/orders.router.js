@@ -177,6 +177,8 @@ router.get("/commissions", verifyToken, canManageOrders, async (req, res, next) 
       salesAgentUserId: req.query.salesAgentUserId,
       dateFrom: req.query.dateFrom,
       dateTo: req.query.dateTo,
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
     });
     res.json(result);
   } catch (error) {

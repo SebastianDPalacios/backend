@@ -2333,6 +2333,180 @@ const createProductionPlan = async (payload, actorUserId) => {
   }
 };
 
+const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) => {
+  const db = await connect();
+  const connection = await db.getConnection();
+  const planId = Number(productionPlanId || 0);
+  const actorUserId = Number(actorUser.userId || 0);
+  const branchId = Number(payload.p_branch_id || 0);
+  const bakerEmployeeId = Number(payload.p_baker_employee_id || 0);
+  const plannedDate = payload.p_planned_date || null;
+  const items = Array.isArray(payload.p_items) ? payload.p_items : [];
+  const roleCodes = (Array.isArray(actorUser.roles) ? actorUser.roles : [])
+    .map((role) => String(typeof role === "string" ? role : role?.code || role?.name || "").toUpperCase());
+  const isAdministrator = roleCodes.includes("ADMIN") || roleCodes.includes("SUPER_ADMIN");
+
+  if (!planId || !branchId || !bakerEmployeeId || !plannedDate || !items.length) {
+    connection.release();
+    return { code: 0, message: "Selecciona sucursal, fecha, panadero y al menos una receta.", data: null };
+  }
+
+  try {
+    await connection.beginTransaction();
+    const [planRows] = await connection.query(
+      `SELECT pp.id, pp.created_by, pp.status, e.user_id AS baker_user_id
+         FROM production_plans pp
+         INNER JOIN employees e ON e.id = pp.baker_employee_id
+        WHERE pp.id = ?
+        FOR UPDATE`,
+      [planId]
+    );
+    if (!planRows.length) {
+      await connection.rollback();
+      return { code: 0, message: "El plan de produccion no existe.", data: null };
+    }
+
+    const plan = planRows[0];
+    const canEdit = isAdministrator
+      || Number(plan.created_by) === actorUserId
+      || Number(plan.baker_user_id) === actorUserId;
+    if (!canEdit) {
+      await connection.rollback();
+      return { code: 0, message: "No tienes permiso para editar este plan.", data: null };
+    }
+
+    const [progressRows] = await connection.query(
+      `SELECT
+         COUNT(CASE WHEN ppi.started_at IS NOT NULL OR ppi.production_batch_id IS NOT NULL THEN 1 END) AS started_items,
+         COUNT(psr.id) AS reservations
+       FROM production_plan_items ppi
+       LEFT JOIN production_plan_outputs ppo ON ppo.production_plan_item_id = ppi.id
+       LEFT JOIN production_sale_reservations psr ON psr.production_plan_output_id = ppo.id
+       WHERE ppi.production_plan_id = ?`,
+      [planId]
+    );
+    if (plan.status === "completed" || plan.status === "cancelled"
+      || Number(progressRows[0]?.started_items || 0) > 0
+      || Number(progressRows[0]?.reservations || 0) > 0) {
+      await connection.rollback();
+      return { code: 0, message: "El plan ya tiene produccion iniciada o reservas asociadas y no puede modificarse.", data: null };
+    }
+
+    const [branchRows] = await connection.query(
+      "SELECT id, name FROM branches WHERE id = ? AND is_active = 1 LIMIT 1",
+      [branchId]
+    );
+    const [bakerRows] = await connection.query(
+      `SELECT e.id, e.user_id, u.full_name
+         FROM employees e
+         INNER JOIN users u ON u.id = e.user_id
+        WHERE e.id = ? AND e.job_type = 'baker' AND e.status = 'active' AND e.deleted_at IS NULL
+        LIMIT 1`,
+      [bakerEmployeeId]
+    );
+    if (!branchRows.length || !bakerRows.length) {
+      await connection.rollback();
+      return { code: 0, message: "La sucursal o el panadero no estan disponibles.", data: null };
+    }
+
+    const normalizedItems = [];
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      const requestedRecipeId = Number(item.recipe_id || 0);
+      const arrobas = Number(item.arrobas || 0);
+      if (!requestedRecipeId || arrobas <= 0) {
+        await connection.rollback();
+        return { code: 0, message: `Revisa la receta ${index + 1} y sus bultos estimados.`, data: null };
+      }
+      const [recipeRows] = await connection.query(
+        `SELECT current_recipe.id
+           FROM recipes requested
+           INNER JOIN recipes current_recipe
+             ON current_recipe.recipe_family_id = COALESCE(requested.recipe_family_id, requested.id)
+            AND current_recipe.is_current = 1 AND current_recipe.is_active = 1
+          WHERE requested.id = ?
+          ORDER BY current_recipe.version_no DESC LIMIT 1`,
+        [requestedRecipeId]
+      );
+      if (!recipeRows.length) {
+        await connection.rollback();
+        return { code: 0, message: `La receta ${index + 1} no tiene una version vigente.`, data: null };
+      }
+      const recipeId = Number(recipeRows[0].id);
+      const requestedProductIds = (Array.isArray(item.product_ids) ? item.product_ids : [])
+        .map(Number).filter((value) => Number.isInteger(value) && value > 0);
+      const [outputRows] = await connection.query(
+        `SELECT ro.product_id, ro.expected_quantity
+           FROM recipe_outputs ro
+           INNER JOIN products p ON p.id = ro.product_id
+          WHERE ro.recipe_id = ?
+          ORDER BY ro.sort_order, ro.id`,
+        [recipeId]
+      );
+      const selectedOutputs = requestedProductIds.length
+        ? outputRows.filter((output) => requestedProductIds.includes(Number(output.product_id)))
+        : outputRows;
+      if (!selectedOutputs.length || (requestedProductIds.length && selectedOutputs.length !== new Set(requestedProductIds).size)) {
+        await connection.rollback();
+        return { code: 0, message: `Selecciona productos validos para la receta ${index + 1}.`, data: null };
+      }
+      normalizedItems.push({ recipeId, arrobas, outputs: selectedOutputs });
+    }
+
+    await connection.query(
+      `UPDATE production_plans
+          SET branch_id = ?, planned_date = ?, baker_employee_id = ?, notes = ?, status = 'assigned', viewed_at = NULL
+        WHERE id = ?`,
+      [branchId, plannedDate, bakerEmployeeId, payload.p_notes || null, planId]
+    );
+    await connection.query(
+      `DELETE ppo FROM production_plan_outputs ppo
+       INNER JOIN production_plan_items ppi ON ppi.id = ppo.production_plan_item_id
+       WHERE ppi.production_plan_id = ?`,
+      [planId]
+    );
+    await connection.query("DELETE FROM production_plan_items WHERE production_plan_id = ?", [planId]);
+
+    for (let index = 0; index < normalizedItems.length; index += 1) {
+      const item = normalizedItems[index];
+      const [itemInsert] = await connection.query(
+        `INSERT INTO production_plan_items (production_plan_id, recipe_id, arrobas, sort_order)
+         VALUES (?, ?, ?, ?)`,
+        [planId, item.recipeId, item.arrobas, index + 1]
+      );
+      for (const output of item.outputs) {
+        await connection.query(
+          `INSERT INTO production_plan_outputs (production_plan_item_id, product_id, expected_quantity)
+           VALUES (?, ?, ?)`,
+          [Number(itemInsert.insertId), Number(output.product_id), Math.round(Number(output.expected_quantity) * item.arrobas * 1000) / 1000]
+        );
+      }
+    }
+
+    const totalBultos = normalizedItems.reduce((sum, item) => sum + item.arrobas, 0);
+    await connection.query(
+      `INSERT INTO user_notifications
+         (user_id, notification_type, title, message, reference_type, reference_id)
+       VALUES (?, 'production_plan', ?, ?, 'production_plan', ?)`,
+      [Number(bakerRows[0].user_id), `Plan actualizado para ${plannedDate}`,
+        `${normalizedItems.length} receta(s) y ${totalBultos.toLocaleString("es-CO")} bulto(s) estimado(s) en ${branchRows[0].name}.`, planId]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'production_plan.update', 'production_plans', ?,
+         JSON_OBJECT('planned_date', ?, 'baker_employee_id', ?, 'recipes', ?, 'bultos', ?))`,
+      [actorUserId || null, String(planId), plannedDate, bakerEmployeeId, normalizedItems.length, totalBultos]
+    );
+    await connection.commit();
+    return { code: 1, message: "Plan actualizado correctamente.", data: { production_plan_id: planId } };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
 const listProductionPlans = async ({ userId, plannedDate, bakerEmployeeId } = {}) => {
   const db = await connect();
   const filters = [];
@@ -2362,6 +2536,8 @@ const listProductionPlans = async ({ userId, plannedDate, bakerEmployeeId } = {}
        u.full_name AS baker_name,
        pp.status,
        pp.notes,
+       pp.created_by,
+       e.user_id AS baker_user_id,
        pp.viewed_at,
        pp.created_at
      FROM production_plans pp
@@ -2872,6 +3048,7 @@ module.exports = {
   getProductionDayReport,
   getProductionMonthReport,
   createProductionPlan,
+  updateProductionPlan,
   listProductionPlans,
   startProductionPlanItem,
   finishProductionPlanItem,

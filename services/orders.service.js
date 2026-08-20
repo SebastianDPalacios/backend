@@ -2495,6 +2495,7 @@ const confirmOrder = async (payload, actorUserId) => {
 
 const cancelOrder = async (payload, actorUserId) => {
   const db = await connect();
+  const orderId = Number(payload.p_order_id || 0);
   const [reservationRows] = await db.query(
     `
       SELECT
@@ -2504,7 +2505,7 @@ const cancelOrder = async (payload, actorUserId) => {
       INNER JOIN order_items oi ON oi.id = psr.order_item_id
       WHERE oi.order_id = ?
     `,
-    [Number(payload.p_order_id || 0)]
+    [orderId]
   );
   if (Number(reservationRows[0]?.active_reservations || 0) > 0) {
     return { code: 0, message: "libera las reservas de produccion antes de cancelar el pedido", data: null };
@@ -2517,8 +2518,83 @@ const cancelOrder = async (payload, actorUserId) => {
     };
   }
 
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [orderRows] = await connection.query(
+      "SELECT id, branch_id, status FROM orders WHERE id = ? FOR UPDATE",
+      [orderId]
+    );
+    if (!orderRows.length) {
+      await connection.rollback();
+      return { code: 0, message: "pedido no encontrado", data: null };
+    }
+
+    if (orderRows[0].status === "dispatched") {
+      const [items] = await connection.query(
+        `SELECT product_id, SUM(quantity) AS quantity
+           FROM order_items
+          WHERE order_id = ?
+          GROUP BY product_id`,
+        [orderId]
+      );
+      for (const item of items) {
+        await connection.query(
+          `INSERT INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
+           VALUES (?, ?, ?, 0)
+           ON DUPLICATE KEY UPDATE
+             quantity_on_hand = quantity_on_hand + VALUES(quantity_on_hand),
+             updated_at = CURRENT_TIMESTAMP`,
+          [Number(orderRows[0].branch_id), Number(item.product_id), Number(item.quantity)]
+        );
+        await connection.query(
+          `INSERT INTO inventory_movements (
+             branch_id, item_type, raw_material_id, product_id, movement_type,
+             quantity, unit_cost, reference_type, reference_id, notes, created_by
+           ) VALUES (?, 'product', NULL, ?, 'adjustment_in', ?, NULL,
+             'order', ?, ?, ?)`,
+          [
+            Number(orderRows[0].branch_id),
+            Number(item.product_id),
+            Number(item.quantity),
+            orderId,
+            `Reversion por eliminacion de pedido despachado #${orderId}`,
+            actorUserId || null,
+          ]
+        );
+      }
+
+      await connection.query(
+        `UPDATE orders
+            SET status = 'cancelled',
+                notes = CONCAT(IFNULL(notes, ''), ' | CANCEL_REASON: ', ?),
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?`,
+        [payload.p_reason || "not provided", orderId]
+      );
+      await connection.query(
+        `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+         VALUES (?, 'order.cancel_dispatched', 'orders', ?,
+           JSON_OBJECT('reason', ?, 'inventory_restored', true))`,
+        [actorUserId || null, String(orderId), payload.p_reason || "not provided"]
+      );
+      await connection.commit();
+      return {
+        code: 1,
+        message: "pedido despachado eliminado e inventario restaurado",
+        data: { order_id: orderId, status: "cancelled" },
+      };
+    }
+    await connection.rollback();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
   const out = await callProcedure("sp_cancel_order", [
-    payload.p_order_id,
+    orderId,
     payload.p_reason || null,
     actorUserId || null,
   ]);
@@ -3118,12 +3194,21 @@ const createSalesGift = async (payload, actorUserId, { canViewAllCustomers = fal
     connection.release();
   }
 };
-const listSalesCommissions = async ({ salesAgentUserId, dateFrom, dateTo } = {}) => {
+const listSalesCommissions = async ({
+  salesAgentUserId,
+  dateFrom,
+  dateTo,
+  actorUserId,
+  canViewAll = false,
+} = {}) => {
   const db = await connect();
   const filters = ["sc.status IN ('accrued','adjusted')"];
   const values = [];
 
-  if (salesAgentUserId) {
+  if (!canViewAll) {
+    filters.push("sc.sales_agent_user_id = ?");
+    values.push(Number(actorUserId || 0));
+  } else if (salesAgentUserId) {
     filters.push("sc.sales_agent_user_id = ?");
     values.push(Number(salesAgentUserId));
   }

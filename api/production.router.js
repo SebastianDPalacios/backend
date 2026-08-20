@@ -23,6 +23,7 @@ const {
   getProductionDayReport,
   getProductionMonthReport,
   createProductionPlan,
+  updateProductionPlan,
   listProductionPlans,
   startProductionPlanItem,
   finishProductionPlanItem,
@@ -73,6 +74,15 @@ router.get("/my-plans", verifyToken, canRegisterBakerProduction, async (req, res
 router.get("/my-base-data", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
   try {
     const result = await listMyProductionBaseData({ userId: req.user.userId });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.put("/plans/:id", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
+  try {
+    const result = await updateProductionPlan(Number(req.params.id), req.body, req.user);
     res.json(result);
   } catch (error) {
     next(error);
