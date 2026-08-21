@@ -71,6 +71,54 @@ const ensureCustomerCreditAccount = async (connection, customerId) => {
   );
 };
 
+const calculateRuleBoundBonusTotal = (items) => {
+  const hasUiLineTypes = items.some((item) => item.uiLineType || item.ui_line_type);
+  if (hasUiLineTypes) {
+    return items.reduce((total, item) => (
+      (item.lineType || item.line_type) === "bonus"
+        && String(item.uiLineType || item.ui_line_type || "") === "sale_bonus"
+        ? total + Number(item.commercialValue || item.commercial_value || 0)
+        : total
+    ), 0);
+  }
+
+  const saleProductIds = new Set(
+    items
+      .filter((item) => (item.lineType || item.line_type) === "sale")
+      .map((item) => Number(item.productId || item.product_id || 0))
+  );
+  return items.reduce((total, item) => (
+    (item.lineType || item.line_type) === "bonus"
+      && saleProductIds.has(Number(item.productId || item.product_id || 0))
+      ? total + Number(item.commercialValue || item.commercial_value || 0)
+      : total
+  ), 0);
+};
+
+const calculateRuleBoundSaleTotal = (items) => {
+  const hasUiLineTypes = items.some((item) => item.uiLineType || item.ui_line_type);
+  if (hasUiLineTypes) {
+    return items.reduce((total, item) => (
+      (item.lineType || item.line_type) === "sale"
+        && String(item.uiLineType || item.ui_line_type || "") === "sale_bonus"
+        ? total + Number(item.lineTotal || item.line_total || 0)
+        : total
+    ), 0);
+  }
+
+  const bonusProductIds = new Set(
+    items
+      .filter((item) => (item.lineType || item.line_type) === "bonus")
+      .map((item) => Number(item.productId || item.product_id || 0))
+  );
+  return items.reduce((total, item) => (
+    (item.lineType || item.line_type) === "sale"
+      && bonusProductIds.has(Number(item.productId || item.product_id || 0))
+      ? total + Number(item.lineTotal || item.line_total || 0)
+      : total
+  ), 0);
+};
+
 const addCustomerCreditMovement = async (
   connection,
   {
@@ -1536,6 +1584,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           normalizedItems.push({
             productId,
             categoryName: products[0].category_name || null,
+            uiLineType: String(item.ui_line_type || item.p_ui_line_type || lineType),
             ...calculateOrderLine({
               unit: products[0].unit,
               unitPrice: products[0].base_price,
@@ -1544,6 +1593,8 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
               captureMode: item.capture_mode || item.p_capture_mode || "quantity",
               requestedAmount: item.requested_amount ?? item.p_requested_amount,
               quantity: item.quantity ?? item.p_quantity,
+              requireWholeUnitAmount:
+                lineType === "sale" && String(item.ui_line_type || item.p_ui_line_type || "sale") !== "sale_bonus",
             }),
           });
         } catch (error) {
@@ -1593,11 +1644,11 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
       try {
         validateBonusAllowance({
           grandTotal: calculateBonusEligibleGrandTotal(normalizedItems),
-          bonusTotal: totals.bonusTotal,
+          bonusBaseTotal: calculateRuleBoundSaleTotal(normalizedItems),
+          bonusTotal: calculateRuleBoundBonusTotal(normalizedItems),
           bonusPercent: settings.bonus_percent,
           bonusMinimumAmount: settings.bonus_minimum_amount,
           bonusMaxCompanyLossAmount: settings.bonus_max_company_loss_amount,
-          bonusLineCount: normalizedItems.filter((item) => item.lineType === "bonus").length,
         });
       } catch (error) {
         await connection.rollback();
@@ -2130,6 +2181,8 @@ const upsertOrderItem = async (payload, actorUserId) => {
           captureMode: payload.p_capture_mode || "quantity",
           requestedAmount: payload.p_requested_amount,
           quantity: payload.p_quantity,
+          requireWholeUnitAmount:
+            lineType === "sale" && String(payload.p_ui_line_type || "sale") !== "sale_bonus",
         });
       } catch (error) {
         await connection.rollback();
@@ -2219,6 +2272,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
 
     const [itemRows] = await connection.query(
       `SELECT
+         oi.product_id,
          oi.line_type,
          oi.line_subtotal,
          oi.line_tax,
@@ -2262,11 +2316,11 @@ const upsertOrderItem = async (payload, actorUserId) => {
     try {
       validateBonusAllowance({
         grandTotal: calculateBonusEligibleGrandTotal(itemRows),
-        bonusTotal: totals.bonusTotal,
+        bonusBaseTotal: calculateRuleBoundSaleTotal(itemRows),
+        bonusTotal: calculateRuleBoundBonusTotal(itemRows),
         bonusPercent: orders[0].bonus_percent,
         bonusMinimumAmount: orders[0].bonus_minimum_amount,
         bonusMaxCompanyLossAmount: orders[0].bonus_max_company_loss_amount,
-        bonusLineCount: itemRows.filter((item) => item.line_type === "bonus").length,
       });
     } catch (error) {
       await connection.rollback();
@@ -2385,6 +2439,7 @@ const confirmOrder = async (payload, actorUserId) => {
 
     const [items] = await connection.query(
       `SELECT
+         oi.product_id,
          oi.line_type,
          oi.line_subtotal,
          oi.line_tax,
@@ -2416,11 +2471,11 @@ const confirmOrder = async (payload, actorUserId) => {
     try {
       validateBonusAllowance({
         grandTotal: calculateBonusEligibleGrandTotal(items),
-        bonusTotal: totals.bonusTotal,
+        bonusBaseTotal: calculateRuleBoundSaleTotal(items),
+        bonusTotal: calculateRuleBoundBonusTotal(items),
         bonusPercent: orders[0].bonus_percent,
         bonusMinimumAmount: orders[0].bonus_minimum_amount,
         bonusMaxCompanyLossAmount: orders[0].bonus_max_company_loss_amount,
-        bonusLineCount: items.filter((item) => item.line_type === "bonus").length,
       });
     } catch (error) {
       await connection.rollback();

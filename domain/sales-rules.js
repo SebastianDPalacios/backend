@@ -23,6 +23,7 @@ const calculateOrderLine = ({
   captureMode,
   requestedAmount,
   quantity,
+  requireWholeUnitAmount = false,
 }) => {
   const price = Number(unitPrice || 0);
   const taxRate = Number(taxPercent || 0);
@@ -49,6 +50,9 @@ const calculateOrderLine = ({
     }
 
     const rawQuantity = normalizedRequestedAmount / price;
+    if (requireWholeUnitAmount && unit === "unit" && !Number.isInteger(rawQuantity)) {
+      throw new Error(`el valor de la venta debe ser multiplo de $${roundMoney(price).toLocaleString("es-CO")}`);
+    }
     calculatedQuantity = unit === "unit"
       ? Math.floor(rawQuantity)
       : Math.floor(rawQuantity * 1000) / 1000;
@@ -122,18 +126,19 @@ const calculateOrderTotals = (items) => {
 
 const validateBonusAllowance = ({
   grandTotal,
+  bonusBaseTotal = grandTotal,
   bonusTotal,
   bonusPercent,
   bonusMinimumAmount,
   bonusMaxCompanyLossAmount = 0,
-  bonusLineCount = 0,
 }) => {
   const chargedTotal = roundMoney(grandTotal);
   const appliedBonus = roundMoney(bonusTotal);
+  const bonusBase = roundMoney(bonusBaseTotal);
   const minimum = roundMoney(bonusMinimumAmount);
-  const allowedBonus = chargedTotal >= minimum
-    ? roundMoney(chargedTotal * (Number(bonusPercent || 0) / 100)
-        + Number(bonusMaxCompanyLossAmount || 0) * Number(bonusLineCount || 0))
+  const allowedBonus = chargedTotal >= minimum && bonusBase > 0
+    ? roundMoney(bonusBase * (Number(bonusPercent || 0) / 100)
+        + Number(bonusMaxCompanyLossAmount || 0))
     : 0;
 
   if (appliedBonus > allowedBonus) {
@@ -141,7 +146,7 @@ const validateBonusAllowance = ({
       throw new Error(`el vendaje aplica desde compras de $${minimum.toLocaleString("es-CO")}`);
     }
     throw new Error(
-      `el vendaje supera el maximo permitido de $${allowedBonus.toLocaleString("es-CO")}`
+      `el vendaje supera el maximo permitido por pedido de $${allowedBonus.toLocaleString("es-CO")}`
     );
   }
 
