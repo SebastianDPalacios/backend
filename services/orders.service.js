@@ -1594,7 +1594,8 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
               requestedAmount: item.requested_amount ?? item.p_requested_amount,
               quantity: item.quantity ?? item.p_quantity,
               requireWholeUnitAmount:
-                lineType === "sale" && String(item.ui_line_type || item.p_ui_line_type || "sale") !== "sale_bonus",
+                lineType === "bonus" ||
+                (lineType === "sale" && String(item.ui_line_type || item.p_ui_line_type || "sale") !== "sale_bonus"),
             }),
           });
         } catch (error) {
@@ -1800,6 +1801,7 @@ const getOrderPrintData = async ({
        o.subtotal,
        o.tax_total,
        o.grand_total,
+       o.bonus_percent,
        o.bonus_total,
        o.gift_total,
        o.exchange_total,
@@ -2182,7 +2184,8 @@ const upsertOrderItem = async (payload, actorUserId) => {
           requestedAmount: payload.p_requested_amount,
           quantity: payload.p_quantity,
           requireWholeUnitAmount:
-            lineType === "sale" && String(payload.p_ui_line_type || "sale") !== "sale_bonus",
+            lineType === "bonus" ||
+            (lineType === "sale" && String(payload.p_ui_line_type || "sale") !== "sale_bonus"),
         });
       } catch (error) {
         await connection.rollback();

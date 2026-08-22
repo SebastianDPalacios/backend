@@ -51,7 +51,8 @@ const calculateOrderLine = ({
 
     const rawQuantity = normalizedRequestedAmount / price;
     if (requireWholeUnitAmount && unit === "unit" && !Number.isInteger(rawQuantity)) {
-      throw new Error(`el valor de la venta debe ser multiplo de $${roundMoney(price).toLocaleString("es-CO")}`);
+      const lineLabel = type === "bonus" ? "solo vendaje" : "venta";
+      throw new Error(`el valor de ${lineLabel} debe ser multiplo de $${roundMoney(price).toLocaleString("es-CO")}`);
     }
     calculatedQuantity = unit === "unit"
       ? Math.floor(rawQuantity)
