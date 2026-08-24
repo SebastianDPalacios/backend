@@ -309,7 +309,7 @@ const listOrders = async ({
         o.gift_total,
         o.exchange_total,
         o.credit_redeemed_amount,
-        ROUND(o.grand_total + o.exchange_total - LEAST(o.credit_redeemed_amount, o.exchange_total), 2) AS amount_to_collect,
+        ROUND(o.grand_total, 2) AS amount_to_collect,
         o.commission_base,
         o.commission_total,
         o.print_count,
@@ -1806,7 +1806,7 @@ const getOrderPrintData = async ({
        o.gift_total,
        o.exchange_total,
        o.credit_redeemed_amount,
-       ROUND(o.grand_total + o.exchange_total - LEAST(o.credit_redeemed_amount, o.exchange_total), 2) AS amount_to_collect,
+       ROUND(o.grand_total, 2) AS amount_to_collect,
        o.notes,
        o.print_count,
        o.last_printed_at,
@@ -3420,8 +3420,8 @@ const getDailySalesSettlement = async ({
        sc.excluded_exchange_total AS exchange_total,
        o.credit_redeemed_amount,
        ROUND(sc.delivered_sales_total, 2) AS collected_sales_total,
-       ROUND(GREATEST(sc.excluded_exchange_total - COALESCE(o.credit_redeemed_amount, 0), 0), 2) AS exchange_collected_total,
-       ROUND(sc.delivered_sales_total + sc.excluded_exchange_total - COALESCE(o.credit_redeemed_amount, 0) - sc.commission_amount, 2) AS amount_to_deliver,
+       0 AS exchange_collected_total,
+       ROUND(sc.delivered_sales_total - sc.commission_amount, 2) AS amount_to_deliver,
        sc.status,
        sc.delivered_at
      FROM sales_commissions sc
