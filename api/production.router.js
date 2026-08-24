@@ -27,6 +27,11 @@ const {
   listProductionPlans,
   startProductionPlanItem,
   finishProductionPlanItem,
+  startProductionPlanProduct,
+  saveProductionPlanProductProgress,
+  skipProductionPlanProduct,
+  finishProductionPlanProduct,
+  correctProductionPlanProduct,
   listUserNotifications,
   markUserNotificationViewed,
   closeProductionOrder,
@@ -346,6 +351,55 @@ router.get("/reports/raw-material-usage-by-product", verifyToken, canManageProdu
   } catch (error) {
     next(error);
   }
+});
+
+router.post("/plans/products/:id/start", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
+  try {
+    res.json(await startProductionPlanProduct({
+      productionPlanOutputId: Number(req.params.id),
+      userId: req.user.userId,
+    }));
+  } catch (error) { next(error); }
+});
+
+router.patch("/plans/products/:id/progress", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
+  try {
+    res.json(await saveProductionPlanProductProgress({
+      productionPlanOutputId: Number(req.params.id),
+      userId: req.user.userId,
+      payload: req.body,
+    }));
+  } catch (error) { next(error); }
+});
+
+router.post("/plans/products/:id/skip", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
+  try {
+    res.json(await skipProductionPlanProduct({
+      productionPlanOutputId: Number(req.params.id),
+      userId: req.user.userId,
+      justification: req.body?.p_justification,
+    }));
+  } catch (error) { next(error); }
+});
+
+router.post("/plans/products/:id/finish", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
+  try {
+    res.json(await finishProductionPlanProduct({
+      productionPlanOutputId: Number(req.params.id),
+      userId: req.user.userId,
+      payload: req.body,
+    }));
+  } catch (error) { next(error); }
+});
+
+router.patch("/plans/products/:id/correction", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
+  try {
+    res.json(await correctProductionPlanProduct({
+      productionPlanOutputId: Number(req.params.id),
+      actorUser: req.user,
+      payload: req.body,
+    }));
+  } catch (error) { next(error); }
 });
 router.get("/reports/packing-summary", verifyToken, canManageProduction, async (req, res, next) => {
   try {

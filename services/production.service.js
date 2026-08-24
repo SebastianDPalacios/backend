@@ -869,9 +869,10 @@ const registerProductionResult = async (payload, actorUserId) => {
   };
 };
 
-const registerProductionBatch = async (payload, actorUserId) => {
+const registerProductionBatch = async (payload, actorUserId, options = {}) => {
   const db = await connect();
-  const connection = await db.getConnection();
+  const connection = options.connection || await db.getConnection();
+  const ownsTransaction = !options.connection;
   const branchId = Number(payload.p_branch_id || 0);
   const requestedRecipeId = Number(payload.p_recipe_id || 0);
   const bakerEmployeeId = Number(payload.p_baker_employee_id || 0);
@@ -887,7 +888,7 @@ const registerProductionBatch = async (payload, actorUserId) => {
   const requestedProductIds = Array.from(requestedOutputMap.keys());
 
   if (!branchId || !requestedRecipeId || !bakerEmployeeId || batchQuantity <= 0) {
-    connection.release();
+    if (ownsTransaction) connection.release();
     return {
       code: 0,
       message: "Completa sucursal, receta vigente, panadero y una cantidad de arrobas mayor a cero.",
@@ -896,7 +897,7 @@ const registerProductionBatch = async (payload, actorUserId) => {
   }
 
   try {
-    await connection.beginTransaction();
+    if (ownsTransaction) await connection.beginTransaction();
 
     const [recipeRows] = await connection.query(
       `SELECT current_recipe.id,
@@ -916,7 +917,7 @@ const registerProductionBatch = async (payload, actorUserId) => {
     );
 
     if (!recipeRows.length) {
-      await connection.rollback();
+      if (ownsTransaction) await connection.rollback();
       return { code: 0, message: "La receta no existe o no tiene una versiÃƒÂ³n vigente.", data: null };
     }
 
@@ -926,7 +927,7 @@ const registerProductionBatch = async (payload, actorUserId) => {
       [branchId]
     );
     if (!branchRows.length) {
-      await connection.rollback();
+      if (ownsTransaction) await connection.rollback();
       return { code: 0, message: "La sucursal no existe o estÃƒÂ¡ inactiva.", data: null };
     }
 
@@ -942,7 +943,7 @@ const registerProductionBatch = async (payload, actorUserId) => {
       [bakerEmployeeId]
     );
     if (!bakerRows.length) {
-      await connection.rollback();
+      if (ownsTransaction) await connection.rollback();
       return { code: 0, message: "El panadero no existe o estÃƒÂ¡ inactivo.", data: null };
     }
 
@@ -960,7 +961,7 @@ const registerProductionBatch = async (payload, actorUserId) => {
     const outputRows = availableOutputs.filter((output) => selectedProductIds.includes(Number(output.product_id)));
 
     if (!outputRows.length || outputRows.length !== new Set(selectedProductIds).size) {
-      await connection.rollback();
+      if (ownsTransaction) await connection.rollback();
       return { code: 0, message: "Selecciona productos finales que pertenezcan a la versiÃƒÂ³n vigente de la receta.", data: null };
     }
 
@@ -1031,7 +1032,7 @@ const registerProductionBatch = async (payload, actorUserId) => {
       }));
 
     if (shortages.length) {
-      await connection.rollback();
+      if (ownsTransaction) await connection.rollback();
       const details = shortages
         .map((item) => `${item.raw_material_name}: necesitas ${item.required_qty.toLocaleString("es-CO")} ${item.unit} y hay ${item.available_qty.toLocaleString("es-CO")} ${item.unit}`)
         .join("; ");
@@ -1092,11 +1093,11 @@ const registerProductionBatch = async (payload, actorUserId) => {
         : null;
       const producedQuantity = requestedProducedQuantity !== null
         ? Math.round(requestedProducedQuantity * 1000) / 1000
-        : Math.round(Number(output.expected_quantity) * batchQuantity * 1000) / 1000;
+        : Math.round(Number(output.expected_quantity) * batchQuantity);
 
-      if (!Number.isFinite(producedQuantity) || producedQuantity <= 0) {
-        await connection.rollback();
-        return { code: 0, message: `La cantidad realizada de ${output.product_name || 'producto'} debe ser mayor a cero.`, data: null };
+      if (!Number.isFinite(producedQuantity) || producedQuantity <= 0 || !Number.isInteger(producedQuantity)) {
+        if (ownsTransaction) await connection.rollback();
+        return { code: 0, message: `La cantidad realizada de ${output.product_name || 'producto'} debe ser un numero entero mayor a cero.`, data: null };
       }
 
       await connection.query(
@@ -1130,10 +1131,10 @@ const registerProductionBatch = async (payload, actorUserId) => {
       ]
     );
 
-    await connection.commit();
+    if (ownsTransaction) await connection.commit();
     return {
       code: 1,
-      message: "ProducciÃƒÂ³n registrada con la versiÃƒÂ³n vigente y todos sus ingredientes descontados.",
+      message: "Produccion registrada. Las materias primas fueron descontadas correctamente.",
       data: {
         production_batch_id: productionBatchId,
         recipe_id: recipeId,
@@ -1141,10 +1142,10 @@ const registerProductionBatch = async (payload, actorUserId) => {
       },
     };
   } catch (error) {
-    await connection.rollback();
+    if (ownsTransaction) await connection.rollback();
     throw error;
   } finally {
-    connection.release();
+    if (ownsTransaction) connection.release();
   }
 };
 
@@ -1792,7 +1793,7 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
     values
   );
 
-  const [rawMaterialRows] = await db.query(
+  let [rawMaterialRows] = await db.query(
     `
       SELECT
         im.raw_material_id,
@@ -1828,6 +1829,52 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
     `,
     [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
   );
+
+  const [correctionMaterialRows] = await db.query(
+    `SELECT
+       im.raw_material_id,
+       rm.name AS raw_material_name,
+       rm.unit AS raw_material_unit,
+       rm.purchase_package_name,
+       rm.purchase_package_quantity,
+       COALESCE(rm.unit_cost, 0) AS unit_cost,
+       COALESCE(SUM(CASE WHEN im.movement_type = 'production_out' THEN im.quantity ELSE -im.quantity END), 0) AS correction_quantity,
+       COALESCE(SUM(CASE WHEN im.movement_type = 'production_out' THEN im.quantity ELSE -im.quantity END
+         * COALESCE(im.unit_cost, rm.unit_cost, 0)), 0) AS correction_cost
+     FROM inventory_movements im
+     INNER JOIN raw_materials rm ON rm.id = im.raw_material_id
+     INNER JOIN production_plan_product_corrections correction ON correction.id = im.reference_id
+     INNER JOIN production_plan_product_details detail ON detail.id = correction.production_plan_product_detail_id
+     INNER JOIN production_plan_outputs plan_output ON plan_output.id = detail.production_plan_output_id
+     INNER JOIN production_plan_items plan_item ON plan_item.id = plan_output.production_plan_item_id
+     WHERE im.item_type = 'raw_material'
+       AND im.reference_type = 'production_correction'
+       AND im.movement_type IN ('production_out', 'adjustment_in')
+       AND DATE(im.moved_at) >= ? AND DATE(im.moved_at) <= ?
+       AND (? IS NULL OR im.branch_id = ?)
+       AND (? IS NULL OR plan_item.recipe_id = ?)
+     GROUP BY im.raw_material_id, rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity, rm.unit_cost`,
+    [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
+  );
+  const rawMaterialMap = new Map(rawMaterialRows.map((row) => [Number(row.raw_material_id), { ...row }]));
+  correctionMaterialRows.forEach((correction) => {
+    const id = Number(correction.raw_material_id);
+    const current = rawMaterialMap.get(id) || {
+      ...correction,
+      base_quantity: 0,
+      posterior_quantity: 0,
+      total_quantity: 0,
+      base_cost: 0,
+      posterior_cost: 0,
+      total_cost: 0,
+    };
+    current.base_quantity = Number(current.base_quantity || 0) + Number(correction.correction_quantity || 0);
+    current.total_quantity = Number(current.total_quantity || 0) + Number(correction.correction_quantity || 0);
+    current.base_cost = Number(current.base_cost || 0) + Number(correction.correction_cost || 0);
+    current.total_cost = Number(current.total_cost || 0) + Number(correction.correction_cost || 0);
+    rawMaterialMap.set(id, current);
+  });
+  rawMaterialRows = Array.from(rawMaterialMap.values()).sort((a, b) => String(a.raw_material_name).localeCompare(String(b.raw_material_name)));
 
   const [posteriorRows] = await db.query(
     `
@@ -1873,6 +1920,35 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
     values
   );
 
+  const planProductFilters = ["history.planned_date >= ?", "history.planned_date <= ?"];
+  const planProductValues = [reportDateFrom, reportDateTo];
+  if (branchId) {
+    planProductFilters.push("history.branch_id = ?");
+    planProductValues.push(Number(branchId));
+  }
+  if (recipeId) {
+    planProductFilters.push("history.recipe_id = ?");
+    planProductValues.push(Number(recipeId));
+  }
+  const [planProductRows] = await db.query(
+    `SELECT
+       history.*,
+       baker.full_name AS baker_name,
+       reporter.full_name AS reported_by_name,
+       GREATEST(
+         history.batch_produced_quantity - history.packed_quantity - history.damaged_quantity
+         - history.missing_quantity - history.direct_delivered_quantity,
+         0
+       ) AS pending_quantity
+     FROM vw_production_plan_product_history history
+     INNER JOIN employees baker_employee ON baker_employee.id = history.baker_employee_id
+     INNER JOIN users baker ON baker.id = baker_employee.user_id
+     LEFT JOIN users reporter ON reporter.id = history.reported_by
+     WHERE ${planProductFilters.join(" AND ")}
+     ORDER BY history.planned_date DESC, baker.full_name, history.recipe_id, history.product_name`,
+    planProductValues
+  );
+
   return {
     code: 1,
       message: "reporte diario de produccion generado",
@@ -1886,6 +1962,7 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
       raw_materials_usage: rawMaterialRows,
       posterior_materials: posteriorRows,
       packers: packerRows,
+      plan_products: planProductRows,
     },
   };
 };
@@ -1908,7 +1985,7 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
   const estimatedCost = rawMaterialsUsage.reduce((total, material) => {
     return total + Number(material.total_cost || 0);
   }, 0);
-  const [recipeMaterialRows] = await db.query(
+  let [recipeMaterialRows] = await db.query(
     `
       SELECT
         r.id AS recipe_id,
@@ -1944,7 +2021,49 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
     [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
   );
 
-  const [flourDailyRows] = await db.query(
+  const [recipeCorrectionRows] = await db.query(
+    `SELECT
+       recipe.id AS recipe_id,
+       COALESCE(NULLIF(SUBSTRING_INDEX(recipe.notes, ' - ', 1), ''), recipe_product.name, CONCAT('Receta #', recipe.id)) AS recipe_name,
+       im.raw_material_id,
+       rm.name AS raw_material_name,
+       rm.unit AS raw_material_unit,
+       rm.purchase_package_name,
+       rm.purchase_package_quantity,
+       COALESCE(SUM(CASE WHEN im.movement_type = 'production_out' THEN im.quantity ELSE -im.quantity END), 0) AS total_quantity,
+       COALESCE(SUM(CASE WHEN im.movement_type = 'production_out' THEN im.quantity ELSE -im.quantity END
+         * COALESCE(im.unit_cost, rm.unit_cost, 0)), 0) AS total_cost
+     FROM inventory_movements im
+     INNER JOIN raw_materials rm ON rm.id = im.raw_material_id
+     INNER JOIN production_plan_product_corrections correction ON correction.id = im.reference_id
+     INNER JOIN production_plan_product_details detail ON detail.id = correction.production_plan_product_detail_id
+     INNER JOIN production_plan_outputs plan_output ON plan_output.id = detail.production_plan_output_id
+     INNER JOIN production_plan_items plan_item ON plan_item.id = plan_output.production_plan_item_id
+     INNER JOIN recipes recipe ON recipe.id = plan_item.recipe_id
+     LEFT JOIN products recipe_product ON recipe_product.id = recipe.product_id
+     WHERE im.item_type = 'raw_material'
+       AND im.reference_type = 'production_correction'
+       AND im.movement_type IN ('production_out', 'adjustment_in')
+       AND DATE(im.moved_at) >= ? AND DATE(im.moved_at) <= ?
+       AND (? IS NULL OR im.branch_id = ?)
+       AND (? IS NULL OR recipe.id = ?)
+     GROUP BY recipe.id, recipe.notes, recipe_product.name, im.raw_material_id,
+              rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity`,
+    [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
+  );
+  const recipeMaterialMap = new Map(recipeMaterialRows.map((row) => [`${row.recipe_id}-${row.raw_material_id}`, { ...row }]));
+  recipeCorrectionRows.forEach((correction) => {
+    const key = `${correction.recipe_id}-${correction.raw_material_id}`;
+    const current = recipeMaterialMap.get(key) || { ...correction, total_quantity: 0, total_cost: 0 };
+    current.total_quantity = Number(current.total_quantity || 0) + Number(correction.total_quantity || 0);
+    current.total_cost = Number(current.total_cost || 0) + Number(correction.total_cost || 0);
+    recipeMaterialMap.set(key, current);
+  });
+  recipeMaterialRows = Array.from(recipeMaterialMap.values()).sort((a, b) =>
+    `${a.recipe_name}-${a.raw_material_name}`.localeCompare(`${b.recipe_name}-${b.raw_material_name}`)
+  );
+
+  let [flourDailyRows] = await db.query(
     `
       SELECT
         x.usage_date,
@@ -2014,6 +2133,53 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
       ORDER BY x.usage_date, x.raw_material_name
     `,
     [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
+  );
+
+  const [flourCorrectionRows] = await db.query(
+    `SELECT
+       DATE(im.moved_at) AS usage_date,
+       im.raw_material_id,
+       rm.name AS raw_material_name,
+       rm.unit AS raw_material_unit,
+       rm.category_id,
+       category.name AS category_name,
+       rm.purchase_package_name,
+       rm.purchase_package_quantity,
+       SUM(CASE WHEN im.movement_type = 'production_out' THEN im.quantity ELSE -im.quantity END) AS total_quantity,
+       SUM((CASE WHEN im.movement_type = 'production_out' THEN im.quantity ELSE -im.quantity END)
+         * CASE rm.unit WHEN 'kg' THEN 1000 WHEN 'lb' THEN 453.59237 ELSE 1 END) AS total_grams
+     FROM inventory_movements im
+     INNER JOIN raw_materials rm ON rm.id = im.raw_material_id
+     LEFT JOIN raw_material_categories category ON category.id = rm.category_id
+     INNER JOIN production_plan_product_corrections correction ON correction.id = im.reference_id
+     INNER JOIN production_plan_product_details detail ON detail.id = correction.production_plan_product_detail_id
+     INNER JOIN production_plan_outputs plan_output ON plan_output.id = detail.production_plan_output_id
+     INNER JOIN production_plan_items plan_item ON plan_item.id = plan_output.production_plan_item_id
+     WHERE im.reference_type = 'production_correction'
+       AND im.item_type = 'raw_material'
+       AND im.movement_type IN ('production_out', 'adjustment_in')
+       AND DATE(im.moved_at) >= ? AND DATE(im.moved_at) <= ?
+       AND (? IS NULL OR im.branch_id = ?)
+       AND (? IS NULL OR plan_item.recipe_id = ?)
+       AND (LOWER(rm.name) LIKE '%harina%' OR LOWER(COALESCE(category.name, '')) LIKE '%harina%')
+     GROUP BY DATE(im.moved_at), im.raw_material_id, rm.name, rm.unit, rm.category_id,
+              category.name, rm.purchase_package_name, rm.purchase_package_quantity`,
+    [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
+  );
+  const flourMap = new Map(flourDailyRows.map((row) => [`${String(row.usage_date).slice(0, 10)}-${row.raw_material_id}`, { ...row }]));
+  flourCorrectionRows.forEach((correction) => {
+    const key = `${String(correction.usage_date).slice(0, 10)}-${correction.raw_material_id}`;
+    const current = flourMap.get(key) || { ...correction, total_quantity: 0, total_grams: 0 };
+    current.total_quantity = Number(current.total_quantity || 0) + Number(correction.total_quantity || 0);
+    current.total_grams = Number(current.total_grams || 0) + Number(correction.total_grams || 0);
+    current.total_kilos = current.total_grams / 1000;
+    current.bags_used = Number(current.purchase_package_quantity || 0) > 0
+      ? current.total_quantity / Number(current.purchase_package_quantity)
+      : null;
+    flourMap.set(key, current);
+  });
+  flourDailyRows = Array.from(flourMap.values()).sort((a, b) =>
+    `${String(a.usage_date).slice(0, 10)}-${a.raw_material_name}`.localeCompare(`${String(b.usage_date).slice(0, 10)}-${b.raw_material_name}`)
   );
 
   const [returnRows] = await db.query(
@@ -2146,6 +2312,7 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
       batches: dayReport.data?.batches || [],
       products: dayReport.data?.products || [],
       packers: dayReport.data?.packers || [],
+      plan_products: dayReport.data?.plan_products || [],
       raw_materials_usage: rawMaterialsUsage,
       recipe_materials_usage: recipeMaterialRows,
       flour_daily_usage: flourDailyRows,
@@ -2160,6 +2327,244 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
   };
 };
 
+const roundProductionQuantity = (value) => Math.round(Number(value || 0) * 1000) / 1000;
+
+const normalizeOptionalProductionQuantity = (value, { allowZero = true } = {}) => {
+  if (value === undefined || value === null || value === "") return { value: null };
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue) || (allowZero ? numericValue < 0 : numericValue <= 0)) {
+    return { error: true };
+  }
+  return { value: roundProductionQuantity(numericValue) };
+};
+
+const normalizeRequestMode = (value) => {
+  const mode = String(value || "").trim().toLowerCase();
+  if (["units", "unit", "unidades", "unidad"].includes(mode)) return "units";
+  if (["arrobas", "arroba"].includes(mode)) return "arrobas";
+  return null;
+};
+
+const resolveCurrentRecipeForProduct = async (connection, { productId, requestedRecipeId }) => {
+  const params = [];
+  const requestedRecipeJoin = requestedRecipeId
+    ? `INNER JOIN recipes requested
+         ON requested.id = ?
+        AND current_recipe.recipe_family_id = COALESCE(requested.recipe_family_id, requested.id)`
+    : "";
+  if (requestedRecipeId) params.push(requestedRecipeId);
+  params.push(productId);
+
+  const [rows] = await connection.query(
+    `SELECT
+       current_recipe.id,
+       current_recipe.version_no,
+       current_recipe.notes,
+       ro.product_id,
+       ro.expected_quantity,
+       p.name AS product_name
+     FROM recipes current_recipe
+     ${requestedRecipeJoin}
+     INNER JOIN recipe_outputs ro ON ro.recipe_id = current_recipe.id
+     INNER JOIN products p ON p.id = ro.product_id
+     WHERE current_recipe.is_current = 1
+       AND current_recipe.is_active = 1
+       AND ro.product_id = ?
+       AND p.is_active = 1
+     ORDER BY current_recipe.version_no DESC, current_recipe.id DESC`,
+    params
+  );
+
+  return rows;
+};
+
+const normalizeProductionPlanItems = async (connection, items) => {
+  const normalizedItems = [];
+  const selectedProductIds = new Set();
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index] || {};
+    const isProductBased = item.product_id !== undefined
+      || item.request_mode !== undefined
+      || item.requested_quantity !== undefined;
+
+    if (isProductBased) {
+      const productId = Number(item.product_id || 0);
+      const requestMode = normalizeRequestMode(item.request_mode);
+      const requestedQuantity = Number(item.requested_quantity || 0);
+      if (!Number.isInteger(productId) || productId <= 0 || !requestMode
+        || !Number.isFinite(requestedQuantity) || requestedQuantity <= 0) {
+        return { error: `Revisa el producto ${index + 1}, su modalidad y la cantidad solicitada.` };
+      }
+      if (requestMode === "units" && !Number.isInteger(requestedQuantity)) {
+        return { error: `La cantidad solicitada de ${index + 1} debe ser un numero entero de unidades.` };
+      }
+      if (selectedProductIds.has(productId)) {
+        return { error: `El producto ${index + 1} esta repetido en el plan.` };
+      }
+
+      const recipeRows = await resolveCurrentRecipeForProduct(connection, {
+        productId,
+        requestedRecipeId: Number(item.recipe_id || 0) || null,
+      });
+      if (!recipeRows.length) {
+        return { error: `El producto ${index + 1} no tiene una receta vigente asociada.` };
+      }
+      if (recipeRows.length > 1 && !item.recipe_id) {
+        return { error: `${recipeRows[0].product_name} pertenece a mas de una receta vigente. Indica la receta que debe utilizarse.` };
+      }
+
+      const recipe = recipeRows[0];
+      const yieldPerArroba = Number(recipe.expected_quantity || 0);
+      if (!Number.isFinite(yieldPerArroba) || yieldPerArroba <= 0) {
+        return { error: `${recipe.product_name} no tiene un rendimiento valido en su receta vigente.` };
+      }
+
+      const plannedArrobas = roundProductionQuantity(
+        requestMode === "arrobas" ? requestedQuantity : requestedQuantity / yieldPerArroba
+      );
+      const estimatedUnits = roundProductionQuantity(
+        requestMode === "units" ? requestedQuantity : requestedQuantity * yieldPerArroba
+      );
+      if (plannedArrobas <= 0 || estimatedUnits <= 0) {
+        return { error: `La cantidad del producto ${index + 1} es demasiado pequena para planificarla.` };
+      }
+
+      const unitsPerTray = normalizeOptionalProductionQuantity(item.units_per_tray, { allowZero: false });
+      const trayCount = normalizeOptionalProductionQuantity(item.tray_count);
+      const looseUnits = normalizeOptionalProductionQuantity(item.loose_units);
+      if (unitsPerTray.error || trayCount.error || looseUnits.error) {
+        return { error: `Revisa el detalle opcional de latas del producto ${index + 1}.` };
+      }
+
+      selectedProductIds.add(productId);
+      normalizedItems.push({
+        recipeId: Number(recipe.id),
+        recipeVersion: Number(recipe.version_no),
+        recipeName: String(recipe.notes || `Receta #${recipe.id}`).split(/\s+-\s+/)[0],
+        arrobas: plannedArrobas,
+        outputs: [{
+          product_id: productId,
+          product_name: recipe.product_name,
+          expected_quantity: estimatedUnits,
+          detail: {
+            requestMode,
+            requestedQuantity: roundProductionQuantity(requestedQuantity),
+            plannedArrobas,
+            estimatedUnits,
+            unitsPerTray: unitsPerTray.value,
+            trayCount: trayCount.value,
+            looseUnits: looseUnits.value,
+          },
+        }],
+      });
+      continue;
+    }
+
+    const requestedRecipeId = Number(item.recipe_id || 0);
+    const arrobas = Number(item.arrobas || 0);
+    if (!requestedRecipeId || !Number.isFinite(arrobas) || arrobas <= 0) {
+      return { error: `Revisa la receta ${index + 1} y su cantidad de arrobas.` };
+    }
+
+    const [recipeRows] = await connection.query(
+      `SELECT current_recipe.id, current_recipe.version_no, current_recipe.notes
+       FROM recipes requested
+       INNER JOIN recipes current_recipe
+         ON current_recipe.recipe_family_id = COALESCE(requested.recipe_family_id, requested.id)
+        AND current_recipe.is_current = 1
+        AND current_recipe.is_active = 1
+       WHERE requested.id = ?
+       ORDER BY current_recipe.version_no DESC
+       LIMIT 1`,
+      [requestedRecipeId]
+    );
+    if (!recipeRows.length) {
+      return { error: `La receta ${index + 1} no tiene una version vigente.` };
+    }
+
+    const recipeId = Number(recipeRows[0].id);
+    const requestedProductIds = (Array.isArray(item.product_ids) ? item.product_ids : [])
+      .map(Number)
+      .filter((value) => Number.isInteger(value) && value > 0);
+    const [outputRows] = await connection.query(
+      `SELECT ro.product_id, ro.expected_quantity, p.name AS product_name
+       FROM recipe_outputs ro
+       INNER JOIN products p ON p.id = ro.product_id
+       WHERE ro.recipe_id = ?
+       ORDER BY ro.sort_order, ro.id`,
+      [recipeId]
+    );
+    const selectedOutputs = requestedProductIds.length
+      ? outputRows.filter((output) => requestedProductIds.includes(Number(output.product_id)))
+      : outputRows;
+    if (!selectedOutputs.length
+      || (requestedProductIds.length && selectedOutputs.length !== new Set(requestedProductIds).size)) {
+      return { error: `Selecciona productos validos para la receta ${index + 1}.` };
+    }
+    for (const output of selectedOutputs) {
+      const productId = Number(output.product_id);
+      if (selectedProductIds.has(productId)) {
+        return { error: `${output.product_name || `El producto #${productId}`} esta repetido en el plan.` };
+      }
+      selectedProductIds.add(productId);
+    }
+
+    normalizedItems.push({
+      recipeId,
+      recipeVersion: Number(recipeRows[0].version_no),
+      recipeName: String(recipeRows[0].notes || `Receta #${recipeId}`).split(/\s+-\s+/)[0],
+      arrobas: roundProductionQuantity(arrobas),
+      outputs: selectedOutputs.map((output) => ({
+        ...output,
+        expected_quantity: roundProductionQuantity(Number(output.expected_quantity) * arrobas),
+        detail: null,
+      })),
+    });
+  }
+
+  return { normalizedItems };
+};
+
+const insertNormalizedProductionPlanItems = async (connection, productionPlanId, normalizedItems) => {
+  for (let index = 0; index < normalizedItems.length; index += 1) {
+    const item = normalizedItems[index];
+    const [itemInsert] = await connection.query(
+      `INSERT INTO production_plan_items (production_plan_id, recipe_id, arrobas, sort_order)
+       VALUES (?, ?, ?, ?)`,
+      [productionPlanId, item.recipeId, item.arrobas, index + 1]
+    );
+    const planItemId = Number(itemInsert.insertId);
+
+    for (const output of item.outputs) {
+      const [outputInsert] = await connection.query(
+        `INSERT INTO production_plan_outputs (production_plan_item_id, product_id, expected_quantity)
+         VALUES (?, ?, ?)`,
+        [planItemId, Number(output.product_id), Number(output.expected_quantity)]
+      );
+      if (output.detail) {
+        const detail = output.detail;
+        await connection.query(
+          `INSERT INTO production_plan_product_details (
+             production_plan_output_id, request_mode, requested_quantity,
+             planned_arrobas, estimated_units, units_per_tray, tray_count, loose_units
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            Number(outputInsert.insertId),
+            detail.requestMode,
+            detail.requestedQuantity,
+            detail.plannedArrobas,
+            detail.estimatedUnits,
+            detail.unitsPerTray,
+            detail.trayCount,
+            detail.looseUnits,
+          ]
+        );
+      }
+    }
+  }
+};
+
 const createProductionPlan = async (payload, actorUserId) => {
   const db = await connect();
   const connection = await db.getConnection();
@@ -2172,7 +2577,7 @@ const createProductionPlan = async (payload, actorUserId) => {
     connection.release();
     return {
       code: 0,
-      message: "Selecciona sucursal, fecha, panadero y al menos una receta.",
+      message: "Selecciona sucursal, fecha, panadero y al menos un producto.",
       data: null,
     };
   }
@@ -2201,64 +2606,12 @@ const createProductionPlan = async (payload, actorUserId) => {
       return { code: 0, message: "La sucursal o el panadero no estÃƒÂ¡n disponibles.", data: null };
     }
 
-    const normalizedItems = [];
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      const requestedRecipeId = Number(item.recipe_id || 0);
-      const arrobas = Number(item.arrobas || 0);
-      if (!requestedRecipeId || arrobas <= 0) {
-        await connection.rollback();
-        return { code: 0, message: `Revisa la receta ${index + 1} y su cantidad de arrobas.`, data: null };
-      }
-
-      const [recipeRows] = await connection.query(
-        `SELECT current_recipe.id,
-                current_recipe.version_no,
-                current_recipe.notes
-           FROM recipes requested
-           INNER JOIN recipes current_recipe
-             ON current_recipe.recipe_family_id = COALESCE(requested.recipe_family_id, requested.id)
-            AND current_recipe.is_current = 1
-            AND current_recipe.is_active = 1
-          WHERE requested.id = ?
-          ORDER BY current_recipe.version_no DESC
-          LIMIT 1`,
-        [requestedRecipeId]
-      );
-      if (!recipeRows.length) {
-        await connection.rollback();
-        return { code: 0, message: `La receta ${index + 1} no tiene una versiÃƒÂ³n vigente.`, data: null };
-      }
-
-      const recipeId = Number(recipeRows[0].id);
-      const requestedProductIds = (Array.isArray(item.product_ids) ? item.product_ids : [])
-        .map(Number)
-        .filter((value) => Number.isInteger(value) && value > 0);
-      const [outputRows] = await connection.query(
-        `SELECT ro.product_id, ro.expected_quantity, p.name AS product_name
-           FROM recipe_outputs ro
-           INNER JOIN products p ON p.id = ro.product_id
-          WHERE ro.recipe_id = ?
-          ORDER BY ro.sort_order, ro.id`,
-        [recipeId]
-      );
-      const selectedOutputs = requestedProductIds.length
-        ? outputRows.filter((output) => requestedProductIds.includes(Number(output.product_id)))
-        : outputRows;
-
-      if (!selectedOutputs.length || (requestedProductIds.length && selectedOutputs.length !== new Set(requestedProductIds).size)) {
-        await connection.rollback();
-        return { code: 0, message: `Selecciona productos vÃƒÂ¡lidos para la receta ${index + 1}.`, data: null };
-      }
-
-      normalizedItems.push({
-        recipeId,
-        recipeVersion: Number(recipeRows[0].version_no),
-        recipeName: String(recipeRows[0].notes || `Receta #${recipeId}`).split(/\s+-\s+/)[0],
-        arrobas,
-        outputs: selectedOutputs,
-      });
+    const normalization = await normalizeProductionPlanItems(connection, items);
+    if (normalization.error) {
+      await connection.rollback();
+      return { code: 0, message: normalization.error, data: null };
     }
+    const { normalizedItems } = normalization;
 
     const [planInsert] = await connection.query(
       `INSERT INTO production_plans (
@@ -2268,31 +2621,11 @@ const createProductionPlan = async (payload, actorUserId) => {
     );
     const productionPlanId = Number(planInsert.insertId);
 
-    for (let index = 0; index < normalizedItems.length; index += 1) {
-      const item = normalizedItems[index];
-      const [itemInsert] = await connection.query(
-        `INSERT INTO production_plan_items (
-           production_plan_id, recipe_id, arrobas, sort_order
-         ) VALUES (?, ?, ?, ?)`,
-        [productionPlanId, item.recipeId, item.arrobas, index + 1]
-      );
-      const planItemId = Number(itemInsert.insertId);
-
-      for (const output of item.outputs) {
-        await connection.query(
-          `INSERT INTO production_plan_outputs (
-             production_plan_item_id, product_id, expected_quantity
-           ) VALUES (?, ?, ?)`,
-          [
-            planItemId,
-            Number(output.product_id),
-            Math.round(Number(output.expected_quantity) * item.arrobas * 1000) / 1000,
-          ]
-        );
-      }
-    }
+    await insertNormalizedProductionPlanItems(connection, productionPlanId, normalizedItems);
 
     const totalArrobas = normalizedItems.reduce((sum, item) => sum + item.arrobas, 0);
+    const productCount = normalizedItems.reduce((sum, item) => sum + item.outputs.length, 0);
+    const recipeCount = new Set(normalizedItems.map((item) => item.recipeId)).size;
     await connection.query(
       `INSERT INTO user_notifications (
          user_id, notification_type, title, message, reference_type, reference_id
@@ -2300,7 +2633,7 @@ const createProductionPlan = async (payload, actorUserId) => {
       [
         Number(bakerRows[0].user_id),
         `ProducciÃƒÂ³n asignada para ${plannedDate}`,
-        `${normalizedItems.length} receta(s) y ${totalArrobas.toLocaleString("es-CO")} arroba(s) en ${branchRows[0].name}.`,
+        `${productCount} producto(s), ${recipeCount} receta(s) y ${totalArrobas.toLocaleString("es-CO")} arroba(s) en ${branchRows[0].name}.`,
         productionPlanId,
       ]
     );
@@ -2308,13 +2641,14 @@ const createProductionPlan = async (payload, actorUserId) => {
     await connection.query(
       `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
        VALUES (?, 'production_plan.create', 'production_plans', ?,
-         JSON_OBJECT('planned_date', ?, 'baker_employee_id', ?, 'recipes', ?, 'arrobas', ?))`,
+         JSON_OBJECT('planned_date', ?, 'baker_employee_id', ?, 'recipes', ?, 'products', ?, 'arrobas', ?))`,
       [
         actorUserId || null,
         String(productionPlanId),
         plannedDate,
         bakerEmployeeId,
-        normalizedItems.length,
+        recipeCount,
+        productCount,
         totalArrobas,
       ]
     );
@@ -2336,6 +2670,7 @@ const createProductionPlan = async (payload, actorUserId) => {
 const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) => {
   const db = await connect();
   const connection = await db.getConnection();
+  const ownsTransaction = true;
   const planId = Number(productionPlanId || 0);
   const actorUserId = Number(actorUser.userId || 0);
   const branchId = Number(payload.p_branch_id || 0);
@@ -2348,11 +2683,11 @@ const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) =
 
   if (!planId || !branchId || !bakerEmployeeId || !plannedDate || !items.length) {
     connection.release();
-    return { code: 0, message: "Selecciona sucursal, fecha, panadero y al menos una receta.", data: null };
+    return { code: 0, message: "Selecciona sucursal, fecha, panadero y al menos un producto.", data: null };
   }
 
   try {
-    await connection.beginTransaction();
+    if (ownsTransaction) await connection.beginTransaction();
     const [planRows] = await connection.query(
       `SELECT pp.id, pp.created_by, pp.status, e.user_id AS baker_user_id
          FROM production_plans pp
@@ -2362,7 +2697,7 @@ const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) =
       [planId]
     );
     if (!planRows.length) {
-      await connection.rollback();
+      if (ownsTransaction) await connection.rollback();
       return { code: 0, message: "El plan de produccion no existe.", data: null };
     }
 
@@ -2371,7 +2706,7 @@ const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) =
       || Number(plan.created_by) === actorUserId
       || Number(plan.baker_user_id) === actorUserId;
     if (!canEdit) {
-      await connection.rollback();
+      if (ownsTransaction) await connection.rollback();
       return { code: 0, message: "No tienes permiso para editar este plan.", data: null };
     }
 
@@ -2388,7 +2723,7 @@ const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) =
     if (plan.status === "completed" || plan.status === "cancelled"
       || Number(progressRows[0]?.started_items || 0) > 0
       || Number(progressRows[0]?.reservations || 0) > 0) {
-      await connection.rollback();
+      if (ownsTransaction) await connection.rollback();
       return { code: 0, message: "El plan ya tiene produccion iniciada o reservas asociadas y no puede modificarse.", data: null };
     }
 
@@ -2405,53 +2740,16 @@ const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) =
       [bakerEmployeeId]
     );
     if (!branchRows.length || !bakerRows.length) {
-      await connection.rollback();
+      if (ownsTransaction) await connection.rollback();
       return { code: 0, message: "La sucursal o el panadero no estan disponibles.", data: null };
     }
 
-    const normalizedItems = [];
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      const requestedRecipeId = Number(item.recipe_id || 0);
-      const arrobas = Number(item.arrobas || 0);
-      if (!requestedRecipeId || arrobas <= 0) {
-        await connection.rollback();
-        return { code: 0, message: `Revisa la receta ${index + 1} y sus bultos estimados.`, data: null };
-      }
-      const [recipeRows] = await connection.query(
-        `SELECT current_recipe.id
-           FROM recipes requested
-           INNER JOIN recipes current_recipe
-             ON current_recipe.recipe_family_id = COALESCE(requested.recipe_family_id, requested.id)
-            AND current_recipe.is_current = 1 AND current_recipe.is_active = 1
-          WHERE requested.id = ?
-          ORDER BY current_recipe.version_no DESC LIMIT 1`,
-        [requestedRecipeId]
-      );
-      if (!recipeRows.length) {
-        await connection.rollback();
-        return { code: 0, message: `La receta ${index + 1} no tiene una version vigente.`, data: null };
-      }
-      const recipeId = Number(recipeRows[0].id);
-      const requestedProductIds = (Array.isArray(item.product_ids) ? item.product_ids : [])
-        .map(Number).filter((value) => Number.isInteger(value) && value > 0);
-      const [outputRows] = await connection.query(
-        `SELECT ro.product_id, ro.expected_quantity
-           FROM recipe_outputs ro
-           INNER JOIN products p ON p.id = ro.product_id
-          WHERE ro.recipe_id = ?
-          ORDER BY ro.sort_order, ro.id`,
-        [recipeId]
-      );
-      const selectedOutputs = requestedProductIds.length
-        ? outputRows.filter((output) => requestedProductIds.includes(Number(output.product_id)))
-        : outputRows;
-      if (!selectedOutputs.length || (requestedProductIds.length && selectedOutputs.length !== new Set(requestedProductIds).size)) {
-        await connection.rollback();
-        return { code: 0, message: `Selecciona productos validos para la receta ${index + 1}.`, data: null };
-      }
-      normalizedItems.push({ recipeId, arrobas, outputs: selectedOutputs });
+    const normalization = await normalizeProductionPlanItems(connection, items);
+    if (normalization.error) {
+      if (ownsTransaction) await connection.rollback();
+      return { code: 0, message: normalization.error, data: null };
     }
+    const { normalizedItems } = normalization;
 
     await connection.query(
       `UPDATE production_plans
@@ -2467,40 +2765,28 @@ const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) =
     );
     await connection.query("DELETE FROM production_plan_items WHERE production_plan_id = ?", [planId]);
 
-    for (let index = 0; index < normalizedItems.length; index += 1) {
-      const item = normalizedItems[index];
-      const [itemInsert] = await connection.query(
-        `INSERT INTO production_plan_items (production_plan_id, recipe_id, arrobas, sort_order)
-         VALUES (?, ?, ?, ?)`,
-        [planId, item.recipeId, item.arrobas, index + 1]
-      );
-      for (const output of item.outputs) {
-        await connection.query(
-          `INSERT INTO production_plan_outputs (production_plan_item_id, product_id, expected_quantity)
-           VALUES (?, ?, ?)`,
-          [Number(itemInsert.insertId), Number(output.product_id), Math.round(Number(output.expected_quantity) * item.arrobas * 1000) / 1000]
-        );
-      }
-    }
+    await insertNormalizedProductionPlanItems(connection, planId, normalizedItems);
 
     const totalBultos = normalizedItems.reduce((sum, item) => sum + item.arrobas, 0);
+    const productCount = normalizedItems.reduce((sum, item) => sum + item.outputs.length, 0);
+    const recipeCount = new Set(normalizedItems.map((item) => item.recipeId)).size;
     await connection.query(
       `INSERT INTO user_notifications
          (user_id, notification_type, title, message, reference_type, reference_id)
        VALUES (?, 'production_plan', ?, ?, 'production_plan', ?)`,
       [Number(bakerRows[0].user_id), `Plan actualizado para ${plannedDate}`,
-        `${normalizedItems.length} receta(s) y ${totalBultos.toLocaleString("es-CO")} bulto(s) estimado(s) en ${branchRows[0].name}.`, planId]
+        `${productCount} producto(s), ${recipeCount} receta(s) y ${totalBultos.toLocaleString("es-CO")} arroba(s) estimada(s) en ${branchRows[0].name}.`, planId]
     );
     await connection.query(
       `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
        VALUES (?, 'production_plan.update', 'production_plans', ?,
-         JSON_OBJECT('planned_date', ?, 'baker_employee_id', ?, 'recipes', ?, 'bultos', ?))`,
-      [actorUserId || null, String(planId), plannedDate, bakerEmployeeId, normalizedItems.length, totalBultos]
+         JSON_OBJECT('planned_date', ?, 'baker_employee_id', ?, 'recipes', ?, 'products', ?, 'arrobas', ?))`,
+      [actorUserId || null, String(planId), plannedDate, bakerEmployeeId, recipeCount, productCount, totalBultos]
     );
     await connection.commit();
     return { code: 1, message: "Plan actualizado correctamente.", data: { production_plan_id: planId } };
   } catch (error) {
-    await connection.rollback();
+        if (ownsTransaction) await connection.rollback();
     throw error;
   } finally {
     connection.release();
@@ -2581,16 +2867,44 @@ const listProductionPlans = async ({ userId, plannedDate, bakerEmployeeId } = {}
     const outputPlaceholders = itemIds.map(() => "?").join(",");
     const [rows] = await db.query(
       `SELECT
+         ppo.id AS production_plan_output_id,
          ppo.production_plan_item_id,
          ppo.product_id,
          p.name AS product_name,
          ppo.expected_quantity,
-         pbo.produced_quantity,
+         CASE WHEN ppd.id IS NULL THEN 'legacy' ELSE 'product' END AS planning_format,
+         COALESCE(ppd.request_mode, 'arrobas') AS request_mode,
+         COALESCE(ppd.requested_quantity, output_item.arrobas) AS requested_quantity,
+         COALESCE(ppd.planned_arrobas, output_item.arrobas) AS planned_arrobas,
+         COALESCE(ppd.estimated_units, ppo.expected_quantity) AS estimated_units,
+         ppd.units_per_tray,
+         ppd.tray_count,
+         ppd.loose_units,
+         COALESCE(
+           ppd.product_status,
+           CASE
+             WHEN output_item.production_batch_id IS NOT NULL THEN 'completed'
+             WHEN output_item.started_at IS NOT NULL THEN 'in_progress'
+             ELSE 'pending'
+           END
+         ) AS product_status,
+         ppd.actual_arrobas,
+         COALESCE(ppd.produced_quantity, pbo.produced_quantity) AS produced_quantity,
+         ppd.actual_units_per_tray,
+         ppd.actual_tray_count,
+         ppd.actual_loose_units,
+         ppd.baker_notes,
+         ppd.reported_by,
+         ppd.reported_at,
+         ppd.started_at AS product_started_at,
+         ppd.completed_at AS product_completed_at,
          COALESCE(reserved.reserved_quantity, 0) AS reserved_quantity,
          COALESCE(reserved.delivered_quantity, 0) AS direct_delivered_quantity
        FROM production_plan_outputs ppo
        INNER JOIN products p ON p.id = ppo.product_id
        INNER JOIN production_plan_items output_item ON output_item.id = ppo.production_plan_item_id
+       LEFT JOIN production_plan_product_details ppd
+         ON ppd.production_plan_output_id = ppo.id
        LEFT JOIN production_batch_outputs pbo
          ON pbo.production_batch_id = output_item.production_batch_id
         AND pbo.product_id = ppo.product_id
@@ -2624,10 +2938,53 @@ const listProductionPlans = async ({ userId, plannedDate, bakerEmployeeId } = {}
     return acc;
   }, {});
 
+  const buildCompatiblePlanData = (plan) => {
+    const planItems = itemsByPlan[String(plan.id)] || [];
+    const productAssignments = planItems.flatMap((item) => item.outputs.map((output) => ({
+      ...output,
+      production_plan_item_id: Number(item.id),
+      recipe_id: Number(item.recipe_id),
+      recipe_version: Number(item.recipe_version),
+      recipe_name: item.recipe_name,
+      sort_order: Number(item.sort_order),
+    })));
+    const groupsByRecipe = new Map();
+    planItems.forEach((item) => {
+      const key = String(item.recipe_id);
+      const group = groupsByRecipe.get(key) || {
+        recipe_id: Number(item.recipe_id),
+        recipe_version: Number(item.recipe_version),
+        recipe_name: item.recipe_name,
+        planned_arrobas: 0,
+        items: [],
+        products: [],
+      };
+      group.planned_arrobas = roundProductionQuantity(
+        Number(group.planned_arrobas) + Number(item.arrobas || 0)
+      );
+      group.items.push(item);
+      group.products.push(...item.outputs.map((output) => ({
+        ...output,
+        production_plan_item_id: Number(item.id),
+      })));
+      groupsByRecipe.set(key, group);
+    });
+
+    return {
+      ...plan,
+      items: planItems,
+      product_assignments: productAssignments,
+      recipe_groups: Array.from(groupsByRecipe.values()),
+      planning_format: productAssignments.some((output) => output.planning_format === "product")
+        ? "product"
+        : "legacy",
+    };
+  };
+
   return {
     code: 1,
     message: "planes de producciÃƒÂ³n listados",
-    data: plans.map((plan) => ({ ...plan, items: itemsByPlan[String(plan.id)] || [] })),
+    data: plans.map(buildCompatiblePlanData),
   };
 };
 
@@ -2676,7 +3033,7 @@ const startProductionPlanItem = async ({ productionPlanItemId, userId }) => {
   };
 };
 
-const finishProductionPlanItem = async ({ productionPlanItemId, userId, outputs = [] }) => {
+const finishProductionPlanItem = async ({ productionPlanItemId, userId, outputs = [], batchQuantity }) => {
   const db = await connect();
   const lockConnection = await db.getConnection();
   const lockName = `production_plan_item_${Number(productionPlanItemId)}`;
@@ -2766,7 +3123,7 @@ const finishProductionPlanItem = async ({ productionPlanItemId, userId, outputs 
         p_recipe_id: Number(item.recipe_id),
         p_baker_employee_id: Number(item.baker_employee_id),
         p_produced_date: item.planned_date,
-        p_batch_quantity: Number(item.arrobas),
+        p_batch_quantity: Number(batchQuantity || item.arrobas),
         p_outputs: normalizedOutputs,
         p_notes: item.notes || `Plan de produccion #${item.production_plan_id}`,
       },
@@ -2829,6 +3186,453 @@ const finishProductionPlanItem = async ({ productionPlanItemId, userId, outputs 
       await lockConnection.query("SELECT RELEASE_LOCK(?)", [lockName]);
     }
     lockConnection.release();
+  }
+};
+
+const getOwnedProductionPlanProduct = async (connection, productionPlanOutputId, userId, { forUpdate = false } = {}) => {
+  const [rows] = await connection.query(
+    `SELECT
+       ppo.id,
+       ppo.production_plan_item_id,
+       ppo.product_id,
+       ppo.expected_quantity,
+       ppi.recipe_id,
+       ppi.production_batch_id,
+       ppi.started_at AS item_started_at,
+       p.name AS product_name,
+       ppd.product_status,
+       ppd.planned_arrobas,
+       ppd.estimated_units,
+       pp.id AS production_plan_id,
+       pp.branch_id,
+       pp.planned_date,
+       pp.baker_employee_id,
+       pp.notes AS plan_notes,
+       pp.status AS plan_status
+     FROM production_plan_outputs ppo
+     INNER JOIN production_plan_product_details ppd ON ppd.production_plan_output_id = ppo.id
+     INNER JOIN production_plan_items ppi ON ppi.id = ppo.production_plan_item_id
+     INNER JOIN production_plans pp ON pp.id = ppi.production_plan_id
+     INNER JOIN employees e ON e.id = pp.baker_employee_id
+     INNER JOIN products p ON p.id = ppo.product_id
+     WHERE ppo.id = ? AND e.user_id = ?
+     LIMIT 1${forUpdate ? " FOR UPDATE" : ""}`,
+    [Number(productionPlanOutputId), Number(userId)]
+  );
+  return rows[0] || null;
+};
+
+const refreshProductionPlanStatus = async (connection, productionPlanId) => {
+  const [rows] = await connection.query(
+    `SELECT COUNT(*) AS pending_products
+     FROM production_plan_outputs ppo
+     INNER JOIN production_plan_items ppi ON ppi.id = ppo.production_plan_item_id
+     LEFT JOIN production_plan_product_details ppd ON ppd.production_plan_output_id = ppo.id
+     WHERE ppi.production_plan_id = ?
+       AND (
+         (ppd.id IS NOT NULL AND ppd.product_status NOT IN ('completed','skipped','cancelled'))
+         OR (ppd.id IS NULL AND ppi.production_batch_id IS NULL)
+       )`,
+    [Number(productionPlanId)]
+  );
+  if (Number(rows[0]?.pending_products || 0) === 0) {
+    await connection.query(
+      "UPDATE production_plans SET status = 'completed' WHERE id = ? AND status <> 'cancelled'",
+      [Number(productionPlanId)]
+    );
+  }
+};
+
+const normalizeProductProgress = (payload = {}) => {
+  const fields = [
+    ["actual_arrobas", payload.p_actual_arrobas, false],
+    ["produced_quantity", payload.p_produced_quantity, true],
+    ["actual_units_per_tray", payload.p_actual_units_per_tray, false],
+    ["actual_tray_count", payload.p_actual_tray_count, true],
+    ["actual_loose_units", payload.p_actual_loose_units, true],
+  ];
+  const values = {};
+  for (const [name, rawValue, allowZero] of fields) {
+    if (rawValue === undefined || rawValue === null || rawValue === "") {
+      values[name] = null;
+      continue;
+    }
+    const value = Number(rawValue);
+    if (!Number.isFinite(value) || (allowZero ? value < 0 : value <= 0)) return null;
+    if (name === "produced_quantity" && !Number.isInteger(value)) return null;
+    values[name] = roundProductionQuantity(value);
+  }
+  values.baker_notes = String(payload.p_baker_notes || "").trim().slice(0, 500) || null;
+  return values;
+};
+
+const startProductionPlanProduct = async ({ productionPlanOutputId, userId }) => {
+  const db = await connect();
+  const product = await getOwnedProductionPlanProduct(db, productionPlanOutputId, userId);
+  if (!product) return { code: 0, message: "Este producto no esta asignado a tu usuario.", data: null };
+  if (["completed", "skipped", "cancelled"].includes(product.product_status) || product.plan_status === "cancelled") {
+    return { code: 0, message: "Este producto ya no se puede iniciar.", data: null };
+  }
+  await db.query(
+    `UPDATE production_plan_product_details
+     SET product_status = 'in_progress', started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
+     WHERE production_plan_output_id = ?`,
+    [Number(productionPlanOutputId)]
+  );
+  await db.query(
+    `UPDATE production_plan_items ppi
+     INNER JOIN production_plan_outputs ppo ON ppo.production_plan_item_id = ppi.id
+     INNER JOIN production_plans pp ON pp.id = ppi.production_plan_id
+     SET ppi.started_at = COALESCE(ppi.started_at, CURRENT_TIMESTAMP),
+         pp.status = IF(pp.status = 'assigned', 'viewed', pp.status),
+         pp.viewed_at = COALESCE(pp.viewed_at, CURRENT_TIMESTAMP)
+     WHERE ppo.id = ?`,
+    [Number(productionPlanOutputId)]
+  );
+  return { code: 1, message: "Producto iniciado.", data: { production_plan_output_id: Number(productionPlanOutputId) } };
+};
+
+const saveProductionPlanProductProgress = async ({ productionPlanOutputId, userId, payload }) => {
+  const db = await connect();
+  const product = await getOwnedProductionPlanProduct(db, productionPlanOutputId, userId);
+  if (!product) return { code: 0, message: "Este producto no esta asignado a tu usuario.", data: null };
+  if (product.product_status !== "in_progress") {
+    return { code: 0, message: "Inicia el producto antes de guardar avances.", data: null };
+  }
+  const progress = normalizeProductProgress(payload);
+  if (!progress) return { code: 0, message: "Revisa las cantidades registradas.", data: null };
+  await db.query(
+    `UPDATE production_plan_product_details
+     SET actual_arrobas = ?, produced_quantity = ?, actual_units_per_tray = ?,
+         actual_tray_count = ?, actual_loose_units = ?, baker_notes = ?,
+         reported_by = ?, reported_at = CURRENT_TIMESTAMP
+     WHERE production_plan_output_id = ?`,
+    [progress.actual_arrobas, progress.produced_quantity, progress.actual_units_per_tray,
+      progress.actual_tray_count, progress.actual_loose_units, progress.baker_notes,
+      Number(userId), Number(productionPlanOutputId)]
+  );
+  return { code: 1, message: "Avance guardado.", data: { production_plan_output_id: Number(productionPlanOutputId) } };
+};
+
+const skipProductionPlanProduct = async ({ productionPlanOutputId, userId, justification }) => {
+  const db = await connect();
+  const product = await getOwnedProductionPlanProduct(db, productionPlanOutputId, userId);
+  const notes = String(justification || "").trim();
+  if (!product) return { code: 0, message: "Este producto no esta asignado a tu usuario.", data: null };
+  if (!notes) return { code: 0, message: "Escribe por que el producto no fue elaborado.", data: null };
+  if (["completed", "skipped", "cancelled"].includes(product.product_status)) {
+    return { code: 0, message: "Este producto ya fue cerrado.", data: null };
+  }
+  await db.query(
+    `UPDATE production_plan_product_details ppd
+     INNER JOIN production_plan_outputs ppo ON ppo.id = ppd.production_plan_output_id
+     INNER JOIN production_plan_items ppi ON ppi.id = ppo.production_plan_item_id
+     SET ppd.product_status = 'skipped', ppd.baker_notes = ?, ppd.reported_by = ?,
+         ppd.reported_at = CURRENT_TIMESTAMP, ppd.completed_at = CURRENT_TIMESTAMP,
+         ppi.finished_at = CURRENT_TIMESTAMP
+     WHERE ppd.production_plan_output_id = ?`,
+    [notes.slice(0, 500), Number(userId), Number(productionPlanOutputId)]
+  );
+  await refreshProductionPlanStatus(db, product.production_plan_id);
+  return { code: 1, message: "Producto marcado como no elaborado.", data: null };
+};
+
+const finishProductionPlanProduct = async ({ productionPlanOutputId, userId, payload }) => {
+  const db = await connect();
+  const connection = await db.getConnection();
+  const ownsTransaction = true;
+  try {
+    if (ownsTransaction) await connection.beginTransaction();
+    const product = await getOwnedProductionPlanProduct(
+      connection,
+      productionPlanOutputId,
+      userId,
+      { forUpdate: true }
+    );
+    if (!product) {
+      if (ownsTransaction) await connection.rollback();
+      return { code: 0, message: "Este producto no esta asignado a tu usuario.", data: null };
+    }
+    if (product.product_status === "completed" || product.production_batch_id) {
+      if (ownsTransaction) await connection.rollback();
+      return {
+        code: 1,
+        message: "El producto ya fue finalizado.",
+        data: { production_batch_id: Number(product.production_batch_id || 0) || null },
+      };
+    }
+    if (product.product_status !== "in_progress" || !product.item_started_at) {
+      if (ownsTransaction) await connection.rollback();
+      return { code: 0, message: "Inicia el producto antes de finalizarlo.", data: null };
+    }
+    if (product.plan_status === "cancelled") {
+      if (ownsTransaction) await connection.rollback();
+      return { code: 0, message: "El plan fue cancelado.", data: null };
+    }
+    const progress = normalizeProductProgress(payload);
+    if (!progress || !progress.actual_arrobas || !progress.produced_quantity) {
+      if (ownsTransaction) await connection.rollback();
+      return { code: 0, message: "Registra las arrobas utilizadas y la cantidad producida.", data: null };
+    }
+
+    const batchResult = await registerProductionBatch(
+      {
+        p_branch_id: Number(product.branch_id),
+        p_recipe_id: Number(product.recipe_id),
+        p_baker_employee_id: Number(product.baker_employee_id),
+        p_produced_date: product.planned_date,
+        p_batch_quantity: progress.actual_arrobas,
+        p_outputs: [{ product_id: product.product_id, produced_quantity: progress.produced_quantity }],
+        p_notes: progress.baker_notes || product.plan_notes || `Plan de produccion #${product.production_plan_id}`,
+      },
+      Number(userId),
+      { connection }
+    );
+    if (batchResult?.code !== 1) {
+        if (ownsTransaction) await connection.rollback();
+      return batchResult;
+    }
+
+    const productionBatchId = Number(batchResult.data?.production_batch_id);
+    await connection.query(
+      `UPDATE production_plan_items
+       SET production_batch_id = ?, finished_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND production_batch_id IS NULL`,
+      [productionBatchId, Number(product.production_plan_item_id)]
+    );
+    await connection.query(
+      `UPDATE production_sale_reservations psr
+       INNER JOIN production_plan_outputs ppo ON ppo.id = psr.production_plan_output_id
+       INNER JOIN production_batch_outputs pbo
+         ON pbo.production_batch_id = ? AND pbo.product_id = ppo.product_id
+       SET psr.production_batch_output_id = pbo.id
+       WHERE ppo.id = ?
+         AND psr.production_batch_output_id IS NULL
+         AND psr.status IN ('reserved','partially_delivered')`,
+      [productionBatchId, Number(productionPlanOutputId)]
+    );
+    await connection.query(
+      `UPDATE production_plan_product_details
+       SET product_status = 'completed', actual_arrobas = ?, produced_quantity = ?,
+           actual_units_per_tray = ?, actual_tray_count = ?, actual_loose_units = ?,
+           baker_notes = ?, reported_by = ?, reported_at = CURRENT_TIMESTAMP,
+           completed_at = CURRENT_TIMESTAMP
+       WHERE production_plan_output_id = ?`,
+      [progress.actual_arrobas, progress.produced_quantity, progress.actual_units_per_tray,
+        progress.actual_tray_count, progress.actual_loose_units, progress.baker_notes,
+        Number(userId), Number(productionPlanOutputId)]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'production_plan.product.finish', 'production_plan_outputs', ?,
+         JSON_OBJECT('production_plan_id', ?, 'production_batch_id', ?, 'product_id', ?,
+           'actual_arrobas', ?, 'produced_quantity', ?, 'inventory_state', 'pending_packaging'))`,
+      [Number(userId), String(productionPlanOutputId), Number(product.production_plan_id),
+        productionBatchId, Number(product.product_id), progress.actual_arrobas, progress.produced_quantity]
+    );
+    await refreshProductionPlanStatus(connection, product.production_plan_id);
+    if (ownsTransaction) await connection.commit();
+    return {
+      ...batchResult,
+      message: "Producto finalizado. La produccion queda pendiente de conteo y empaque.",
+    };
+  } catch (error) {
+    if (ownsTransaction) await connection.rollback();
+    throw error;
+  } finally {
+    if (ownsTransaction) connection.release();
+  }
+};
+
+const correctProductionPlanProduct = async ({ productionPlanOutputId, actorUser = {}, payload = {} }) => {
+  const db = await connect();
+  const connection = await db.getConnection();
+  const ownsTransaction = true;
+  const actorUserId = Number(actorUser.userId || 0);
+  const roleCodes = (Array.isArray(actorUser.roles) ? actorUser.roles : [])
+    .map((role) => String(typeof role === "string" ? role : role?.code || role?.name || "").toUpperCase());
+  const isAdministrator = roleCodes.includes("ADMIN") || roleCodes.includes("SUPER_ADMIN");
+  const correctedArrobas = roundProductionQuantity(payload.p_actual_arrobas);
+  const correctedQuantity = roundProductionQuantity(payload.p_produced_quantity);
+  const reason = String(payload.p_reason || "").trim();
+  if (!correctedArrobas || !correctedQuantity || !reason) {
+    connection.release();
+    return { code: 0, message: "Indica arrobas, cantidad producida y el motivo de la correccion.", data: null };
+  }
+  if (!Number.isInteger(Number(payload.p_produced_quantity))) {
+    connection.release();
+    return { code: 0, message: "La cantidad producida debe ser un numero entero.", data: null };
+  }
+
+  try {
+    if (ownsTransaction) await connection.beginTransaction();
+    const [rows] = await connection.query(
+      `SELECT
+         ppd.id AS detail_id, ppd.product_status, ppd.actual_arrobas, ppd.produced_quantity,
+         ppo.product_id, ppo.production_plan_item_id, ppi.recipe_id, ppi.production_batch_id,
+         pp.branch_id, e.user_id AS baker_user_id,
+         pb.status AS batch_status, pbo.id AS production_batch_output_id,
+         pbo.packed_quantity, pbo.damaged_quantity, pbo.missing_quantity,
+         COALESCE(pbo.direct_delivered_quantity, 0) AS direct_delivered_quantity
+       FROM production_plan_outputs ppo
+       INNER JOIN production_plan_product_details ppd ON ppd.production_plan_output_id = ppo.id
+       INNER JOIN production_plan_items ppi ON ppi.id = ppo.production_plan_item_id
+       INNER JOIN production_plans pp ON pp.id = ppi.production_plan_id
+       INNER JOIN employees e ON e.id = pp.baker_employee_id
+       INNER JOIN production_batches pb ON pb.id = ppi.production_batch_id
+       INNER JOIN production_batch_outputs pbo
+         ON pbo.production_batch_id = pb.id AND pbo.product_id = ppo.product_id
+       WHERE ppo.id = ?
+       LIMIT 1 FOR UPDATE`,
+      [Number(productionPlanOutputId)]
+    );
+    if (!rows.length || rows[0].product_status !== "completed") {
+      await connection.rollback();
+      return { code: 0, message: "El producto no tiene una produccion finalizada para corregir.", data: null };
+    }
+    const product = rows[0];
+    const accountedQuantity = Number(product.packed_quantity || 0)
+      + Number(product.damaged_quantity || 0)
+      + Number(product.missing_quantity || 0)
+      + Number(product.direct_delivered_quantity || 0);
+    const [reservationRows] = await connection.query(
+      `SELECT COALESCE(SUM(quantity), 0) AS committed_quantity
+       FROM production_sale_reservations
+       WHERE production_plan_output_id = ?
+         AND status NOT IN ('released','cancelled')`,
+      [Number(productionPlanOutputId)]
+    );
+    const committedQuantity = Number(reservationRows[0]?.committed_quantity || 0);
+    const hasPackaging = accountedQuantity > 0 || ["partially_packed", "packed"].includes(product.batch_status);
+    const requiresAdministrator = hasPackaging || committedQuantity > 0;
+    if (requiresAdministrator && !isAdministrator) {
+      await connection.rollback();
+      return { code: 0, message: "Despues del conteo, empaque o una reserva, solo un administrador puede corregir la produccion.", data: null };
+    }
+    if (!isAdministrator && Number(product.baker_user_id) !== actorUserId) {
+      await connection.rollback();
+      return { code: 0, message: "Esta produccion no esta asignada a tu usuario.", data: null };
+    }
+    if (correctedQuantity < Math.max(accountedQuantity, committedQuantity)) {
+      await connection.rollback();
+      return {
+        code: 0,
+        message: `La cantidad no puede ser menor a ${Math.max(accountedQuantity, committedQuantity).toLocaleString("es-CO")} unidades ya empacadas, entregadas o reservadas.`,
+        data: null,
+      };
+    }
+
+    const previousArrobas = Number(product.actual_arrobas);
+    const previousQuantity = Number(product.produced_quantity);
+    const arrobasDelta = roundProductionQuantity(correctedArrobas - previousArrobas);
+    const scope = requiresAdministrator ? "post_packaging" : "pre_packaging";
+    const [correctionInsert] = await connection.query(
+      `INSERT INTO production_plan_product_corrections (
+         production_plan_product_detail_id, production_batch_id, correction_scope,
+         previous_actual_arrobas, corrected_actual_arrobas,
+         previous_produced_quantity, corrected_produced_quantity, reason, corrected_by
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [Number(product.detail_id), Number(product.production_batch_id), scope,
+        previousArrobas, correctedArrobas, previousQuantity, correctedQuantity,
+        reason.slice(0, 500), actorUserId]
+    );
+    const correctionId = Number(correctionInsert.insertId);
+
+    if (arrobasDelta !== 0) {
+      const [materialRows] = await connection.query(
+        `SELECT usage.raw_material_id, rm.unit_cost,
+                ROUND(SUM(usage.quantity_per_arroba) * ABS(?), 3) AS adjustment_quantity
+         FROM (
+           SELECT ri.raw_material_id,
+                  ri.quantity * (1 + COALESCE(ri.wastage_percent, 0) / 100) AS quantity_per_arroba
+           FROM recipe_items ri WHERE ri.recipe_id = ?
+           UNION ALL
+           SELECT roi.raw_material_id,
+                  roi.quantity * (1 + COALESCE(roi.wastage_percent, 0) / 100) AS quantity_per_arroba
+           FROM recipe_output_items roi
+           INNER JOIN recipe_outputs ro ON ro.id = roi.recipe_output_id
+           WHERE ro.recipe_id = ? AND ro.product_id = ?
+         ) usage
+         INNER JOIN raw_materials rm ON rm.id = usage.raw_material_id
+         GROUP BY usage.raw_material_id, rm.unit_cost`,
+        [arrobasDelta, Number(product.recipe_id), Number(product.recipe_id), Number(product.product_id)]
+      );
+      for (const material of materialRows) {
+        const quantity = Number(material.adjustment_quantity || 0);
+        if (quantity <= 0) continue;
+        await connection.query(
+          `INSERT IGNORE INTO stock_raw_materials (branch_id, raw_material_id, quantity_on_hand, min_stock)
+           VALUES (?, ?, 0, 0)`,
+          [Number(product.branch_id), Number(material.raw_material_id)]
+        );
+        const [stockRows] = await connection.query(
+          `SELECT quantity_on_hand FROM stock_raw_materials
+           WHERE branch_id = ? AND raw_material_id = ? FOR UPDATE`,
+          [Number(product.branch_id), Number(material.raw_material_id)]
+        );
+        if (arrobasDelta > 0 && Number(stockRows[0]?.quantity_on_hand || 0) < quantity) {
+          await connection.rollback();
+          return { code: 0, message: "No hay materia prima suficiente para aumentar las arrobas utilizadas.", data: null };
+        }
+        await connection.query(
+          `UPDATE stock_raw_materials
+           SET quantity_on_hand = quantity_on_hand ${arrobasDelta > 0 ? "-" : "+"} ?
+           WHERE branch_id = ? AND raw_material_id = ?`,
+          [quantity, Number(product.branch_id), Number(material.raw_material_id)]
+        );
+        await connection.query(
+          `INSERT INTO inventory_movements (
+             branch_id, item_type, raw_material_id, product_id, movement_type,
+             quantity, unit_cost, reference_type, reference_id, notes, created_by
+           ) VALUES (?, 'raw_material', ?, NULL, ?, ?, ?, 'production_correction', ?, ?, ?)`,
+          [Number(product.branch_id), Number(material.raw_material_id),
+            arrobasDelta > 0 ? "production_out" : "adjustment_in", quantity,
+            material.unit_cost ?? null, correctionId, reason.slice(0, 500), actorUserId]
+        );
+      }
+    }
+
+    await connection.query(
+      `UPDATE production_batches SET batch_quantity = ? WHERE id = ?`,
+      [correctedArrobas, Number(product.production_batch_id)]
+    );
+    await connection.query(
+      `UPDATE production_batch_outputs SET produced_quantity = ? WHERE id = ?`,
+      [correctedQuantity, Number(product.production_batch_output_id)]
+    );
+    await connection.query(
+      `UPDATE production_plan_product_details
+       SET actual_arrobas = ?, produced_quantity = ?, baker_notes = ?,
+           reported_by = ?, reported_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [correctedArrobas, correctedQuantity, reason.slice(0, 500), actorUserId, Number(product.detail_id)]
+    );
+    const remainingQuantity = correctedQuantity - accountedQuantity;
+    await connection.query(
+      `UPDATE production_batches
+       SET status = CASE
+         WHEN ? <= 0 THEN 'packed'
+         WHEN ? > 0 THEN 'partially_packed'
+         ELSE 'pending_packaging'
+       END
+       WHERE id = ?`,
+      [remainingQuantity, accountedQuantity, Number(product.production_batch_id)]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'production_plan.product.correct', 'production_plan_outputs', ?,
+         JSON_OBJECT('correction_id', ?, 'scope', ?, 'previous_arrobas', ?, 'corrected_arrobas', ?,
+           'previous_quantity', ?, 'corrected_quantity', ?, 'reason', ?))`,
+      [actorUserId, String(productionPlanOutputId), correctionId, scope, previousArrobas,
+        correctedArrobas, previousQuantity, correctedQuantity, reason.slice(0, 500)]
+    );
+    if (ownsTransaction) await connection.commit();
+    return { code: 1, message: "Correccion registrada con trazabilidad.", data: { correction_id: correctionId } };
+  } catch (error) {
+    if (ownsTransaction) await connection.rollback();
+    throw error;
+  } finally {
+    if (ownsTransaction) connection.release();
   }
 };
 
@@ -3052,6 +3856,11 @@ module.exports = {
   listProductionPlans,
   startProductionPlanItem,
   finishProductionPlanItem,
+  startProductionPlanProduct,
+  saveProductionPlanProductProgress,
+  skipProductionPlanProduct,
+  finishProductionPlanProduct,
+  correctProductionPlanProduct,
   listUserNotifications,
   markUserNotificationViewed,
   closeProductionOrder,
