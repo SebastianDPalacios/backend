@@ -69,6 +69,8 @@ router.get("/my-plans", verifyToken, canRegisterBakerProduction, async (req, res
     const result = await listProductionPlans({
       userId: req.user.userId,
       plannedDate: req.query.plannedDate || req.query.planned_date,
+      dateFrom: req.query.dateFrom || req.query.date_from,
+      dateTo: req.query.dateTo || req.query.date_to,
     });
     res.json(result);
   } catch (error) {

@@ -2083,7 +2083,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
 
     const [orders] = await connection.query(
       `SELECT
-         id, customer_id, status, bonus_percent, bonus_minimum_amount, bonus_max_company_loss_amount,
+         id, branch_id, customer_id, status, bonus_percent, bonus_minimum_amount, bonus_max_company_loss_amount,
          sales_agent_user_id, seller_commission_percent, credit_redeemed_amount,
          actual_delivered_at
        FROM orders
@@ -2110,6 +2110,27 @@ const upsertOrderItem = async (payload, actorUserId) => {
       await connection.rollback();
       return { code: 0, message: "selecciona un tipo de movimiento valido", data: null };
     }
+
+    const [previousItemRows] = await connection.query(
+      `SELECT
+         oi.id,
+         oi.quantity,
+         COALESCE((
+           SELECT SUM(psr.delivered_quantity)
+           FROM production_sale_reservations psr
+           WHERE psr.order_item_id = oi.id AND psr.status = 'delivered'
+         ), 0) AS directly_delivered_quantity
+       FROM order_items oi
+       WHERE oi.order_id = ?
+         AND oi.product_id = ?
+         AND oi.line_type = ?
+       FOR UPDATE`,
+      [orderId, productId, previousLineType]
+    );
+    const previousItem = previousItemRows[0] || null;
+    const previousStockQuantity = previousItem
+      ? Math.max(Number(previousItem.quantity || 0) - Number(previousItem.directly_delivered_quantity || 0), 0)
+      : 0;
 
     const wantsRemoval =
       payload.p_remove === true ||
@@ -2271,6 +2292,77 @@ const upsertOrderItem = async (payload, actorUserId) => {
           calculated.commercialValue,
         ]
       );
+    }
+
+    if (orders[0].status === "dispatched") {
+      const [currentItemRows] = await connection.query(
+        `SELECT
+           oi.id,
+           oi.quantity,
+           COALESCE((
+             SELECT SUM(psr.delivered_quantity)
+             FROM production_sale_reservations psr
+             WHERE psr.order_item_id = oi.id AND psr.status = 'delivered'
+           ), 0) AS directly_delivered_quantity
+         FROM order_items oi
+         WHERE oi.order_id = ?
+           AND oi.product_id = ?
+           AND oi.line_type = ?
+         FOR UPDATE`,
+        [orderId, productId, lineType]
+      );
+      const currentItem = currentItemRows[0] || null;
+      const currentStockQuantity = currentItem
+        ? Math.max(Number(currentItem.quantity || 0) - Number(currentItem.directly_delivered_quantity || 0), 0)
+        : 0;
+      const stockDifference = Number((currentStockQuantity - previousStockQuantity).toFixed(3));
+
+      if (stockDifference !== 0) {
+        await connection.query(
+          `INSERT IGNORE INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
+           VALUES (?, ?, 0, 0)`,
+          [Number(orders[0].branch_id), productId]
+        );
+        const [stockRows] = await connection.query(
+          `SELECT quantity_on_hand
+           FROM stock_products
+           WHERE branch_id = ? AND product_id = ?
+           FOR UPDATE`,
+          [Number(orders[0].branch_id), productId]
+        );
+
+        if (stockDifference > 0 && Number(stockRows[0]?.quantity_on_hand || 0) < stockDifference) {
+          await connection.rollback();
+          return {
+            code: 0,
+            message: `insufficient stock for product_id=${productId}`,
+            data: null,
+          };
+        }
+
+        await connection.query(
+          `UPDATE stock_products
+           SET quantity_on_hand = quantity_on_hand - ?,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE branch_id = ? AND product_id = ?`,
+          [stockDifference, Number(orders[0].branch_id), productId]
+        );
+        await connection.query(
+          `INSERT INTO inventory_movements (
+             branch_id, item_type, raw_material_id, product_id, movement_type,
+             quantity, unit_cost, reference_type, reference_id, notes, created_by
+           ) VALUES (?, 'product', NULL, ?, ?, ?, NULL, 'order', ?, ?, ?)`,
+          [
+            Number(orders[0].branch_id),
+            productId,
+            stockDifference > 0 ? "sale_out" : "adjustment_in",
+            Math.abs(stockDifference),
+            orderId,
+            `Conciliacion por edicion de pedido despachado #${orderId}`,
+            actorUserId || null,
+          ]
+        );
+      }
     }
 
     const [itemRows] = await connection.query(

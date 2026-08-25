@@ -2793,7 +2793,7 @@ const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) =
   }
 };
 
-const listProductionPlans = async ({ userId, plannedDate, bakerEmployeeId } = {}) => {
+const listProductionPlans = async ({ userId, plannedDate, dateFrom, dateTo, bakerEmployeeId } = {}) => {
   const db = await connect();
   const filters = [];
   const params = [];
@@ -2805,6 +2805,15 @@ const listProductionPlans = async ({ userId, plannedDate, bakerEmployeeId } = {}
   if (plannedDate) {
     filters.push("pp.planned_date = ?");
     params.push(plannedDate);
+  } else {
+    if (dateFrom) {
+      filters.push("pp.planned_date >= ?");
+      params.push(dateFrom);
+    }
+    if (dateTo) {
+      filters.push("pp.planned_date <= ?");
+      params.push(dateTo);
+    }
   }
   if (bakerEmployeeId) {
     filters.push("pp.baker_employee_id = ?");
