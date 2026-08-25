@@ -11,6 +11,9 @@ router.get("/audit", verifyToken, canViewAudit, async (req, res, next) => {
       search: req.query.search,
       action: req.query.action,
       entityName: req.query.entityName,
+      actorUserId: req.query.actorUserId,
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
       page: req.query.page,
       pageSize: req.query.pageSize,
     });

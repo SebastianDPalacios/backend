@@ -6,6 +6,7 @@ const compression = require("compression");
 const httpLogger = require("./httpLogger");
 const logger = require("./logger");
 const { logErrors, boomErrorHandler, errorHandler } = require("./middlewares/error.handler");
+const { auditMutations } = require("./services/audit.service");
 
 dotenv.config({ path: path.join(__dirname, ".env") });
 
@@ -16,6 +17,7 @@ app.use(compression());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.use(httpLogger);
+app.use(auditMutations);
 
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "panaderia-backend" });
