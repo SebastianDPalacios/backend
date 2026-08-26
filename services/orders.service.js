@@ -1543,14 +1543,6 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
       for (const item of items) {
         const productId = Number(item.product_id || item.p_product_id || 0);
         const lineType = normalizeLineType(item.line_type || item.p_line_type || "sale");
-        if (lineType === "gift") {
-          await connection.rollback();
-          return {
-            code: 0,
-            message: "los obsequios se registran en el flujo independiente",
-            data: null,
-          };
-        }
         const [products] = await connection.query(
           `SELECT
              p.id,
@@ -1594,7 +1586,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
               requestedAmount: item.requested_amount ?? item.p_requested_amount,
               quantity: item.quantity ?? item.p_quantity,
               requireWholeUnitAmount:
-                lineType === "bonus" ||
+                ["bonus", "gift"].includes(lineType) ||
                 (lineType === "sale" && String(item.ui_line_type || item.p_ui_line_type || "sale") !== "sale_bonus"),
             }),
           });
@@ -2067,14 +2059,6 @@ const upsertOrderItem = async (payload, actorUserId) => {
     return { code: 0, message: "selecciona un producto", data: null };
   }
 
-  if (lineType === "gift" || previousLineType === "gift") {
-    return {
-      code: 0,
-      message: "los obsequios se registran en el flujo independiente",
-      data: null,
-    };
-  }
-
   const db = await connect();
   const connection = await db.getConnection();
 
@@ -2205,7 +2189,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
           requestedAmount: payload.p_requested_amount,
           quantity: payload.p_quantity,
           requireWholeUnitAmount:
-            lineType === "bonus" ||
+            ["bonus", "gift"].includes(lineType) ||
             (lineType === "sale" && String(payload.p_ui_line_type || "sale") !== "sale_bonus"),
         });
       } catch (error) {
@@ -2294,7 +2278,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
       );
     }
 
-    if (orders[0].status === "dispatched") {
+    if (["dispatched", "delivered"].includes(orders[0].status)) {
       const [currentItemRows] = await connection.query(
         `SELECT
            oi.id,
@@ -2548,11 +2532,11 @@ const confirmOrder = async (payload, actorUserId) => {
       [orderId]
     );
     const totals = calculateOrderTotals(items);
-    const chargeableItems = items.filter((item) => ["sale", "exchange"].includes(item.line_type)).length;
+    const confirmableItems = items.filter((item) => ["sale", "gift", "exchange"].includes(item.line_type)).length;
 
-    if (chargeableItems === 0) {
+    if (confirmableItems === 0) {
       await connection.rollback();
-      return { code: 0, message: "agrega al menos un producto de venta o cambio antes de confirmar", data: null };
+      return { code: 0, message: "agrega al menos un producto de venta, obsequio o cambio antes de confirmar", data: null };
     }
     if (items.some((item) => item.line_type === "bonus" && isPastryCategoryName(item.category_name))) {
       await connection.rollback();
@@ -2634,7 +2618,30 @@ const confirmOrder = async (payload, actorUserId) => {
       ]
     );
     await connection.commit();
-    return { code: 1, message: "pedido confirmado", data: { order_id: orderId } };
+
+    const dispatchResult = await dispatchOrder({ p_order_id: orderId }, actorUserId);
+    if (dispatchResult.code !== 1) {
+      return {
+        code: 0,
+        message: `el pedido se confirmo, pero no pudo descontarse del inventario: ${dispatchResult.message}`,
+        data: { order_id: orderId, status: "confirmed" },
+      };
+    }
+
+    const deliveryResult = await deliverOrder({ p_order_id: orderId }, actorUserId);
+    if (deliveryResult.code !== 1) {
+      return {
+        code: 0,
+        message: `el inventario fue descontado, pero no pudo generarse la comision: ${deliveryResult.message}`,
+        data: { order_id: orderId, status: "dispatched" },
+      };
+    }
+
+    return {
+      code: 1,
+      message: "pedido confirmado",
+      data: { ...deliveryResult.data, order_id: orderId, status: "delivered" },
+    };
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -2680,7 +2687,8 @@ const cancelOrder = async (payload, actorUserId) => {
       return { code: 0, message: "pedido no encontrado", data: null };
     }
 
-    if (orderRows[0].status === "dispatched") {
+    if (["dispatched", "delivered"].includes(orderRows[0].status)) {
+      const wasDelivered = orderRows[0].status === "delivered";
       const [items] = await connection.query(
         `SELECT product_id, SUM(quantity) AS quantity
            FROM order_items
@@ -2714,9 +2722,38 @@ const cancelOrder = async (payload, actorUserId) => {
         );
       }
 
+      if (wasDelivered) {
+        const [financialRows] = await connection.query(
+          `SELECT customer_id, credit_redeemed_amount
+             FROM orders
+            WHERE id = ?
+            FOR UPDATE`,
+          [orderId]
+        );
+        const redeemedAmount = roundMoney(financialRows[0]?.credit_redeemed_amount || 0);
+        if (redeemedAmount > 0) {
+          await addCustomerCreditMovement(connection, {
+            customerId: financialRows[0].customer_id,
+            movementType: "adjusted",
+            amount: redeemedAmount,
+            orderId,
+            notes: `Reversion de saldo por eliminacion del pedido ${orderId}`,
+            metadata: { source: "order_cancellation", order_id: orderId },
+            actorUserId,
+          });
+        }
+        await connection.query(
+          "UPDATE sales_commissions SET status = 'cancelled' WHERE order_id = ?",
+          [orderId]
+        );
+      }
+
       await connection.query(
         `UPDATE orders
             SET status = 'cancelled',
+                commission_base = 0,
+                commission_total = 0,
+                credit_redeemed_amount = 0,
                 notes = CONCAT(IFNULL(notes, ''), ' | CANCEL_REASON: ', ?),
                 updated_at = CURRENT_TIMESTAMP
           WHERE id = ?`,
@@ -2725,13 +2762,13 @@ const cancelOrder = async (payload, actorUserId) => {
       await connection.query(
         `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
          VALUES (?, 'order.cancel_dispatched', 'orders', ?,
-           JSON_OBJECT('reason', ?, 'inventory_restored', true))`,
-        [actorUserId || null, String(orderId), payload.p_reason || "not provided"]
+           JSON_OBJECT('reason', ?, 'inventory_restored', true, 'commission_cancelled', ?))`,
+        [actorUserId || null, String(orderId), payload.p_reason || "not provided", wasDelivered]
       );
       await connection.commit();
       return {
         code: 1,
-        message: "pedido despachado eliminado e inventario restaurado",
+        message: "pedido eliminado e inventario restaurado",
         data: { order_id: orderId, status: "cancelled" },
       };
     }
