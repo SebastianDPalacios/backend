@@ -869,6 +869,116 @@ const registerProductionResult = async (payload, actorUserId) => {
   };
 };
 
+const reconcilePendingProductSales = async (connection, {
+  branchId,
+  productId,
+  productionBatchId,
+  businessDate,
+  actorUserId,
+}) => {
+  await connection.query(
+    `INSERT INTO product_inventory_daily_cutoffs (
+       branch_id, product_id, business_date, production_batch_id, created_by
+     ) VALUES (?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       production_batch_id = COALESCE(production_batch_id, VALUES(production_batch_id))`,
+    [branchId, productId, businessDate, productionBatchId, actorUserId || null]
+  );
+
+  const [commitments] = await connection.query(
+    `SELECT id, order_id, committed_quantity, applied_quantity
+       FROM product_sale_inventory_commitments
+      WHERE branch_id = ?
+        AND product_id = ?
+        AND status = 'pending'
+        AND DATE(created_at) <= ?
+      ORDER BY id
+      FOR UPDATE`,
+    [branchId, productId, businessDate]
+  );
+  const pendingQuantity = Number(commitments.reduce(
+    (total, row) => total + Math.max(
+      Number(row.committed_quantity || 0) - Number(row.applied_quantity || 0),
+      0
+    ),
+    0
+  ).toFixed(3));
+
+  if (pendingQuantity > 0) {
+    await connection.query(
+      `INSERT INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
+       VALUES (?, ?, ?, 0)
+       ON DUPLICATE KEY UPDATE
+         quantity_on_hand = quantity_on_hand - ?,
+         updated_at = CURRENT_TIMESTAMP`,
+      [branchId, productId, -pendingQuantity, pendingQuantity]
+    );
+
+    for (const commitment of commitments) {
+      const quantity = Number((
+        Number(commitment.committed_quantity || 0) - Number(commitment.applied_quantity || 0)
+      ).toFixed(3));
+      if (quantity <= 0) continue;
+      await connection.query(
+        `INSERT INTO inventory_movements (
+           branch_id, item_type, raw_material_id, product_id, movement_type,
+           quantity, unit_cost, reference_type, reference_id, notes, created_by
+         ) VALUES (?, 'product', NULL, ?, 'sale_out', ?, NULL, 'order', ?, ?, ?)`,
+        [
+          branchId,
+          productId,
+          quantity,
+          Number(commitment.order_id),
+          `Venta previa conciliada con produccion #${productionBatchId}`,
+          actorUserId || null,
+        ]
+      );
+    }
+
+    await connection.query(
+      `UPDATE product_sale_inventory_commitments
+          SET applied_quantity = committed_quantity,
+              status = 'applied',
+              applied_at = CURRENT_TIMESTAMP,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE branch_id = ?
+          AND product_id = ?
+          AND status = 'pending'
+          AND DATE(created_at) <= ?`,
+      [branchId, productId, businessDate]
+    );
+  }
+
+  const [stockRows] = await connection.query(
+    `SELECT COALESCE(quantity_on_hand, 0) AS quantity_on_hand
+       FROM stock_products
+      WHERE branch_id = ? AND product_id = ?`,
+    [branchId, productId]
+  );
+  const endingBalance = Number(stockRows[0]?.quantity_on_hand || 0);
+
+  await connection.query(
+    `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+     VALUES (?, 'inventory.product_sales.reconcile', 'products', ?,
+       JSON_OBJECT(
+         'production_batch_id', ?,
+         'business_date', ?,
+         'pending_sales_quantity', ?,
+         'ending_balance', ?
+       ))`,
+    [
+      actorUserId || null,
+      String(productId),
+      productionBatchId,
+      businessDate,
+      pendingQuantity,
+      endingBalance,
+    ]
+  );
+
+  return { product_id: productId, pending_sales_quantity: pendingQuantity, ending_balance: endingBalance };
+};
+
 const registerProductionBatch = async (payload, actorUserId, options = {}) => {
   const db = await connect();
   const connection = options.connection || await db.getConnection();
@@ -1059,6 +1169,12 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
       ]
     );
     const productionBatchId = Number(batchInsert.insertId);
+    const [productionDateRows] = await connection.query(
+      "SELECT DATE_FORMAT(produced_date, '%Y-%m-%d') AS business_date FROM production_batches WHERE id = ?",
+      [productionBatchId]
+    );
+    const productionBusinessDate = productionDateRows[0]?.business_date;
+    const reconciliationResults = [];
 
     for (const material of materialRows) {
       const quantity = Number(material.required_qty || 0);
@@ -1114,12 +1230,23 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
           output.packing_note || null,
         ]
       );
+
+      reconciliationResults.push(await reconcilePendingProductSales(connection, {
+        branchId,
+        productId: Number(output.product_id),
+        productionBatchId,
+        businessDate: productionBusinessDate,
+        actorUserId,
+      }));
     }
 
     await connection.query(
       `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
        VALUES (?, 'production_batch.register_current_recipe', 'production_batches', ?,
-         JSON_OBJECT('recipe_id', ?, 'version_no', ?, 'baker_employee_id', ?, 'arrobas', ?, 'outputs', ?))`,
+         JSON_OBJECT(
+           'recipe_id', ?, 'version_no', ?, 'baker_employee_id', ?, 'arrobas', ?,
+           'outputs', ?, 'prior_sales_reconciled', ?
+         ))`,
       [
         actorUserId || null,
         String(productionBatchId),
@@ -1128,6 +1255,10 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
         bakerEmployeeId,
         batchQuantity,
         outputRows.length,
+        reconciliationResults.reduce(
+          (total, row) => total + Number(row.pending_sales_quantity || 0),
+          0
+        ),
       ]
     );
 
@@ -1139,6 +1270,7 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
         production_batch_id: productionBatchId,
         recipe_id: recipeId,
         recipe_version: Number(recipeRows[0].version_no),
+        sales_reconciliation: reconciliationResults,
       },
     };
   } catch (error) {
@@ -1166,6 +1298,12 @@ const createPackingReport = async (payload, actorUserId) => {
     "handling_loss",
     "suspected_theft",
     "other",
+  ]);
+  const validDamageReasons = new Set([
+    "production",
+    "oven",
+    "cut",
+    "packaging",
   ]);
 
   if (!items.length) {
@@ -1199,6 +1337,19 @@ const createPackingReport = async (payload, actorUserId) => {
     return {
       code: 0,
       message: "Revisa las cantidades: el conteo debe ser mayor a cero y empacados/danados no pueden superar lo contado.",
+      data: null,
+    };
+  }
+
+  const unjustifiedDamage = items.some((item) => {
+    const damaged = Number(item.damaged_quantity || 0);
+    return damaged > 0 && !validDamageReasons.has(item.damage_reason);
+  });
+
+  if (unjustifiedDamage) {
+    return {
+      code: 0,
+      message: "Todo producto dañado debe indicar si ocurrió en producción, horneo, corte o empaque.",
       data: null,
     };
   }

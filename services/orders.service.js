@@ -916,7 +916,10 @@ const listOrderBaseData = async ({
   }
 
   const [customerRows] = await db.query(
-    `SELECT c.id, c.tax_id, c.name, c.email, c.phone, c.address, c.neighborhood, c.credit_limit
+    `SELECT c.id, c.tax_id, c.name, c.email, c.phone, c.address, c.neighborhood, c.credit_limit,
+       (SELECT sca.sales_agent_user_id FROM seller_customer_assignments sca
+         WHERE sca.customer_id = c.id AND sca.is_active = 1
+         ORDER BY sca.updated_at DESC, sca.id DESC LIMIT 1) AS sales_agent_user_id
      FROM customers c
      WHERE ${customerFilters.join(" AND ")}
      ORDER BY c.name, c.id
@@ -938,6 +941,18 @@ const listOrderBaseData = async ({
      WHERE is_active = 1
      ORDER BY name, id`
   );
+  const [sellerRows] = canViewAllCustomers
+    ? await db.query(
+        `SELECT DISTINCT u.id, u.full_name, u.username, u.email, u.phone
+         FROM users u
+         JOIN user_roles ur ON ur.user_id = u.id
+         JOIN roles r ON r.id = ur.role_id
+         WHERE r.code = 'VENTAS'
+           AND u.status = 'active'
+           AND u.deleted_at IS NULL
+         ORDER BY u.full_name, u.id`
+      )
+    : [[]];
 
   if (products.code !== 1) {
     return products;
@@ -980,6 +995,7 @@ const listOrderBaseData = async ({
         total: customerRows.length,
         assigned_only: !canViewAllCustomers,
       },
+      sellers: { items: sellerRows, total: sellerRows.length },
       branches: {
         items: branchRows,
         total: branchRows.length,
@@ -1474,6 +1490,9 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
   if (items) {
     const branchId = Number(payload.p_branch_id || 0);
     const customerId = Number(payload.p_customer_id || 0);
+    const salesAgentUserId = canViewAllCustomers
+      ? Number(payload.p_sales_agent_user_id || 0)
+      : Number(actorUserId || 0);
     const orderDate = payload.p_order_date || null;
     const deliveryDate = payload.p_delivery_date || null;
     const db = await connect();
@@ -1481,9 +1500,9 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
 
     try {
       await connection.beginTransaction();
-      if (!branchId || !customerId || !orderDate) {
+      if (!branchId || !customerId || !salesAgentUserId || !orderDate) {
         await connection.rollback();
-        return { code: 0, message: "sucursal, cliente y fecha son obligatorios", data: null };
+        return { code: 0, message: "sucursal, vendedor, cliente y fecha son obligatorios", data: null };
       }
       if (deliveryDate && String(deliveryDate).slice(0, 10) < String(orderDate).slice(0, 10)) {
         await connection.rollback();
@@ -1513,18 +1532,15 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
          WHERE c.id = ?
            AND c.status = 'active'
            AND c.deleted_at IS NULL
-           AND (
-             ? = 1
-             OR EXISTS (
-               SELECT 1
-               FROM seller_customer_assignments sca
-               WHERE sca.customer_id = c.id
-                 AND sca.sales_agent_user_id = ?
-                 AND sca.is_active = 1
-             )
+           AND EXISTS (
+             SELECT 1
+             FROM seller_customer_assignments sca
+             WHERE sca.customer_id = c.id
+               AND sca.sales_agent_user_id = ?
+               AND sca.is_active = 1
            )
          LIMIT 1`,
-        [customerId, canViewAllCustomers ? 1 : 0, Number(actorUserId || 0)]
+        [customerId, salesAgentUserId]
       );
       if (!customers.length) {
         await connection.rollback();
@@ -1619,6 +1635,18 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           : null;
         existing.captureMode = existing.captureMode === item.captureMode ? existing.captureMode : "quantity";
       }
+
+      const [sellers] = await connection.query(
+        `SELECT u.id FROM users u
+         JOIN user_roles ur ON ur.user_id = u.id JOIN roles r ON r.id = ur.role_id
+         WHERE u.id = ? AND r.code = 'VENTAS' AND u.status = 'active'
+           AND u.deleted_at IS NULL LIMIT 1`,
+        [salesAgentUserId]
+      );
+      if (!sellers.length) {
+        await connection.rollback();
+        return { code: 0, message: "selecciona un vendedor activo", data: null };
+      }
       normalizedItems = Array.from(aggregatedItems.values());
       const totals = calculateOrderTotals(
         normalizedItems.map((item) => ({
@@ -1674,7 +1702,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         [
           branchId,
           customerId,
-          actorUserId || null,
+          salesAgentUserId,
           orderDate,
           deliveryDate,
           roundMoney(totals.subtotal),
@@ -1956,7 +1984,6 @@ const recalculateDeliveredOrderCommission = async ({ connection, orderId, order,
      WHERE order_id = ?`,
     [orderId]
   );
-
   const deliveredTotals = deliveredTotalsRows[0] || {};
   const [commissionRows] = await connection.query(
     `SELECT id, returned_sales_total, status, delivered_at
@@ -2115,6 +2142,17 @@ const upsertOrderItem = async (payload, actorUserId) => {
     const previousStockQuantity = previousItem
       ? Math.max(Number(previousItem.quantity || 0) - Number(previousItem.directly_delivered_quantity || 0), 0)
       : 0;
+    let previousCommitment = null;
+    if (previousItem?.id) {
+      const [commitmentRows] = await connection.query(
+        `SELECT id, committed_quantity, applied_quantity, status
+           FROM product_sale_inventory_commitments
+          WHERE order_item_id = ?
+          FOR UPDATE`,
+        [Number(previousItem.id)]
+      );
+      previousCommitment = commitmentRows[0] || null;
+    }
 
     const wantsRemoval =
       payload.p_remove === true ||
@@ -2300,30 +2338,16 @@ const upsertOrderItem = async (payload, actorUserId) => {
         ? Math.max(Number(currentItem.quantity || 0) - Number(currentItem.directly_delivered_quantity || 0), 0)
         : 0;
       const stockDifference = Number((currentStockQuantity - previousStockQuantity).toFixed(3));
+      const inventoryWasApplied = previousCommitment
+        ? previousCommitment.status === "applied"
+        : true;
 
-      if (stockDifference !== 0) {
+      if (inventoryWasApplied && stockDifference !== 0) {
         await connection.query(
           `INSERT IGNORE INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
            VALUES (?, ?, 0, 0)`,
           [Number(orders[0].branch_id), productId]
         );
-        const [stockRows] = await connection.query(
-          `SELECT quantity_on_hand
-           FROM stock_products
-           WHERE branch_id = ? AND product_id = ?
-           FOR UPDATE`,
-          [Number(orders[0].branch_id), productId]
-        );
-
-        if (stockDifference > 0 && Number(stockRows[0]?.quantity_on_hand || 0) < stockDifference) {
-          await connection.rollback();
-          return {
-            code: 0,
-            message: `insufficient stock for product_id=${productId}`,
-            data: null,
-          };
-        }
-
         await connection.query(
           `UPDATE stock_products
            SET quantity_on_hand = quantity_on_hand - ?,
@@ -2344,6 +2368,31 @@ const upsertOrderItem = async (payload, actorUserId) => {
             orderId,
             `Conciliacion por edicion de pedido despachado #${orderId}`,
             actorUserId || null,
+          ]
+        );
+      }
+
+      if (currentItem?.id) {
+        await connection.query(
+          `INSERT INTO product_sale_inventory_commitments (
+             order_id, order_item_id, branch_id, product_id, committed_quantity,
+             applied_quantity, status, applied_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             committed_quantity = VALUES(committed_quantity),
+             applied_quantity = VALUES(applied_quantity),
+             status = VALUES(status),
+             applied_at = VALUES(applied_at),
+             updated_at = CURRENT_TIMESTAMP`,
+          [
+            orderId,
+            Number(currentItem.id),
+            Number(orders[0].branch_id),
+            productId,
+            currentStockQuantity,
+            inventoryWasApplied ? currentStockQuantity : 0,
+            inventoryWasApplied ? "applied" : "pending",
+            inventoryWasApplied ? new Date() : null,
           ]
         );
       }
@@ -2689,14 +2738,36 @@ const cancelOrder = async (payload, actorUserId) => {
 
     if (["dispatched", "delivered"].includes(orderRows[0].status)) {
       const wasDelivered = orderRows[0].status === "delivered";
-      const [items] = await connection.query(
-        `SELECT product_id, SUM(quantity) AS quantity
-           FROM order_items
+      const [commitmentRows] = await connection.query(
+        `SELECT id, product_id, committed_quantity, applied_quantity, status
+           FROM product_sale_inventory_commitments
           WHERE order_id = ?
-          GROUP BY product_id`,
+          FOR UPDATE`,
+        [orderId]
+      );
+      const hasCommitments = commitmentRows.length > 0;
+      const pendingCommitmentQuantity = commitmentRows.reduce(
+        (total, row) => total + (row.status === "pending" ? Number(row.committed_quantity || 0) : 0),
+        0
+      );
+      const appliedCommitmentQuantity = commitmentRows.reduce(
+        (total, row) => total + (row.status === "applied" ? Number(row.applied_quantity || 0) : 0),
+        0
+      );
+      const [items] = await connection.query(
+        hasCommitments
+          ? `SELECT product_id, SUM(applied_quantity) AS quantity
+               FROM product_sale_inventory_commitments
+              WHERE order_id = ? AND status = 'applied'
+              GROUP BY product_id`
+          : `SELECT product_id, SUM(quantity) AS quantity
+               FROM order_items
+              WHERE order_id = ?
+              GROUP BY product_id`,
         [orderId]
       );
       for (const item of items) {
+        if (Number(item.quantity || 0) <= 0) continue;
         await connection.query(
           `INSERT INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
            VALUES (?, ?, ?, 0)
@@ -2719,6 +2790,16 @@ const cancelOrder = async (payload, actorUserId) => {
             `Reversion por eliminacion de pedido despachado #${orderId}`,
             actorUserId || null,
           ]
+        );
+      }
+
+      if (hasCommitments) {
+        await connection.query(
+          `UPDATE product_sale_inventory_commitments
+              SET status = 'cancelled',
+                  updated_at = CURRENT_TIMESTAMP
+            WHERE order_id = ?`,
+          [orderId]
         );
       }
 
@@ -2761,9 +2842,24 @@ const cancelOrder = async (payload, actorUserId) => {
       );
       await connection.query(
         `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
-         VALUES (?, 'order.cancel_dispatched', 'orders', ?,
-           JSON_OBJECT('reason', ?, 'inventory_restored', true, 'commission_cancelled', ?))`,
-        [actorUserId || null, String(orderId), payload.p_reason || "not provided", wasDelivered]
+       VALUES (?, 'order.cancel_dispatched', 'orders', ?,
+           JSON_OBJECT(
+             'reason', ?,
+             'inventory_restored', true,
+             'restored_quantity', ?,
+             'pending_quantity_released', ?,
+             'commission_cancelled', ?
+           ))`,
+        [
+          actorUserId || null,
+          String(orderId),
+          payload.p_reason || "not provided",
+          hasCommitments
+            ? appliedCommitmentQuantity
+            : items.reduce((total, item) => total + Number(item.quantity || 0), 0),
+          hasCommitments ? pendingCommitmentQuantity : 0,
+          wasDelivered,
+        ]
       );
       await connection.commit();
       return {

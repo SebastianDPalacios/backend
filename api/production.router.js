@@ -1,5 +1,6 @@
 const express = require("express");
 const { verifyToken, requirePermission } = require("../middlewares/auth.handler");
+const { listEmployees } = require("../services/employees.service");
 const {
   listProductionOrders,
   createProductionOrder,
@@ -283,6 +284,21 @@ router.get("/packaging/pending", verifyToken, canRegisterPackaging, async (req, 
     const result = await listPendingPackaging({
       branchId: req.query.branchId || req.query.branch_id,
       search: req.query.search,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/packaging/packers", verifyToken, canRegisterPackaging, async (req, res, next) => {
+  try {
+    const result = await listEmployees({
+      status: "active",
+      jobType: "packer",
+      search: req.query.search,
+      page: 1,
+      pageSize: 200,
     });
     res.json(result);
   } catch (error) {

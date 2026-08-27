@@ -2,6 +2,19 @@ const express = require("express");
 const boom = require("@hapi/boom");
 const { verifyToken } = require("../middlewares/auth.handler");
 const { login, refreshSession, logout } = require("../services/auth.service");
+const announcements = require("../services/system-announcements.service");
+
+const assertLoginAllowed = async (result) => {
+  if (result?.code !== 1) return;
+  try {
+    await announcements.assertSystemAccess({ roles: result.data.roles, permissions: result.data.permissions });
+  } catch (error) {
+    if (result.data?.session_id && result.data?.user?.user_id) {
+      await logout({ sessionId: result.data.session_id, userId: result.data.user.user_id });
+    }
+    throw error;
+  }
+};
 
 const router = express.Router();
 
@@ -22,6 +35,7 @@ router.post("/login", async (req, res, next) => {
     if (result.code !== 1) {
       return res.status(401).json(result);
     }
+    await assertLoginAllowed(result);
 
     res.json(result);
   } catch (error) {
@@ -42,6 +56,7 @@ router.post("/refresh", async (req, res, next) => {
     if (result.code !== 1) {
       return res.status(401).json(result);
     }
+    await assertLoginAllowed(result);
     res.json(result);
   } catch (error) {
     next(error);

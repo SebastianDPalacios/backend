@@ -24,6 +24,7 @@ app.get("/health", (req, res) => {
 });
 
 app.use("/api/auth", require("./api/auth.router"));
+app.use("/api/system-announcements", require("./api/system-announcements.router"));
 app.use("/api/users", require("./api/users.router"));
 app.use("/api/employees", require("./api/employees.router"));
 app.use("/api/catalog", require("./api/catalog.router"));

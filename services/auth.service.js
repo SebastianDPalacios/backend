@@ -126,13 +126,15 @@ const refreshSession = async ({ sessionId, userId, refreshToken }) => {
 
   const permissionsOut = await callProcedure("sp_permission_list_by_user", [userId]);
   const permissions = mapSpResult(permissionsOut);
+  const roles = permissions.data ? permissions.data.roles : [];
+  const permissionCodes = permissions.data ? permissions.data.permissions : [];
   const employee = await getActiveEmployeeForUser(userId);
   const accessToken = signToken({
     user: {
       userId,
       sessionId,
-      roles: permissions.data ? permissions.data.roles : [],
-      permissions: permissions.data ? permissions.data.permissions : [],
+      roles,
+      permissions: permissionCodes,
       employee,
     },
   });
@@ -144,6 +146,9 @@ const refreshSession = async ({ sessionId, userId, refreshToken }) => {
       refresh_token: newRefreshToken,
       session_id: sessionId,
       expires_at: result.data ? result.data.expires_at : null,
+      user: { user_id: Number(userId) },
+      roles,
+      permissions: permissionCodes,
     },
   };
 };

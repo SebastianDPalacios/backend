@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 const boom = require("@hapi/boom");
 const { connect } = require("../data-access");
+const { assertSystemAccess } = require("../services/system-announcements.service");
 
 const signToken = (payload, secret, expiresIn) => {
   return jwt.sign(payload, secret || process.env.JWT_SECRET, {
@@ -43,10 +44,11 @@ const verifyToken = async (req, res, next) => {
     const token = authHeader.slice(7);
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded.user;
+    await assertSystemAccess(req.user);
     await assertSessionIsActive(req.user);
     next();
   } catch (error) {
-    next(boom.unauthorized(error?.message || "token invalido o expirado"));
+    next(error?.isBoom ? error : boom.unauthorized(error?.message || "token invalido o expirado"));
   }
 };
 
