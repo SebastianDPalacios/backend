@@ -242,6 +242,15 @@ const sanitizeOrderReceiptSettings = (payload = {}) => {
   };
 };
 
+const mergeOrderReceiptSettings = (settings = {}) => ({
+  ...defaultOrderReceiptSettings,
+  ...settings,
+  settlementPrint: {
+    ...defaultOrderReceiptSettings.settlementPrint,
+    ...(settings.settlementPrint || {}),
+  },
+});
+
 const getPosTicketSettings = async () => {
   const db = await connect();
   const [rows] = await db.query(
@@ -256,10 +265,7 @@ const getPosTicketSettings = async () => {
   return {
     code: 1,
     message: "configuracion de ticket POS",
-    data: {
-      ...defaultOrderReceiptSettings,
-      ...settings,
-    },
+    data: mergeOrderReceiptSettings(settings),
   };
 };
 
