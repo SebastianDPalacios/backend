@@ -1565,6 +1565,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
              p.id,
              p.unit,
              p.base_price,
+             p.includes_bonus,
              pc.name AS category_name,
              COALESCE(t.rate_percent, 0) AS rate_percent
            FROM products p
@@ -1589,11 +1590,19 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           };
         }
 
+        const requestedUiLineType = String(item.ui_line_type || item.p_ui_line_type || lineType);
+        const includedBonusSale = Number(products[0].includes_bonus || 0) === 1
+          && requestedUiLineType === "sale_bonus";
+        if (includedBonusSale && lineType === "bonus") {
+          continue;
+        }
+        const uiLineType = includedBonusSale ? "sale" : requestedUiLineType;
+
         try {
           normalizedItems.push({
             productId,
             categoryName: products[0].category_name || null,
-            uiLineType: String(item.ui_line_type || item.p_ui_line_type || lineType),
+            uiLineType,
             ...calculateOrderLine({
               unit: products[0].unit,
               unitPrice: products[0].base_price,
@@ -1604,7 +1613,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
               quantity: item.quantity ?? item.p_quantity,
               requireWholeUnitAmount:
                 ["bonus", "gift"].includes(lineType) ||
-                (lineType === "sale" && String(item.ui_line_type || item.p_ui_line_type || "sale") !== "sale_bonus"),
+                (lineType === "sale" && uiLineType !== "sale_bonus"),
             }),
           });
         } catch (error) {
@@ -1770,9 +1779,21 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         grandTotal: totals.grandTotal,
       });
       await connection.commit();
+      const operationalResult = await confirmOrder(
+        { p_order_id: orderId },
+        actorUserId,
+        { retainDraftStatus: true }
+      );
+      if (operationalResult.code !== 1) {
+        return {
+          code: 0,
+          message: `el pedido se guardo en borrador, pero no pudieron aplicarse sus movimientos: ${operationalResult.message}`,
+          data: { order_id: orderId, status: "draft" },
+        };
+      }
       return {
         code: 1,
-        message: "pedido guardado",
+        message: "pedido guardado en borrador y aplicado operativamente",
         data: {
           order_id: orderId,
           grand_total: roundMoney(totals.grandTotal),
@@ -2119,6 +2140,12 @@ const upsertOrderItem = async (payload, actorUserId) => {
       };
     }
 
+    const [operationalCommissionRows] = await connection.query(
+      "SELECT id FROM sales_commissions WHERE order_id = ? LIMIT 1 FOR UPDATE",
+      [orderId]
+    );
+    const hasOperationalEffects = operationalCommissionRows.length > 0;
+
     if (!lineType || !previousLineType) {
       await connection.rollback();
       return { code: 0, message: "selecciona un tipo de movimiento valido", data: null };
@@ -2318,7 +2345,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
       );
     }
 
-    if (["dispatched", "delivered"].includes(orders[0].status)) {
+    if (["dispatched", "delivered"].includes(orders[0].status) || hasOperationalEffects) {
       const [currentItemRows] = await connection.query(
         `SELECT
            oi.id,
@@ -2418,7 +2445,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
     const totals = calculateOrderTotals(itemRows);
 
     let creditRedeemedAmount = roundMoney(orders[0].credit_redeemed_amount || 0);
-    if (orders[0].status !== "delivered") {
+    if (orders[0].status !== "delivered" && !hasOperationalEffects) {
       creditRedeemedAmount = 0;
       if (roundMoney(totals.exchangeTotal) > 0) {
         await ensureCustomerCreditAccount(connection, orders[0].customer_id);
@@ -2479,7 +2506,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
         orderId,
       ]
     );
-    if (orders[0].status === "delivered") {
+    if (orders[0].status === "delivered" || hasOperationalEffects) {
       try {
         await recalculateDeliveredOrderCommission({
           connection,
@@ -2540,7 +2567,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
   }
 };
 
-const confirmOrder = async (payload, actorUserId) => {
+const confirmOrder = async (payload, actorUserId, { retainDraftStatus = false } = {}) => {
   const db = await connect();
   const connection = await db.getConnection();
   const orderId = Number(payload.p_order_id || 0);
@@ -2565,6 +2592,32 @@ const confirmOrder = async (payload, actorUserId) => {
     if (orders[0].status !== "draft") {
       await connection.rollback();
       return { code: 0, message: "solo un pedido en borrador puede confirmarse", data: null };
+    }
+
+    const [existingCommissionRows] = await connection.query(
+      "SELECT id FROM sales_commissions WHERE order_id = ? LIMIT 1 FOR UPDATE",
+      [orderId]
+    );
+    if (existingCommissionRows.length) {
+      await connection.query(
+        `UPDATE orders
+         SET status = 'delivered', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [orderId]
+      );
+      await connection.query(
+        `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+         VALUES (?, 'order.confirm_preapplied_draft', 'orders', ?, JSON_OBJECT(
+           'operational_effects_reapplied', false
+         ))`,
+        [actorUserId || null, String(orderId)]
+      );
+      await connection.commit();
+      return {
+        code: 1,
+        message: "pedido confirmado sin duplicar movimientos",
+        data: { order_id: orderId, status: "delivered", operational_effects_reapplied: false },
+      };
     }
 
     const [items] = await connection.query(
@@ -2688,6 +2741,28 @@ const confirmOrder = async (payload, actorUserId) => {
       };
     }
 
+    if (retainDraftStatus) {
+      await db.query(
+        `UPDATE orders
+         SET status = 'draft', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND status = 'delivered'`,
+        [orderId]
+      );
+      await db.query(
+        `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+         VALUES (?, 'order.draft_operationally_applied', 'orders', ?, JSON_OBJECT(
+           'inventory_applied', true,
+           'commission_applied', true
+         ))`,
+        [actorUserId || null, String(orderId)]
+      );
+      return {
+        code: 1,
+        message: "pedido guardado en borrador y aplicado operativamente",
+        data: { ...deliveryResult.data, order_id: orderId, status: "draft" },
+      };
+    }
+
     return {
       code: 1,
       message: "pedido confirmado",
@@ -2738,8 +2813,13 @@ const cancelOrder = async (payload, actorUserId) => {
       return { code: 0, message: "pedido no encontrado", data: null };
     }
 
-    if (["dispatched", "delivered"].includes(orderRows[0].status)) {
-      const wasDelivered = orderRows[0].status === "delivered";
+    const [commissionRows] = await connection.query(
+      "SELECT id FROM sales_commissions WHERE order_id = ? LIMIT 1 FOR UPDATE",
+      [orderId]
+    );
+    const hasOperationalEffects = commissionRows.length > 0;
+    if (["dispatched", "delivered"].includes(orderRows[0].status) || hasOperationalEffects) {
+      const wasDelivered = orderRows[0].status === "delivered" || hasOperationalEffects;
       const [commitmentRows] = await connection.query(
         `SELECT id, product_id, committed_quantity, applied_quantity, status
            FROM product_sale_inventory_commitments
