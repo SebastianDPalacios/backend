@@ -1392,6 +1392,91 @@ const createPackingReport = async (payload, actorUserId) => {
 
   return result;
 };
+
+const listPackingHistory = async ({ dateFrom, dateTo, search, page = 1, pageSize = 20 } = {}) => {
+  const db = await connect();
+  const currentPage = Math.max(Number(page || 1), 1);
+  const limit = Math.min(Math.max(Number(pageSize || 20), 1), 100);
+  const offset = (currentPage - 1) * limit;
+  const filters = [];
+  const params = [];
+
+  if (dateFrom) {
+    filters.push("pr.packed_date >= ?");
+    params.push(String(dateFrom).slice(0, 10));
+  }
+  if (dateTo) {
+    filters.push("pr.packed_date <= ?");
+    params.push(String(dateTo).slice(0, 10));
+  }
+  if (String(search || "").trim()) {
+    const like = `%${String(search).trim()}%`;
+    filters.push(`(CAST(pr.id AS CHAR) LIKE ? OR CAST(pb.id AS CHAR) LIKE ? OR b.name LIKE ?
+      OR packer_user.full_name LIKE ? OR EXISTS (
+        SELECT 1 FROM packing_report_items search_item
+        INNER JOIN products search_product ON search_product.id = search_item.product_id
+        WHERE search_item.packing_report_id = pr.id AND search_product.name LIKE ?
+      ))`);
+    params.push(like, like, like, like, like);
+  }
+
+  const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const joins = `
+    FROM packing_reports pr
+    INNER JOIN production_batches pb ON pb.id = pr.production_batch_id
+    INNER JOIN branches b ON b.id = pb.branch_id
+    INNER JOIN recipes r ON r.id = pb.recipe_id
+    INNER JOIN employees packer ON packer.id = pr.packer_employee_id
+    INNER JOIN users packer_user ON packer_user.id = packer.user_id
+    LEFT JOIN users creator ON creator.id = pr.created_by`;
+
+  const [countRows] = await db.query(`SELECT COUNT(*) AS total ${joins} ${where}`, params);
+  const [reports] = await db.query(
+    `SELECT pr.id, pr.production_batch_id, pr.packed_date, pr.notes, pr.created_at,
+            pb.produced_date, pb.status AS batch_status, b.id AS branch_id, b.name AS branch_name,
+            r.id AS recipe_id, r.notes AS recipe_name, packer_user.full_name AS packer_name,
+            creator.full_name AS created_by_name
+       ${joins}
+       ${where}
+      ORDER BY pr.packed_date DESC, pr.created_at DESC, pr.id DESC
+      LIMIT ? OFFSET ?`,
+    [...params, limit, offset]
+  );
+
+  if (!reports.length) {
+    return { code: 1, message: "Historial de conteos obtenido.", data: { rows: [], total: Number(countRows[0]?.total || 0), page: currentPage, page_size: limit } };
+  }
+
+  const reportIds = reports.map((report) => Number(report.id));
+  const placeholders = reportIds.map(() => "?").join(",");
+  const [items] = await db.query(
+    `SELECT pri.id, pri.packing_report_id, pri.product_id, p.name AS product_name, p.sku AS product_sku,
+            pri.counted_quantity, pri.packed_quantity, pri.damaged_quantity, pri.missing_quantity,
+            pri.damage_reason, pri.missing_reason, pri.notes, pri.created_at
+       FROM packing_report_items pri
+       INNER JOIN products p ON p.id = pri.product_id
+      WHERE pri.packing_report_id IN (${placeholders})
+      ORDER BY pri.packing_report_id DESC, p.name`,
+    reportIds
+  );
+  const itemsByReport = items.reduce((grouped, item) => {
+    const key = String(item.packing_report_id);
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(item);
+    return grouped;
+  }, {});
+
+  return {
+    code: 1,
+    message: "Historial de conteos obtenido.",
+    data: {
+      rows: reports.map((report) => ({ ...report, items: itemsByReport[String(report.id)] || [] })),
+      total: Number(countRows[0]?.total || 0),
+      page: currentPage,
+      page_size: limit,
+    },
+  };
+};
 const listJustifiedShortages = async ({
   branchId,
   productId,
@@ -2947,6 +3032,81 @@ const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) =
   }
 };
 
+const cancelProductionPlan = async (productionPlanId, actorUser = {}) => {
+  const planId = Number(productionPlanId || 0);
+  const actorUserId = Number(actorUser.userId || 0);
+  if (!planId) return { code: 0, message: "Selecciona un plan valido.", data: null };
+
+  const db = await connect();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [planRows] = await connection.query(
+      `SELECT pp.id, pp.created_by, pp.status,
+              DATE_FORMAT(pp.planned_date, '%Y-%m-%d') AS planned_date,
+              e.user_id AS baker_user_id
+         FROM production_plans pp
+         INNER JOIN employees e ON e.id = pp.baker_employee_id
+        WHERE pp.id = ?
+        FOR UPDATE`,
+      [planId]
+    );
+    if (!planRows.length) {
+      await connection.rollback();
+      return { code: 0, message: "El plan informativo no existe.", data: null };
+    }
+
+    const plan = planRows[0];
+    if (plan.status === "cancelled") {
+      await connection.rollback();
+      return { code: 1, message: "El plan informativo ya estaba cancelado.", data: { production_plan_id: planId } };
+    }
+
+    const roleCodes = (Array.isArray(actorUser.roles) ? actorUser.roles : [])
+      .map((role) => String(typeof role === "string" ? role : role?.code || role?.name || "").toUpperCase());
+    const isAdministrator = roleCodes.includes("ADMIN") || roleCodes.includes("SUPER_ADMIN");
+    if (!isAdministrator && Number(plan.created_by) !== actorUserId) {
+      await connection.rollback();
+      return { code: 0, message: "Solo quien creo el plan o un administrador puede cancelarlo.", data: null };
+    }
+
+    const [legacyRows] = await connection.query(
+      `SELECT COUNT(*) AS linked_batches
+         FROM production_plan_items
+        WHERE production_plan_id = ? AND production_batch_id IS NOT NULL`,
+      [planId]
+    );
+    if (Number(legacyRows[0]?.linked_batches || 0) > 0) {
+      await connection.rollback();
+      return { code: 0, message: "Este plan antiguo tiene produccion vinculada y no puede cancelarse como lista informativa.", data: null };
+    }
+
+    await connection.query(
+      "UPDATE production_plans SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      [planId]
+    );
+    await connection.query(
+      `INSERT INTO user_notifications
+         (user_id, notification_type, title, message, reference_type, reference_id)
+       VALUES (?, 'production_plan', ?, ?, 'production_plan', ?)`,
+      [Number(plan.baker_user_id), `Plan cancelado para ${String(plan.planned_date).slice(0, 10)}`,
+        "La lista informativa fue cancelada y ya no debe tomarse como referencia.", planId]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'production_plan.cancel', 'production_plans', ?, JSON_OBJECT('informational_only', true))`,
+      [actorUserId || null, String(planId)]
+    );
+    await connection.commit();
+    return { code: 1, message: "Plan informativo cancelado correctamente.", data: { production_plan_id: planId } };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
 const listProductionPlans = async ({ userId, plannedDate, dateFrom, dateTo, bakerEmployeeId } = {}) => {
   const db = await connect();
   const filters = [];
@@ -4007,6 +4167,7 @@ module.exports = {
   registerMyProductionBatch,
   listPendingPackaging,
   createPackingReport,
+  listPackingHistory,
   listJustifiedShortages,
   registerProductionDamage,
   getRawMaterialUsageReport,
@@ -4016,6 +4177,7 @@ module.exports = {
   getProductionMonthReport,
   createProductionPlan,
   updateProductionPlan,
+  cancelProductionPlan,
   listProductionPlans,
   startProductionPlanItem,
   finishProductionPlanItem,

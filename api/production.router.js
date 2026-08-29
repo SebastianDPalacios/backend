@@ -16,6 +16,7 @@ const {
   registerMyProductionBatch,
   listPendingPackaging,
   createPackingReport,
+  listPackingHistory,
   listJustifiedShortages,
   registerProductionDamage,
   getRawMaterialUsageReport,
@@ -25,6 +26,7 @@ const {
   getProductionMonthReport,
   createProductionPlan,
   updateProductionPlan,
+  cancelProductionPlan,
   listProductionPlans,
   startProductionPlanItem,
   finishProductionPlanItem,
@@ -88,9 +90,18 @@ router.get("/my-base-data", verifyToken, canRegisterBakerProduction, async (req,
   }
 });
 
-router.put("/plans/:id", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
+router.put("/plans/:id", verifyToken, canManageProduction, async (req, res, next) => {
   try {
     const result = await updateProductionPlan(Number(req.params.id), req.body, req.user);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/plans/:id/cancel", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    const result = await cancelProductionPlan(Number(req.params.id), req.user);
     res.json(result);
   } catch (error) {
     next(error);
@@ -364,6 +375,21 @@ router.get("/reports/raw-material-usage-by-product", verifyToken, canManageProdu
       recipeId: req.query.recipeId || req.query.recipe_id,
       productId: req.query.productId || req.query.product_id,
       rawMaterialId: req.query.rawMaterialId || req.query.raw_material_id,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/packaging/history", verifyToken, canRegisterPackaging, async (req, res, next) => {
+  try {
+    const result = await listPackingHistory({
+      dateFrom: req.query.dateFrom || req.query.date_from,
+      dateTo: req.query.dateTo || req.query.date_to,
+      search: req.query.search,
+      page: req.query.page,
+      pageSize: req.query.pageSize || req.query.page_size,
     });
     res.json(result);
   } catch (error) {
