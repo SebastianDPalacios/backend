@@ -1613,7 +1613,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
               quantity: item.quantity ?? item.p_quantity,
               requireWholeUnitAmount:
                 ["bonus", "gift", "exchange"].includes(lineType) ||
-                (lineType === "sale" && uiLineType !== "sale_bonus"),
+                lineType === "sale",
             }),
           });
         } catch (error) {
@@ -2257,7 +2257,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
           quantity: payload.p_quantity,
           requireWholeUnitAmount:
             ["bonus", "gift", "exchange"].includes(lineType) ||
-            (lineType === "sale" && String(payload.p_ui_line_type || "sale") !== "sale_bonus"),
+            lineType === "sale",
         });
       } catch (error) {
         await connection.rollback();
