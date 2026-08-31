@@ -24,6 +24,7 @@ const calculateOrderLine = ({
   requestedAmount,
   quantity,
   requireWholeUnitAmount = false,
+  amountStep = null,
 }) => {
   const price = Number(unitPrice || 0);
   const taxRate = Number(taxPercent || 0);
@@ -47,6 +48,10 @@ const calculateOrderLine = ({
     normalizedRequestedAmount = roundMoney(requestedAmount);
     if (normalizedRequestedAmount <= 0) {
       throw new Error("el valor solicitado debe ser mayor que 0");
+    }
+    const requestedStep = Number(amountStep || 0);
+    if (requestedStep > 0 && !Number.isInteger(normalizedRequestedAmount / requestedStep)) {
+      throw new Error(`el valor de venta + vendaje debe ser multiplo de $${roundMoney(requestedStep).toLocaleString("es-CO")}`);
     }
 
     const rawQuantity = normalizedRequestedAmount / price;
