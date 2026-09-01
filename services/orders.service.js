@@ -3352,9 +3352,9 @@ const updateOrderCustomer = async ({ orderId, customerId, actorUserId, canViewAl
     }
 
     const order = orders[0];
-    if (!["draft", "confirmed", "ready"].includes(order.status)) {
+    if (!["draft", "confirmed", "ready", "dispatched", "delivered"].includes(order.status)) {
       await connection.rollback();
-      return { code: 0, message: "el cliente solo puede cambiarse antes de iniciar el despacho", data: null };
+      return { code: 0, message: "el cliente de un pedido cancelado no puede modificarse", data: null };
     }
     if (!order.sales_agent_user_id) {
       await connection.rollback();
