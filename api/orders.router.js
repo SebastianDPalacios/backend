@@ -24,6 +24,7 @@ const {
   dispatchOrder,
   deliverOrder,
   updateOrderDeliveryDate,
+  updateOrderCustomer,
   listSalesCommissions,
   listSalesGifts,
   getDailySalesSettlement,
@@ -93,6 +94,7 @@ router.get("/base-data", verifyToken, canManageOrders, async (req, res, next) =>
       refDate: req.query.refDate,
       actorUserId: req.user.userId,
       canViewAllCustomers: hasElevatedCustomerAccess(req.user),
+      salesAgentUserId: req.query.salesAgentUserId,
     });
     res.json(result);
   } catch (error) {
@@ -462,6 +464,21 @@ router.put("/:id/delivery-date", verifyToken, canManageOrders, async (req, res, 
         deliveryDate: req.body?.delivery_date,
       },
       req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+router.put("/:id/customer", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await updateOrderCustomer(
+      {
+        orderId: Number(req.params.id),
+        customerId: Number(req.body?.customer_id),
+        actorUserId: req.user.userId,
+        canViewAll: hasElevatedCustomerAccess(req.user),
+      }
     );
     res.json(result);
   } catch (error) {
