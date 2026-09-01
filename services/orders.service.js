@@ -7,6 +7,7 @@ const {
   calculateOrderTotals,
   normalizeLineType,
   roundMoney,
+  getSaleBonusUnitValue,
   validateBonusAllowance,
 } = require("../domain/sales-rules");
 
@@ -1626,7 +1627,8 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
               requireWholeUnitAmount:
                 ["bonus", "gift", "exchange"].includes(lineType) ||
                 (lineType === "sale" && uiLineType !== "sale_bonus"),
-              amountStep: uiLineType === "sale_bonus" ? 500 : null,
+              amountStep: uiLineType === "sale_bonus" ? getSaleBonusUnitValue(products[0].base_price) : null,
+              amountUnitPrice: uiLineType === "sale_bonus" ? getSaleBonusUnitValue(products[0].base_price) : null,
             }),
           });
         } catch (error) {
@@ -2271,7 +2273,12 @@ const upsertOrderItem = async (payload, actorUserId) => {
           requireWholeUnitAmount:
             ["bonus", "gift", "exchange"].includes(lineType) ||
             (lineType === "sale" && String(payload.p_ui_line_type || "sale") !== "sale_bonus"),
-          amountStep: String(payload.p_ui_line_type || "sale") === "sale_bonus" ? 500 : null,
+          amountStep: String(payload.p_ui_line_type || "sale") === "sale_bonus"
+            ? getSaleBonusUnitValue(products[0].base_price)
+            : null,
+          amountUnitPrice: String(payload.p_ui_line_type || "sale") === "sale_bonus"
+            ? getSaleBonusUnitValue(products[0].base_price)
+            : null,
         });
       } catch (error) {
         await connection.rollback();
@@ -3409,6 +3416,139 @@ const updateOrderCustomer = async ({ orderId, customerId, actorUserId, canViewAl
       message: Number(order.customer_id) === normalizedCustomerId ? "el pedido ya pertenece a este cliente" : "cliente del pedido actualizado",
       data: {
         order_id: normalizedOrderId,
+        customer_id: normalizedCustomerId,
+        customer: customers[0],
+      },
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+const updateOrderSeller = async ({ orderId, salesAgentUserId, customerId, actorUserId }) => {
+  const normalizedOrderId = Number(orderId || 0);
+  const normalizedSellerId = Number(salesAgentUserId || 0);
+  const normalizedCustomerId = Number(customerId || 0);
+
+  if (!Number.isInteger(normalizedOrderId) || normalizedOrderId <= 0) {
+    return { code: 0, message: "pedido invalido", data: null };
+  }
+  if (!Number.isInteger(normalizedSellerId) || normalizedSellerId <= 0) {
+    return { code: 0, message: "selecciona un vendedor valido", data: null };
+  }
+  if (!Number.isInteger(normalizedCustomerId) || normalizedCustomerId <= 0) {
+    return { code: 0, message: "selecciona un cliente del vendedor", data: null };
+  }
+
+  const db = await connect();
+  const connection = await db.getConnection();
+
+  try {
+    await connection.beginTransaction();
+    const [orders] = await connection.query(
+      `SELECT id, customer_id, sales_agent_user_id, status
+       FROM orders
+       WHERE id = ?
+       FOR UPDATE`,
+      [normalizedOrderId]
+    );
+
+    if (!orders.length) {
+      await connection.rollback();
+      return { code: 0, message: "pedido no encontrado", data: null };
+    }
+
+    const order = orders[0];
+    if (!["draft", "confirmed", "ready", "dispatched", "delivered"].includes(order.status)) {
+      await connection.rollback();
+      return { code: 0, message: "el vendedor de un pedido cancelado no puede modificarse", data: null };
+    }
+
+    const [sellers] = await connection.query(
+      `SELECT DISTINCT u.id, u.full_name, u.username, u.email, u.phone
+       FROM users u
+       INNER JOIN user_roles ur ON ur.user_id = u.id
+       INNER JOIN roles r ON r.id = ur.role_id
+       WHERE u.id = ?
+         AND r.code = 'VENTAS'
+         AND u.status = 'active'
+         AND u.deleted_at IS NULL
+       LIMIT 1`,
+      [normalizedSellerId]
+    );
+    if (!sellers.length) {
+      await connection.rollback();
+      return { code: 0, message: "el vendedor seleccionado no esta activo", data: null };
+    }
+
+    const [customers] = await connection.query(
+      `SELECT c.id, c.name, c.tax_id, c.phone, c.address, c.neighborhood
+       FROM customers c
+       INNER JOIN seller_customer_assignments sca
+         ON sca.customer_id = c.id
+        AND sca.sales_agent_user_id = ?
+        AND sca.is_active = 1
+       WHERE c.id = ?
+         AND c.status = 'active'
+         AND c.deleted_at IS NULL
+       LIMIT 1`,
+      [normalizedSellerId, normalizedCustomerId]
+    );
+    if (!customers.length) {
+      await connection.rollback();
+      return { code: 0, message: "selecciona un cliente asignado al nuevo vendedor", data: null };
+    }
+
+    const sellerChanged = Number(order.sales_agent_user_id) !== normalizedSellerId;
+    const customerChanged = Number(order.customer_id) !== normalizedCustomerId;
+    if (sellerChanged || customerChanged) {
+      await connection.query(
+        `UPDATE orders
+         SET sales_agent_user_id = ?, customer_id = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [normalizedSellerId, normalizedCustomerId, normalizedOrderId]
+      );
+      await connection.query(
+        `UPDATE sales_commissions
+         SET sales_agent_user_id = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE order_id = ?`,
+        [normalizedSellerId, normalizedOrderId]
+      );
+      await connection.query(
+        `UPDATE sales_returns
+         SET sales_agent_user_id = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE order_id = ?`,
+        [normalizedSellerId, normalizedOrderId]
+      );
+      await connection.query(
+        `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+         VALUES (?, 'order.seller.update', 'orders', ?, JSON_OBJECT(
+           'previous_sales_agent_user_id', ?, 'sales_agent_user_id', ?,
+           'previous_customer_id', ?, 'customer_id', ?, 'status', ?
+         ))`,
+        [
+          Number(actorUserId || 0) || null,
+          String(normalizedOrderId),
+          Number(order.sales_agent_user_id) || null,
+          normalizedSellerId,
+          Number(order.customer_id),
+          normalizedCustomerId,
+          order.status,
+        ]
+      );
+    }
+
+    await connection.commit();
+    return {
+      code: 1,
+      message: sellerChanged || customerChanged ? "vendedor del pedido actualizado" : "el pedido ya tiene este vendedor y cliente",
+      data: {
+        order_id: normalizedOrderId,
+        sales_agent_user_id: normalizedSellerId,
+        seller: sellers[0],
         customer_id: normalizedCustomerId,
         customer: customers[0],
       },
@@ -5118,6 +5258,7 @@ module.exports = {
   deliverOrder,
   updateOrderDeliveryDate,
   updateOrderCustomer,
+  updateOrderSeller,
   listSalesCommissions,
   listSalesGifts,
   getDailySalesSettlement,

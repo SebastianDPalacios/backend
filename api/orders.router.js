@@ -25,6 +25,7 @@ const {
   deliverOrder,
   updateOrderDeliveryDate,
   updateOrderCustomer,
+  updateOrderSeller,
   listSalesCommissions,
   listSalesGifts,
   getDailySalesSettlement,
@@ -480,6 +481,19 @@ router.put("/:id/customer", verifyToken, canManageOrders, async (req, res, next)
         canViewAll: hasElevatedCustomerAccess(req.user),
       }
     );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+router.put("/:id/seller", verifyToken, canManageOrders, requireAdministrativeRole, async (req, res, next) => {
+  try {
+    const result = await updateOrderSeller({
+      orderId: Number(req.params.id),
+      salesAgentUserId: Number(req.body?.sales_agent_user_id),
+      customerId: Number(req.body?.customer_id),
+      actorUserId: req.user.userId,
+    });
     res.json(result);
   } catch (error) {
     next(error);

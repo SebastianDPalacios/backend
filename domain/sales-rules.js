@@ -5,6 +5,18 @@ const EDITABLE_ORDER_STATUSES = Object.freeze(["draft", "confirmed", "ready", "d
 const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 const roundQuantity = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 1000) / 1000;
 
+const SALE_BONUS_UNIT_VALUES = Object.freeze({
+  500: 400,
+  1000: 800,
+  2000: 1700,
+  3000: 2500,
+});
+
+const getSaleBonusUnitValue = (unitPrice) => {
+  const price = Number(unitPrice || 0);
+  return SALE_BONUS_UNIT_VALUES[price] || price;
+};
+
 const normalizeLineType = (value) => {
   const normalized = String(value || "sale").trim().toLowerCase();
   return LINE_TYPES.includes(normalized) ? normalized : null;
@@ -25,6 +37,7 @@ const calculateOrderLine = ({
   quantity,
   requireWholeUnitAmount = false,
   amountStep = null,
+  amountUnitPrice = null,
 }) => {
   const price = Number(unitPrice || 0);
   const taxRate = Number(taxPercent || 0);
@@ -54,7 +67,8 @@ const calculateOrderLine = ({
       throw new Error(`el valor de venta + vendaje debe ser multiplo de $${roundMoney(requestedStep).toLocaleString("es-CO")}`);
     }
 
-    const rawQuantity = normalizedRequestedAmount / price;
+    const quantityUnitPrice = Number(amountUnitPrice || price);
+    const rawQuantity = normalizedRequestedAmount / quantityUnitPrice;
     if (requireWholeUnitAmount && unit === "unit" && !Number.isInteger(rawQuantity)) {
       const lineLabel = type === "bonus"
         ? "solo vendaje"
@@ -203,5 +217,6 @@ module.exports = {
   normalizeCaptureMode,
   normalizeLineType,
   roundMoney,
+  getSaleBonusUnitValue,
   validateBonusAllowance,
 };
