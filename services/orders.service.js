@@ -7,7 +7,6 @@ const {
   calculateOrderTotals,
   normalizeLineType,
   roundMoney,
-  getSaleBonusUnitValue,
   validateBonusAllowance,
 } = require("../domain/sales-rules");
 
@@ -1627,8 +1626,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
               requireWholeUnitAmount:
                 ["bonus", "gift", "exchange"].includes(lineType) ||
                 (lineType === "sale" && uiLineType !== "sale_bonus"),
-              amountStep: uiLineType === "sale_bonus" ? getSaleBonusUnitValue(products[0].base_price) : null,
-              amountUnitPrice: uiLineType === "sale_bonus" ? getSaleBonusUnitValue(products[0].base_price) : null,
+              saleBonusPercent: uiLineType === "sale_bonus" ? settings.bonus_percent : null,
             }),
           });
         } catch (error) {
@@ -2273,11 +2271,8 @@ const upsertOrderItem = async (payload, actorUserId) => {
           requireWholeUnitAmount:
             ["bonus", "gift", "exchange"].includes(lineType) ||
             (lineType === "sale" && String(payload.p_ui_line_type || "sale") !== "sale_bonus"),
-          amountStep: String(payload.p_ui_line_type || "sale") === "sale_bonus"
-            ? getSaleBonusUnitValue(products[0].base_price)
-            : null,
-          amountUnitPrice: String(payload.p_ui_line_type || "sale") === "sale_bonus"
-            ? getSaleBonusUnitValue(products[0].base_price)
+          saleBonusPercent: String(payload.p_ui_line_type || "sale") === "sale_bonus"
+            ? orders[0].bonus_percent
             : null,
         });
       } catch (error) {
