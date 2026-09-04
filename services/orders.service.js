@@ -375,6 +375,7 @@ const listOrderItems = async ({ orderId }) => {
         oi.id,
         oi.order_id,
         oi.product_id,
+        oi.line_group_key,
         p.sku AS product_sku,
         p.name AS product_name,
         p.unit AS product_unit,
@@ -1613,6 +1614,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         try {
           normalizedItems.push({
             productId,
+            lineGroupKey: String(item.line_group_key || item.p_line_group_key || `line-${normalizedItems.length + 1}`),
             categoryName: products[0].category_name || null,
             uiLineType,
             ...calculateOrderLine({
@@ -1635,30 +1637,6 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         }
       }
 
-      const aggregatedItems = new Map();
-      for (const item of normalizedItems) {
-        const key = `${item.productId}:${item.lineType}`;
-        const existing = aggregatedItems.get(key);
-        if (!existing) {
-          aggregatedItems.set(key, { ...item });
-          continue;
-        }
-
-        existing.quantity = Math.round(
-          (Number(existing.quantity || 0) + Number(item.quantity || 0) + Number.EPSILON) * 1000
-        ) / 1000;
-        existing.lineSubtotal = roundMoney(Number(existing.lineSubtotal || 0) + Number(item.lineSubtotal || 0));
-        existing.lineTax = roundMoney(Number(existing.lineTax || 0) + Number(item.lineTax || 0));
-        existing.lineTotal = roundMoney(Number(existing.lineTotal || 0) + Number(item.lineTotal || 0));
-        existing.commercialValue = roundMoney(
-          Number(existing.commercialValue || 0) + Number(item.commercialValue || 0)
-        );
-        existing.requestedAmount = existing.requestedAmount !== null && item.requestedAmount !== null
-          ? roundMoney(Number(existing.requestedAmount || 0) + Number(item.requestedAmount || 0))
-          : null;
-        existing.captureMode = existing.captureMode === item.captureMode ? existing.captureMode : "quantity";
-      }
-
       const [sellers] = await connection.query(
         `SELECT u.id FROM users u
          JOIN user_roles ur ON ur.user_id = u.id JOIN roles r ON r.id = ur.role_id
@@ -1670,7 +1648,6 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         await connection.rollback();
         return { code: 0, message: "selecciona un vendedor activo", data: null };
       }
-      normalizedItems = Array.from(aggregatedItems.values());
       const totals = calculateOrderTotals(
         normalizedItems.map((item) => ({
           line_type: item.lineType,
@@ -1748,14 +1725,15 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
       for (const item of normalizedItems) {
         await connection.query(
           `INSERT INTO order_items (
-             order_id, product_id, line_type, capture_mode, requested_amount,
+             order_id, product_id, line_group_key, line_type, capture_mode, requested_amount,
              quantity, unit_price, tax_percent, line_subtotal, line_tax,
              line_total, commercial_value
            )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             orderId,
             item.productId,
+            item.lineGroupKey,
             item.lineType,
             item.captureMode,
             item.requestedAmount,
@@ -1886,6 +1864,7 @@ const getOrderPrintData = async ({
     `SELECT
        oi.id,
        oi.product_id,
+       oi.line_group_key,
        p.sku AS product_sku,
        p.name AS product_name,
        p.includes_bonus,
@@ -2110,7 +2089,9 @@ const recalculateDeliveredOrderCommission = async ({ connection, orderId, order,
 };
 const upsertOrderItem = async (payload, actorUserId) => {
   const orderId = Number(payload.p_order_id || 0);
+  const orderItemId = Number(payload.p_order_item_id || 0);
   const productId = Number(payload.p_product_id || 0);
+  const lineGroupKey = String(payload.p_line_group_key || `edit-${orderId}-${Date.now()}`).slice(0, 80);
   const lineType = normalizeLineType(payload.p_line_type || "sale");
   const previousLineType = normalizeLineType(payload.p_previous_line_type || lineType || "sale");
 
@@ -2175,10 +2156,9 @@ const upsertOrderItem = async (payload, actorUserId) => {
          ), 0) AS directly_delivered_quantity
        FROM order_items oi
        WHERE oi.order_id = ?
-         AND oi.product_id = ?
-         AND oi.line_type = ?
+         AND ((? > 0 AND oi.id = ?) OR (? = 0 AND oi.line_group_key = ? AND oi.product_id = ? AND oi.line_type = ?))
        FOR UPDATE`,
-      [orderId, productId, previousLineType]
+      [orderId, orderItemId, orderItemId, orderItemId, lineGroupKey, productId, previousLineType]
     );
     const previousItem = previousItemRows[0] || null;
     const previousStockQuantity = previousItem
@@ -2206,11 +2186,9 @@ const upsertOrderItem = async (payload, actorUserId) => {
         `SELECT COUNT(*) AS total
          FROM production_sale_reservations psr
          INNER JOIN order_items oi ON oi.id = psr.order_item_id
-         WHERE oi.order_id = ?
-           AND oi.product_id = ?
-           AND oi.line_type = ?
+         WHERE oi.id = ?
            AND psr.status IN ('reserved', 'partially_delivered', 'delivered')`,
-        [orderId, productId, previousLineType]
+        [Number(previousItem?.id || 0)]
       );
 
       if (Number(reservationRows[0]?.total || 0) > 0) {
@@ -2223,9 +2201,8 @@ const upsertOrderItem = async (payload, actorUserId) => {
       }
 
       await connection.query(
-        `DELETE FROM order_items
-         WHERE order_id = ? AND product_id = ? AND line_type = ?`,
-        [orderId, productId, previousLineType]
+        `DELETE FROM order_items WHERE id = ? AND order_id = ?`,
+        [Number(previousItem?.id || 0), orderId]
       );
     } else {
       const [products] = await connection.query(
@@ -2285,11 +2262,9 @@ const upsertOrderItem = async (payload, actorUserId) => {
           `SELECT COUNT(*) AS total
            FROM production_sale_reservations psr
            INNER JOIN order_items oi ON oi.id = psr.order_item_id
-           WHERE oi.order_id = ?
-             AND oi.product_id = ?
-             AND oi.line_type = ?
+           WHERE oi.id = ?
              AND psr.status IN ('reserved', 'partially_delivered', 'delivered')`,
-          [orderId, productId, previousLineType]
+          [Number(previousItem?.id || 0)]
         );
         if (Number(reservationRows[0]?.total || 0) > 0) {
           await connection.rollback();
@@ -2300,9 +2275,8 @@ const upsertOrderItem = async (payload, actorUserId) => {
           };
         }
         await connection.query(
-          `DELETE FROM order_items
-           WHERE order_id = ? AND product_id = ? AND line_type = ?`,
-          [orderId, productId, previousLineType]
+          `DELETE FROM order_items WHERE id = ? AND order_id = ?`,
+          [Number(previousItem?.id || 0), orderId]
         );
       }
 
@@ -2311,11 +2285,9 @@ const upsertOrderItem = async (payload, actorUserId) => {
           `SELECT COALESCE(SUM(psr.quantity), 0) AS committed_quantity
            FROM production_sale_reservations psr
            INNER JOIN order_items oi ON oi.id = psr.order_item_id
-           WHERE oi.order_id = ?
-             AND oi.product_id = ?
-             AND oi.line_type = 'sale'
+           WHERE oi.id = ?
              AND psr.status IN ('reserved', 'partially_delivered', 'delivered')`,
-          [orderId, productId]
+          [Number(previousItem?.id || 0)]
         );
         if (calculated.quantity < Number(reservedRows[0]?.committed_quantity || 0)) {
           await connection.rollback();
@@ -2329,11 +2301,11 @@ const upsertOrderItem = async (payload, actorUserId) => {
 
       await connection.query(
         `INSERT INTO order_items (
-           order_id, product_id, line_type, capture_mode, requested_amount,
+           order_id, product_id, line_group_key, line_type, capture_mode, requested_amount,
            quantity, unit_price, tax_percent, line_subtotal, line_tax,
            line_total, commercial_value
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            capture_mode = VALUES(capture_mode),
            requested_amount = VALUES(requested_amount),
@@ -2347,6 +2319,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
         [
           orderId,
           productId,
+          lineGroupKey,
           calculated.lineType,
           calculated.captureMode,
           calculated.requestedAmount,
@@ -2373,10 +2346,11 @@ const upsertOrderItem = async (payload, actorUserId) => {
            ), 0) AS directly_delivered_quantity
          FROM order_items oi
          WHERE oi.order_id = ?
+           AND oi.line_group_key = ?
            AND oi.product_id = ?
            AND oi.line_type = ?
          FOR UPDATE`,
-        [orderId, productId, lineType]
+        [orderId, lineGroupKey, productId, lineType]
       );
       const currentItem = currentItemRows[0] || null;
       const currentStockQuantity = currentItem
