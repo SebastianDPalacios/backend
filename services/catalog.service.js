@@ -281,19 +281,68 @@ const updateSupplier = async (payload, actorUserId) => {
 };
 
 const createProduct = async (payload, actorUserId) => {
-  const out = await callProcedure("sp_product_create", [
-    payload.p_sku || null,
-    payload.p_name || null,
-    payload.p_description || null,
-    payload.p_category_id || null,
-    payload.p_tax_rate_id || null,
-    payload.p_unit || null,
-    payload.p_base_price ?? null,
-    payload.p_min_stock ?? null,
-    payload.p_units_per_bag ?? null,
-    payload.p_is_active || null,
-    actorUserId || null,
-  ]);
+  let out;
+  try {
+    const db = await connect();
+    const sku = String(payload.p_sku || "").trim();
+    const name = String(payload.p_name || "").trim();
+    const [duplicates] = await db.query(
+      `SELECT sku, name
+         FROM products
+        WHERE (? <> '' AND sku = ?)
+           OR LOWER(name) = LOWER(?)
+        LIMIT 1`,
+      [sku, sku, name]
+    );
+
+    if (duplicates.length) {
+      const sameSku = sku && String(duplicates[0].sku || "").toLowerCase() === sku.toLowerCase();
+      return {
+        code: 0,
+        message: sameSku
+          ? "Ya existe un producto con ese SKU. Escribe un identificador diferente."
+          : "Ya existe un producto con ese nombre. Escribe un nombre diferente.",
+        data: null,
+      };
+    }
+
+    out = await callProcedure("sp_product_create", [
+      payload.p_sku || null,
+      payload.p_name || null,
+      payload.p_description || null,
+      payload.p_category_id || null,
+      payload.p_tax_rate_id || null,
+      payload.p_unit || null,
+      payload.p_base_price ?? null,
+      payload.p_min_stock ?? null,
+      payload.p_units_per_bag ?? null,
+      payload.p_is_active || null,
+      actorUserId || null,
+    ]);
+  } catch (error) {
+    const databaseMessage = String(error?.sqlMessage || error?.message || "");
+    if (error?.code === "ER_DUP_ENTRY") {
+      const isSkuConflict = /(sku|uq_.*sku)/i.test(databaseMessage);
+      return {
+        code: 0,
+        message: isSkuConflict
+          ? "Ya existe un producto con ese SKU. Escribe un identificador diferente."
+          : "Ya existe un producto con esos datos. Revisa el SKU y el nombre.",
+        data: null,
+      };
+    }
+    if (error?.code === "ER_NO_REFERENCED_ROW_2") {
+      return {
+        code: 0,
+        message: "La categoría o la tasa de impuesto seleccionada ya no está disponible. Vuelve a seleccionarla.",
+        data: null,
+      };
+    }
+    if (error?.code === "ER_SIGNAL_EXCEPTION" && databaseMessage) {
+      return { code: 0, message: databaseMessage, data: null };
+    }
+    throw error;
+  }
   const result = mapSpResult(out);
   if (result.code === 1 && result.data?.product_id) {
     const db = await connect();

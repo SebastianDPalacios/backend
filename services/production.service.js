@@ -2579,6 +2579,7 @@ const normalizeRequestMode = (value) => {
   if (["units", "unit", "unidades", "unidad"].includes(mode)) return "units";
   if (["arrobas", "arroba"].includes(mode)) return "arrobas";
   if (["bags", "bag", "bultos", "bulto"].includes(mode)) return "bags";
+  if (["trays", "tray", "latas", "lata"].includes(mode)) return "trays";
   return null;
 };
 
@@ -2633,8 +2634,8 @@ const normalizeProductionPlanItems = async (connection, items) => {
         || !Number.isFinite(requestedQuantity) || requestedQuantity <= 0) {
         return { error: `Revisa el producto ${index + 1}, su modalidad y la cantidad solicitada.` };
       }
-      if (["units", "bags"].includes(requestMode) && !Number.isInteger(requestedQuantity)) {
-        return { error: `La cantidad solicitada de ${index + 1} debe ser un numero entero de unidades o bultos.` };
+      if (["units", "bags", "trays"].includes(requestMode) && !Number.isInteger(requestedQuantity)) {
+        return { error: `La cantidad solicitada de ${index + 1} debe ser un numero entero de unidades, bultos o latas.` };
       }
       if (selectedProductIds.has(productId)) {
         return { error: `El producto ${index + 1} esta repetido en el plan.` };
@@ -2657,15 +2658,16 @@ const normalizeProductionPlanItems = async (connection, items) => {
         return { error: `${recipe.product_name} no tiene un rendimiento valido en su receta vigente.` };
       }
 
+      const isInformationalMode = ["bags", "trays"].includes(requestMode);
       const estimatedUnits = roundProductionQuantity(
         requestMode === "units"
           ? requestedQuantity
-          : requestMode === "bags" ? 0 : requestedQuantity * yieldPerArroba
+          : isInformationalMode ? 0 : requestedQuantity * yieldPerArroba
       );
       const plannedArrobas = roundProductionQuantity(
-        requestMode === "bags" ? 0 : requestMode === "arrobas" ? requestedQuantity : estimatedUnits / yieldPerArroba
+        isInformationalMode ? 0 : requestMode === "arrobas" ? requestedQuantity : estimatedUnits / yieldPerArroba
       );
-      if (requestMode !== "bags" && (plannedArrobas <= 0 || estimatedUnits <= 0)) {
+      if (!isInformationalMode && (plannedArrobas <= 0 || estimatedUnits <= 0)) {
         return { error: `La cantidad del producto ${index + 1} es demasiado pequena para planificarla.` };
       }
 
