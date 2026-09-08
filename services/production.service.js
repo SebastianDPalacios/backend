@@ -1698,6 +1698,7 @@ const getRawMaterialUsageByProductReport = async ({
         usage_rows.product_id,
         usage_rows.product_name,
         usage_rows.product_sku,
+        usage_rows.product_category,
         usage_rows.raw_material_id,
         usage_rows.raw_material_name,
         usage_rows.raw_material_unit,
@@ -1719,6 +1720,7 @@ const getRawMaterialUsageByProductReport = async ({
           pbo.product_id,
           p.name AS product_name,
           p.sku AS product_sku,
+          pc.name AS product_category,
           ri.raw_material_id,
           rm.name AS raw_material_name,
           rm.unit AS raw_material_unit,
@@ -1742,6 +1744,7 @@ const getRawMaterialUsageByProductReport = async ({
         LEFT JOIN raw_material_categories rmc ON rmc.id = rm.category_id
         INNER JOIN production_batch_outputs pbo ON pbo.production_batch_id = pb.id
         INNER JOIN products p ON p.id = pbo.product_id
+        LEFT JOIN product_categories pc ON pc.id = p.category_id
         LEFT JOIN (
           SELECT production_batch_id, COALESCE(SUM(produced_quantity), 0) AS total_produced
           FROM production_batch_outputs
@@ -1761,6 +1764,7 @@ const getRawMaterialUsageByProductReport = async ({
           pbo.product_id,
           p.name,
           p.sku,
+          pc.name,
           ri.raw_material_id,
           rm.name,
           rm.unit,
@@ -1779,6 +1783,7 @@ const getRawMaterialUsageByProductReport = async ({
           pom.product_id,
           p.name AS product_name,
           p.sku AS product_sku,
+          pc.name AS product_category,
           pom.raw_material_id,
           rm.name AS raw_material_name,
           rm.unit AS raw_material_unit,
@@ -1792,6 +1797,7 @@ const getRawMaterialUsageByProductReport = async ({
         INNER JOIN recipes r ON r.id = pb.recipe_id
         LEFT JOIN products recipe_product ON recipe_product.id = r.product_id
         INNER JOIN products p ON p.id = pom.product_id
+        LEFT JOIN product_categories pc ON pc.id = p.category_id
         INNER JOIN raw_materials rm ON rm.id = pom.raw_material_id
         LEFT JOIN raw_material_categories rmc ON rmc.id = rm.category_id
         LEFT JOIN production_batch_outputs pbo ON pbo.id = pom.production_batch_output_id
@@ -1809,6 +1815,7 @@ const getRawMaterialUsageByProductReport = async ({
           pom.product_id,
           p.name,
           p.sku,
+          pc.name,
           pom.raw_material_id,
           rm.name,
           rm.unit,
@@ -1824,6 +1831,7 @@ const getRawMaterialUsageByProductReport = async ({
         usage_rows.product_id,
         usage_rows.product_name,
         usage_rows.product_sku,
+        usage_rows.product_category,
         usage_rows.raw_material_id,
         usage_rows.raw_material_name,
         usage_rows.raw_material_unit,

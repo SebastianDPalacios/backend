@@ -45,6 +45,7 @@ const router = express.Router();
 const canManageProduction = requirePermission("production.manage");
 const canRegisterBakerProduction = requirePermission("production.baker", "production.manage");
 const canRegisterPackaging = requirePermission("production.packaging", "production.manage");
+const canViewIngredientUsage = requirePermission("production.baker", "production.manage");
 
 router.get("/plans", verifyToken, canManageProduction, async (req, res, next) => {
   try {
@@ -366,7 +367,7 @@ router.get("/reports/raw-material-usage", verifyToken, canManageProduction, asyn
   }
 });
 
-router.get("/reports/raw-material-usage-by-product", verifyToken, canManageProduction, async (req, res, next) => {
+router.get("/reports/raw-material-usage-by-product", verifyToken, canViewIngredientUsage, async (req, res, next) => {
   try {
     const result = await getRawMaterialUsageByProductReport({
       dateFrom: req.query.dateFrom || req.query.date_from,
