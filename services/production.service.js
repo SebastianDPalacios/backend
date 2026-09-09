@@ -825,6 +825,7 @@ const listMyProductionBaseData = async ({ userId } = {}) => {
       `
         SELECT
           ri.recipe_id,
+          ri.concept,
           ri.raw_material_id,
           rm.name AS raw_material_name,
           rm.unit AS raw_material_unit,
@@ -844,6 +845,7 @@ const listMyProductionBaseData = async ({ userId } = {}) => {
         SELECT
           ro.recipe_id,
           ro.product_id,
+          roi.concept,
           roi.raw_material_id,
           rm.name AS raw_material_name,
           rm.unit AS raw_material_unit,
