@@ -798,6 +798,8 @@ const listMyProductionBaseData = async ({ userId } = {}) => {
   );
 
   let outputRows = [];
+  let recipeItemRows = [];
+  let outputItemRows = [];
   if (recipes.length) {
     const recipeIds = recipes.map((recipe) => Number(recipe.id));
     const placeholders = recipeIds.map(() => '?').join(', ');
@@ -818,12 +820,67 @@ const listMyProductionBaseData = async ({ userId } = {}) => {
       recipeIds
     );
     outputRows = rows;
+
+    const [baseItems] = await db.query(
+      `
+        SELECT
+          ri.recipe_id,
+          ri.raw_material_id,
+          rm.name AS raw_material_name,
+          rm.unit AS raw_material_unit,
+          ri.quantity,
+          ri.wastage_percent
+        FROM recipe_items ri
+        INNER JOIN raw_materials rm ON rm.id = ri.raw_material_id
+        WHERE ri.recipe_id IN (${placeholders})
+        ORDER BY ri.recipe_id, rm.name
+      `,
+      recipeIds
+    );
+    recipeItemRows = baseItems;
+
+    const [outputItems] = await db.query(
+      `
+        SELECT
+          ro.recipe_id,
+          ro.product_id,
+          roi.raw_material_id,
+          rm.name AS raw_material_name,
+          rm.unit AS raw_material_unit,
+          roi.quantity,
+          roi.wastage_percent
+        FROM recipe_output_items roi
+        INNER JOIN recipe_outputs ro ON ro.id = roi.recipe_output_id
+        INNER JOIN raw_materials rm ON rm.id = roi.raw_material_id
+        WHERE ro.recipe_id IN (${placeholders})
+        ORDER BY ro.recipe_id, ro.product_id, rm.name
+      `,
+      recipeIds
+    );
+    outputItemRows = outputItems;
   }
+
+  const itemsByRecipe = recipeItemRows.reduce((acc, item) => {
+    const key = String(item.recipe_id);
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(item);
+    return acc;
+  }, {});
+
+  const outputItemsByProduct = outputItemRows.reduce((acc, item) => {
+    const key = `${item.recipe_id}-${item.product_id}`;
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(item);
+    return acc;
+  }, {});
 
   const outputsByRecipe = outputRows.reduce((acc, output) => {
     const key = String(output.recipe_id);
     if (!acc[key]) acc[key] = [];
-    acc[key].push(output);
+    acc[key].push({
+      ...output,
+      items: outputItemsByProduct[`${output.recipe_id}-${output.product_id}`] || [],
+    });
     return acc;
   }, {});
 
@@ -835,6 +892,7 @@ const listMyProductionBaseData = async ({ userId } = {}) => {
       branches,
       recipes: recipes.map((recipe) => ({
         ...recipe,
+        items: itemsByRecipe[String(recipe.id)] || [],
         outputs: outputsByRecipe[String(recipe.id)] || [],
       })),
     },
@@ -1286,11 +1344,35 @@ const listPendingPackaging = async ({ branchId, search } = {}) => {
     branchId || null,
     search || null,
   ]);
-  return mapSpResult(out);
+  const result = mapSpResult(out);
+  const batches = Array.isArray(result.data) ? result.data : [];
+  result.data = batches.map((batch) => ({
+    ...batch,
+    items: (Array.isArray(batch.items) ? batch.items : []).map((item) => {
+      const safeItem = { ...item };
+      ["produced_quantity", "expected_quantity", "counted_quantity", "packed_quantity", "damaged_quantity", "missing_quantity"].forEach((field) => delete safeItem[field]);
+      return safeItem;
+    }),
+  }));
+  return result;
 };
 
 const createPackingReport = async (payload, actorUserId) => {
-  const items = Array.isArray(payload.p_items) ? payload.p_items : payload.p_items_json || [];
+  const submittedItems = Array.isArray(payload.p_items) ? payload.p_items : payload.p_items_json || [];
+  const items = submittedItems.map((item) => {
+    const damages = Array.isArray(item.damages) ? item.damages : [];
+    const damagedQuantity = damages.reduce((total, damage) => total + Number(damage.quantity || 0), 0);
+    const damageNotes = damages
+      .filter((damage) => Number(damage.quantity || 0) > 0)
+      .map((damage) => `${Number(damage.quantity)}: ${String(damage.reason_label || damage.reason || "Daño").trim()}${damage.notes ? ` (${String(damage.notes).trim()})` : ""}`)
+      .join("; ");
+    return {
+      ...item,
+      damaged_quantity: damagedQuantity,
+      damage_reason: damages.find((damage) => Number(damage.quantity || 0) > 0)?.reason || null,
+      notes: [damageNotes, item.notes].filter(Boolean).join(". ") || null,
+    };
+  });
   const outputIds = items.map((item) => Number(item.production_batch_output_id));
   const validOutputIds = outputIds.filter((id) => Number.isInteger(id) && id > 0);
   const validMissingReasons = new Set([
@@ -1322,6 +1404,56 @@ const createPackingReport = async (payload, actorUserId) => {
     };
   }
 
+  if (items.some((item) => (item.damages || []).some((damage) => Number(damage.quantity || 0) <= 0 || !validDamageReasons.has(damage.reason)))) {
+    return { code: 0, message: "Cada daño debe tener una cantidad mayor a cero y un motivo válido.", data: null };
+  }
+
+  if (validOutputIds.length) {
+    const db = await connect();
+    const [outputRows] = await db.query(
+      `SELECT id, produced_quantity, packed_quantity, damaged_quantity, missing_quantity, direct_delivered_quantity
+         FROM production_batch_outputs
+        WHERE production_batch_id = ? AND id IN (?)`,
+      [Number(payload.p_production_batch_id), validOutputIds]
+    );
+    const outputsById = new Map(outputRows.map((row) => [Number(row.id), row]));
+    if (outputsById.size !== validOutputIds.length) {
+      return { code: 0, message: "Uno o más productos ya no están disponibles para empaque.", data: null };
+    }
+    let exceedsAvailable = false;
+    items.forEach((item) => {
+      const output = outputsById.get(Number(item.production_batch_output_id));
+      if (!output) return;
+      const available = Math.max(
+        Number(output.produced_quantity || 0)
+          - Number(output.packed_quantity || 0)
+          - Number(output.damaged_quantity || 0)
+          - Number(output.missing_quantity || 0)
+          - Number(output.direct_delivered_quantity || 0),
+        0
+      );
+      const packed = Number(item.packed_quantity || 0);
+      const damaged = Number(item.damaged_quantity || 0);
+      if (packed + damaged > available) {
+        exceedsAvailable = true;
+        return;
+      }
+      item.missing_quantity = Math.max(available - packed - damaged, 0);
+      item.counted_quantity = packed + damaged + item.missing_quantity;
+      item.missing_reason = item.missing_quantity > 0 ? "count_difference" : null;
+      if (item.missing_quantity > 0) {
+        item.notes = [item.notes, "Faltante calculado automaticamente por diferencia"].filter(Boolean).join(". ");
+      }
+    });
+    if (exceedsAvailable) {
+      return {
+        code: 0,
+        message: "La suma de empacados y dañados supera la cantidad disponible de uno de los productos.",
+        data: null,
+      };
+    }
+  }
+
   const hasInvalidQuantity = items.some((item) => {
     const counted = Number(item.counted_quantity || 0);
     const packed = Number(item.packed_quantity || 0);
@@ -1336,7 +1468,7 @@ const createPackingReport = async (payload, actorUserId) => {
   if (hasInvalidQuantity) {
     return {
       code: 0,
-      message: "Revisa las cantidades: el conteo debe ser mayor a cero y empacados/danados no pueden superar lo contado.",
+      message: "Revisa las cantidades de empacados y dañados. Deben ser valores válidos mayores o iguales a cero.",
       data: null,
     };
   }
@@ -1377,6 +1509,12 @@ const createPackingReport = async (payload, actorUserId) => {
     actorUserId || null,
   ]);
   const result = mapSpResult(out);
+  if (result.code === 1) {
+    result.data = {
+      ...(result.data || {}),
+      missing_quantity: items.reduce((total, item) => total + Number(item.missing_quantity || 0), 0),
+    };
+  }
 
   if (result.code === 1 && validOutputIds.length) {
     const db = await connect();
@@ -1444,14 +1582,14 @@ const listPackingHistory = async ({ dateFrom, dateTo, search, page = 1, pageSize
   );
 
   if (!reports.length) {
-    return { code: 1, message: "Historial de conteos obtenido.", data: { rows: [], total: Number(countRows[0]?.total || 0), page: currentPage, page_size: limit } };
+    return { code: 1, message: "Historial de empaques obtenido.", data: { rows: [], total: Number(countRows[0]?.total || 0), page: currentPage, page_size: limit } };
   }
 
   const reportIds = reports.map((report) => Number(report.id));
   const placeholders = reportIds.map(() => "?").join(",");
   const [items] = await db.query(
     `SELECT pri.id, pri.packing_report_id, pri.product_id, p.name AS product_name, p.sku AS product_sku,
-            pri.counted_quantity, pri.packed_quantity, pri.damaged_quantity, pri.missing_quantity,
+            pri.packed_quantity, pri.damaged_quantity, pri.missing_quantity,
             pri.damage_reason, pri.missing_reason, pri.notes, pri.created_at
        FROM packing_report_items pri
        INNER JOIN products p ON p.id = pri.product_id
@@ -1468,7 +1606,7 @@ const listPackingHistory = async ({ dateFrom, dateTo, search, page = 1, pageSize
 
   return {
     code: 1,
-    message: "Historial de conteos obtenido.",
+    message: "Historial de empaques obtenido.",
     data: {
       rows: reports.map((report) => ({ ...report, items: itemsByReport[String(report.id)] || [] })),
       total: Number(countRows[0]?.total || 0),
@@ -2010,6 +2148,7 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
         pbo.product_id,
         p.name AS product_name,
         p.sku AS product_sku,
+        COALESCE(pc.name, 'Sin categoria') AS product_category,
         p.units_per_bag,
         CASE
           WHEN p.units_per_bag IS NULL OR p.units_per_bag <= 0 THEN NULL
@@ -2030,9 +2169,10 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
       FROM production_batches pb
       INNER JOIN production_batch_outputs pbo ON pbo.production_batch_id = pb.id
       INNER JOIN products p ON p.id = pbo.product_id
+      LEFT JOIN product_categories pc ON pc.id = p.category_id
       ${whereClause}
-      GROUP BY pbo.product_id, p.name, p.sku, p.units_per_bag
-      ORDER BY p.name
+      GROUP BY pbo.product_id, p.name, p.sku, pc.name, p.units_per_bag
+      ORDER BY pc.name, p.name
     `,
     values
   );
