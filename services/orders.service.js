@@ -3409,7 +3409,7 @@ const updateOrderSeller = async ({ orderId, salesAgentUserId, customerId, actorU
     return { code: 0, message: "selecciona un vendedor valido", data: null };
   }
   if (!Number.isInteger(normalizedCustomerId) || normalizedCustomerId <= 0) {
-    return { code: 0, message: "selecciona un cliente del vendedor", data: null };
+    return { code: 0, message: "selecciona un cliente válido", data: null };
   }
 
   const db = await connect();
@@ -3456,19 +3456,15 @@ const updateOrderSeller = async ({ orderId, salesAgentUserId, customerId, actorU
     const [customers] = await connection.query(
       `SELECT c.id, c.name, c.tax_id, c.phone, c.address, c.neighborhood
        FROM customers c
-       INNER JOIN seller_customer_assignments sca
-         ON sca.customer_id = c.id
-        AND sca.sales_agent_user_id = ?
-        AND sca.is_active = 1
        WHERE c.id = ?
          AND c.status = 'active'
          AND c.deleted_at IS NULL
        LIMIT 1`,
-      [normalizedSellerId, normalizedCustomerId]
+      [normalizedCustomerId]
     );
     if (!customers.length) {
       await connection.rollback();
-      return { code: 0, message: "selecciona un cliente asignado al nuevo vendedor", data: null };
+      return { code: 0, message: "el cliente seleccionado no está activo", data: null };
     }
 
     const sellerChanged = Number(order.sales_agent_user_id) !== normalizedSellerId;
