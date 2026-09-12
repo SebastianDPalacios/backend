@@ -119,6 +119,28 @@ const calculateRuleBoundSaleTotal = (items) => {
   ), 0);
 };
 
+const calculateRuleBoundSaleFulfillmentTotal = (items) => {
+  const hasUiLineTypes = items.some((item) => item.uiLineType || item.ui_line_type);
+  const bonusProductIds = new Set(
+    items
+      .filter((item) => (item.lineType || item.line_type) === "bonus")
+      .map((item) => Number(item.productId || item.product_id || 0))
+  );
+
+  return items.reduce((total, item) => {
+    const isRuleBoundSale = (item.lineType || item.line_type) === "sale"
+      && (hasUiLineTypes
+        ? String(item.uiLineType || item.ui_line_type || "") === "sale_bonus"
+        : bonusProductIds.has(Number(item.productId || item.product_id || 0)));
+    if (!isRuleBoundSale) return total;
+
+    const quantity = Number(item.quantity || 0);
+    const unitPrice = Number(item.unitPrice || item.unit_price || 0);
+    const taxPercent = Number(item.taxPercent || item.tax_percent || 0);
+    return total + quantity * unitPrice * (1 + taxPercent / 100);
+  }, 0);
+};
+
 const addCustomerCreditMovement = async (
   connection,
   {
@@ -1666,6 +1688,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         validateBonusAllowance({
           grandTotal: calculateBonusEligibleGrandTotal(normalizedItems),
           bonusBaseTotal: calculateRuleBoundSaleTotal(normalizedItems),
+          saleFulfillmentTotal: calculateRuleBoundSaleFulfillmentTotal(normalizedItems),
           bonusTotal: calculateRuleBoundBonusTotal(normalizedItems),
           bonusPercent: settings.bonus_percent,
           bonusMinimumAmount: settings.bonus_minimum_amount,
@@ -2425,6 +2448,9 @@ const upsertOrderItem = async (payload, actorUserId) => {
          oi.line_tax,
          oi.line_total,
          oi.commercial_value,
+         oi.quantity,
+         oi.unit_price,
+         oi.tax_percent,
          pc.name AS category_name
        FROM order_items oi
        INNER JOIN products p ON p.id = oi.product_id
@@ -2464,6 +2490,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
       validateBonusAllowance({
         grandTotal: calculateBonusEligibleGrandTotal(itemRows),
         bonusBaseTotal: calculateRuleBoundSaleTotal(itemRows),
+        saleFulfillmentTotal: calculateRuleBoundSaleFulfillmentTotal(itemRows),
         bonusTotal: calculateRuleBoundBonusTotal(itemRows),
         bonusPercent: orders[0].bonus_percent,
         bonusMinimumAmount: orders[0].bonus_minimum_amount,
@@ -2618,6 +2645,9 @@ const confirmOrder = async (payload, actorUserId, { retainDraftStatus = false } 
          oi.line_tax,
          oi.line_total,
          oi.commercial_value,
+         oi.quantity,
+         oi.unit_price,
+         oi.tax_percent,
          pc.name AS category_name
        FROM order_items oi
        INNER JOIN products p ON p.id = oi.product_id
@@ -2645,6 +2675,7 @@ const confirmOrder = async (payload, actorUserId, { retainDraftStatus = false } 
       validateBonusAllowance({
         grandTotal: calculateBonusEligibleGrandTotal(items),
         bonusBaseTotal: calculateRuleBoundSaleTotal(items),
+        saleFulfillmentTotal: calculateRuleBoundSaleFulfillmentTotal(items),
         bonusTotal: calculateRuleBoundBonusTotal(items),
         bonusPercent: orders[0].bonus_percent,
         bonusMinimumAmount: orders[0].bonus_minimum_amount,

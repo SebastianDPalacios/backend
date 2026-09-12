@@ -151,6 +151,7 @@ const calculateOrderTotals = (items) => {
 const validateBonusAllowance = ({
   grandTotal,
   bonusBaseTotal = grandTotal,
+  saleFulfillmentTotal = bonusBaseTotal,
   bonusTotal,
   bonusPercent,
   bonusMinimumAmount,
@@ -159,10 +160,15 @@ const validateBonusAllowance = ({
   const chargedTotal = roundMoney(grandTotal);
   const appliedBonus = roundMoney(bonusTotal);
   const bonusBase = roundMoney(bonusBaseTotal);
+  const saleFulfillment = roundMoney(saleFulfillmentTotal);
   const minimum = roundMoney(bonusMinimumAmount);
   const allowedBonus = chargedTotal >= minimum && bonusBase > 0
-    ? roundMoney(bonusBase * (Number(bonusPercent || 0) / 100)
-        + Number(bonusMaxCompanyLossAmount || 0))
+    ? Math.max(roundMoney(
+        bonusBase
+          + bonusBase * (Number(bonusPercent || 0) / 100)
+          + Number(bonusMaxCompanyLossAmount || 0)
+          - saleFulfillment
+      ), 0)
     : 0;
 
   if (appliedBonus > allowedBonus) {
