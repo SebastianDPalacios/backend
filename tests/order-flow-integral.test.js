@@ -30,6 +30,27 @@ test("venta normal por cantidad cobra todas las unidades sin vendaje", () => {
   assert.equal(line.commercialValue, 9000);
 });
 
+test("venta y solo vendaje por valor exigen unidades completas de forma independiente", () => {
+  for (const lineType of ["sale", "bonus"]) {
+    assert.throws(() => calculateOrderLine({
+      ...product,
+      lineType,
+      captureMode: "amount",
+      requestedAmount: 1500,
+      requireWholeUnitAmount: true,
+    }), /debe ser multiplo/);
+
+    const completeUnit = calculateOrderLine({
+      ...product,
+      lineType,
+      captureMode: "amount",
+      requestedAmount: 3000,
+      requireWholeUnitAmount: true,
+    });
+    assert.equal(completeUnit.quantity, 1);
+  }
+});
+
 test("venta + vendaje conserva los resultados oficiales de 2.500, 5.000 y 10.000", () => {
   const cases = [
     { paidValue: 2500, expectedSale: 1, expectedBonus: 0, margin: 0 },
@@ -57,6 +78,16 @@ test("venta + vendaje conserva los resultados oficiales de 2.500, 5.000 y 10.000
     assert.equal(sale.quantity, current.expectedSale);
     assert.equal(bonus.bonusQuantity, current.expectedBonus);
   }
+});
+
+test("venta + vendaje bloquea $3.000 cuando la formula produce 1,2 unidades", () => {
+  assert.throws(() => calculateOrderLine({
+    ...product,
+    lineType: "sale",
+    captureMode: "amount",
+    requestedAmount: 3000,
+    saleBonusPercent: 20,
+  }), /debe producir unidades completas/);
 });
 
 test("el margen se usa solo para completar la unidad y una vez en el pedido", () => {

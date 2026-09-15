@@ -36,6 +36,10 @@ test("Venta + vendaje de $10.000 para producto de $3.000", () => {
   assert.deepEqual(calculateCase(10000), { saleQuantity: 3, bonusQuantity: 1 });
 });
 
+test("bloquea $3.000 porque con el 20% produce 1,2 unidades", () => {
+  assert.throws(() => calculateCase(3000), /debe producir unidades completas/);
+});
+
 test("aplica el margen de redondeo una sola vez al conjunto del pedido", () => {
   const result = calculateSaleBonusOrder({
     lines: [
@@ -69,22 +73,22 @@ test("no redondea hacia arriba cuando la diferencia supera el margen", () => {
   assert.equal(result.marginUsed, 0);
 });
 
-test("no exige redondear venta y vendaje por separado", () => {
+test("valida la cantidad total sin exigir que el valor facturado sea múltiplo del precio", () => {
   const sale = calculateOrderLine({
     unit: "unit",
     unitPrice: 3000,
     lineType: "sale",
     captureMode: "amount",
-    requestedAmount: 4000,
+    requestedAmount: 2500,
     saleBonusPercent: 20,
   });
   const result = calculateSaleBonusOrder({
-    lines: [{ unit: "unit", unitPrice: 3000, paidValue: 4000, saleQuantity: sale.quantity }],
+    lines: [{ unit: "unit", unitPrice: 3000, paidValue: 2500, saleQuantity: sale.quantity }],
     bonusPercent: 20,
     maxCompanyLoss: 1500,
   });
   assert.equal(sale.quantity, 1);
-  assert.equal(result.generatedBonusValue, 800);
-  assert.equal(result.physicalBonusValue, 3000);
-  assert.equal(result.marginUsed, 1200);
+  assert.equal(result.generatedBonusValue, 500);
+  assert.equal(result.physicalBonusValue, 0);
+  assert.equal(result.marginUsed, 0);
 });

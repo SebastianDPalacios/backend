@@ -127,6 +127,17 @@ const calculateOrderLine = ({
 
     const hasSaleBonusPercent = saleBonusPercent !== null && saleBonusPercent !== undefined;
     const normalizedBonusPercent = Number(saleBonusPercent);
+    if (hasSaleBonusPercent && Number.isFinite(normalizedBonusPercent) && unit === "unit") {
+      const commercialUnitPrice = price * (1 + taxRate / 100);
+      const convertedQuantity = (
+        normalizedRequestedAmount * (1 + normalizedBonusPercent / 100)
+      ) / commercialUnitPrice;
+      if (Math.abs(convertedQuantity - Math.round(convertedQuantity)) >= 0.000001) {
+        throw new Error(
+          `con el ${roundMoney(normalizedBonusPercent).toLocaleString("es-CO")}% de vendaje, el valor debe producir unidades completas del producto`
+        );
+      }
+    }
     const rawQuantity = normalizedRequestedAmount / price;
     if (requireWholeUnitAmount && unit === "unit" && !Number.isInteger(rawQuantity)) {
       const lineLabel = type === "bonus"
