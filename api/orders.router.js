@@ -1,6 +1,11 @@
 ﻿const express = require("express");
 const { verifyToken, requirePermission } = require("../middlewares/auth.handler");
 const {
+  requireBodyOrderAccess,
+  requireOrderAccess,
+  requireReservationOrderAccess,
+} = require("../middlewares/order-access.handler");
+const {
   listOrders,
   listOrderItems,
   listProductionReservations,
@@ -13,6 +18,7 @@ const {
   getSalesSettings,
   updateSalesSettings,
   createOrder,
+  retryOrderOperations,
   getOrderPrintData,
   confirmOrderPrint,
   upsertOrderItem,
@@ -62,7 +68,7 @@ const hasElevatedCustomerAccess = (user = {}) => {
 
 const requireAdministrativeRole = (req, res, next) => {
   if (!hasElevatedCustomerAccess(req.user)) {
-    return res.status(403).json({ code: 0, message: "solo un administrador puede eliminar pedidos", data: null });
+    return res.status(403).json({ code: 0, message: "solo un administrador puede realizar esta accion", data: null });
   }
   return next();
 };
@@ -74,6 +80,10 @@ router.get("/", verifyToken, canManageOrders, async (req, res, next) => {
       search: req.query.search,
       dateFrom: req.query.dateFrom,
       dateTo: req.query.dateTo,
+      salesAgentUserId: req.query.salesAgentUserId,
+      customerId: req.query.customerId,
+      productId: req.query.productId,
+      includeCancelled: req.query.includeCancelled !== "0",
       page: req.query.page,
       pageSize: req.query.pageSize,
       actorUserId: req.user.userId,
@@ -266,7 +276,7 @@ router.get("/returns", verifyToken, canManageOrders, async (req, res, next) => {
   }
 });
 
-router.post("/returns", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/returns", verifyToken, canManageOrders, requireBodyOrderAccess, async (req, res, next) => {
   try {
     const result = await createSalesReturn(req.body, req.user.userId);
     res.json(result);
@@ -366,7 +376,7 @@ router.post("/purchase-orders", verifyToken, canManageInventory, async (req, res
   }
 });
 
-router.get("/:id/items", verifyToken, canManageOrders, async (req, res, next) => {
+router.get("/:id/items", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await listOrderItems({
       orderId: Number(req.params.id),
@@ -377,7 +387,7 @@ router.get("/:id/items", verifyToken, canManageOrders, async (req, res, next) =>
   }
 });
 
-router.get("/:id/print-data", verifyToken, canManageOrders, async (req, res, next) => {
+router.get("/:id/print-data", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await getOrderPrintData({
       orderId: Number(req.params.id),
@@ -390,7 +400,7 @@ router.get("/:id/print-data", verifyToken, canManageOrders, async (req, res, nex
   }
 });
 
-router.post("/:id/confirm-print", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/:id/confirm-print", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await confirmOrderPrint({
       orderId: Number(req.params.id),
@@ -403,7 +413,7 @@ router.post("/:id/confirm-print", verifyToken, canManageOrders, async (req, res,
   }
 });
 
-router.get("/:id/production-reservations", verifyToken, canManageOrders, async (req, res, next) => {
+router.get("/:id/production-reservations", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await listProductionReservations({ orderId: Number(req.params.id) });
     res.json(result);
@@ -412,7 +422,7 @@ router.get("/:id/production-reservations", verifyToken, canManageOrders, async (
   }
 });
 
-router.get("/:id/production-reservation-options", verifyToken, canManageOrders, async (req, res, next) => {
+router.get("/:id/production-reservation-options", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await listProductionReservationOptions({ orderId: Number(req.params.id) });
     res.json(result);
@@ -421,7 +431,7 @@ router.get("/:id/production-reservation-options", verifyToken, canManageOrders, 
   }
 });
 
-router.post("/:id/production-reservations", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/:id/production-reservations", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await createProductionReservation(
       { ...req.body, p_order_id: Number(req.params.id) },
@@ -433,7 +443,7 @@ router.post("/:id/production-reservations", verifyToken, canManageOrders, async 
   }
 });
 
-router.post("/production-reservations/:id/deliver", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/production-reservations/:id/deliver", verifyToken, canManageOrders, requireReservationOrderAccess, async (req, res, next) => {
   try {
     const result = await deliverProductionReservation(
       { reservationId: Number(req.params.id) },
@@ -445,7 +455,7 @@ router.post("/production-reservations/:id/deliver", verifyToken, canManageOrders
   }
 });
 
-router.post("/production-reservations/:id/release", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/production-reservations/:id/release", verifyToken, canManageOrders, requireReservationOrderAccess, async (req, res, next) => {
   try {
     const result = await releaseProductionReservation(
       { reservationId: Number(req.params.id) },
@@ -457,7 +467,7 @@ router.post("/production-reservations/:id/release", verifyToken, canManageOrders
   }
 });
 
-router.put("/:id/delivery-date", verifyToken, canManageOrders, async (req, res, next) => {
+router.put("/:id/delivery-date", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await updateOrderDeliveryDate(
       {
@@ -471,7 +481,7 @@ router.put("/:id/delivery-date", verifyToken, canManageOrders, async (req, res, 
     next(error);
   }
 });
-router.put("/:id/customer", verifyToken, canManageOrders, async (req, res, next) => {
+router.put("/:id/customer", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await updateOrderCustomer(
       {
@@ -486,7 +496,7 @@ router.put("/:id/customer", verifyToken, canManageOrders, async (req, res, next)
     next(error);
   }
 });
-router.put("/:id/seller", verifyToken, canManageOrders, requireAdministrativeRole, async (req, res, next) => {
+router.put("/:id/seller", verifyToken, canManageOrders, requireAdministrativeRole, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await updateOrderSeller({
       orderId: Number(req.params.id),
@@ -499,7 +509,7 @@ router.put("/:id/seller", verifyToken, canManageOrders, requireAdministrativeRol
     next(error);
   }
 });
-router.post("/:id/items", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/:id/items", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await upsertOrderItem(
       { ...req.body, p_order_id: Number(req.params.id) },
@@ -511,7 +521,7 @@ router.post("/:id/items", verifyToken, canManageOrders, async (req, res, next) =
   }
 });
 
-router.post("/:id/confirm", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/:id/confirm", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await confirmOrder(
       { p_order_id: Number(req.params.id) },
@@ -523,7 +533,20 @@ router.post("/:id/confirm", verifyToken, canManageOrders, async (req, res, next)
   }
 });
 
-router.post("/:id/cancel", verifyToken, canManageOrders, requireAdministrativeRole, async (req, res, next) => {
+router.post("/:id/retry-operations", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
+  try {
+    const result = await retryOrderOperations({
+      orderId: Number(req.params.id),
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/:id/cancel", verifyToken, canManageOrders, requireAdministrativeRole, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await cancelOrder(
       { ...req.body, p_order_id: Number(req.params.id) },
@@ -535,7 +558,7 @@ router.post("/:id/cancel", verifyToken, canManageOrders, requireAdministrativeRo
   }
 });
 
-router.post("/:id/dispatch", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/:id/dispatch", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await dispatchOrder(
       { p_order_id: Number(req.params.id) },
@@ -547,7 +570,7 @@ router.post("/:id/dispatch", verifyToken, canManageOrders, async (req, res, next
   }
 });
 
-router.post("/:id/deliver", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/:id/deliver", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await deliverOrder(
       { p_order_id: Number(req.params.id) },
@@ -559,7 +582,7 @@ router.post("/:id/deliver", verifyToken, canManageOrders, async (req, res, next)
   }
 });
 
-router.post("/:id/create-production", verifyToken, canManageOrders, async (req, res, next) => {
+router.post("/:id/create-production", verifyToken, canManageOrders, requireOrderAccess, async (req, res, next) => {
   try {
     const result = await createProductionFromOrder(
       { ...req.body, p_order_id: Number(req.params.id) },

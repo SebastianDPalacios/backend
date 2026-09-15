@@ -15,6 +15,76 @@ const normalizeCaptureMode = (value) => {
   return CAPTURE_MODES.includes(normalized) ? normalized : null;
 };
 
+const calculateSaleBonusOrder = ({ lines = [], bonusPercent, maxCompanyLoss = 0, enabled = true }) => {
+  let remainingMargin = Math.max(roundMoney(maxCompanyLoss), 0);
+  let generatedBonusValue = 0;
+  let physicalBonusValue = 0;
+  let marginUsed = 0;
+
+  const allocations = lines.map((line) => {
+    const commercialUnitPrice = roundMoney(
+      Number(line.unitPrice || 0) * (1 + Number(line.taxPercent || 0) / 100)
+    );
+    const paidValue = roundMoney(line.paidValue);
+    const saleQuantity = roundQuantity(line.saleQuantity);
+    const generatedValue = enabled
+      ? roundMoney(paidValue * (Number(bonusPercent || 0) / 100))
+      : 0;
+    generatedBonusValue = roundMoney(generatedBonusValue + generatedValue);
+
+    if (commercialUnitPrice <= 0 || paidValue <= 0 || generatedValue <= 0) {
+      return { ...line, generatedValue, bonusQuantity: 0, physicalValue: 0, roundingDifference: 0 };
+    }
+
+    const availableValue = roundMoney(paidValue + generatedValue);
+    const rawTotalQuantity = availableValue / commercialUnitPrice;
+    let totalQuantity;
+    let roundingDifference = 0;
+    if (line.unit === "unit") {
+      totalQuantity = Math.floor(rawTotalQuantity);
+      const upperQuantity = Math.ceil(rawTotalQuantity);
+      const requiredDifference = roundMoney(upperQuantity * commercialUnitPrice - availableValue);
+      if (upperQuantity > totalQuantity && requiredDifference <= remainingMargin) {
+        totalQuantity = upperQuantity;
+        roundingDifference = requiredDifference;
+        remainingMargin = roundMoney(remainingMargin - requiredDifference);
+        marginUsed = roundMoney(marginUsed + requiredDifference);
+      }
+    } else {
+      totalQuantity = Math.floor(rawTotalQuantity * 1000) / 1000;
+    }
+
+    const bonusQuantity = roundQuantity(Math.max(totalQuantity - saleQuantity, 0));
+    const physicalValue = roundMoney(bonusQuantity * commercialUnitPrice);
+    physicalBonusValue = roundMoney(physicalBonusValue + physicalValue);
+    return { ...line, generatedValue, bonusQuantity, physicalValue, roundingDifference };
+  });
+
+  return { allocations, generatedBonusValue, physicalBonusValue, marginUsed };
+};
+
+const calculateSaleBonus = (options) => {
+  const result = calculateSaleBonusOrder({
+    lines: [{
+      unit: options.unit,
+      unitPrice: options.unitPrice,
+      taxPercent: options.taxPercent,
+      paidValue: options.paidValue,
+      saleQuantity: options.saleQuantity,
+    }],
+    bonusPercent: options.bonusPercent,
+    maxCompanyLoss: options.maxCompanyLoss,
+    enabled: options.enabled,
+  });
+  const allocation = result.allocations[0];
+  return {
+    allowance: allocation.generatedValue,
+    bonusQuantity: allocation.bonusQuantity,
+    bonusCommercialValue: allocation.physicalValue,
+    marginUsed: result.marginUsed,
+  };
+};
+
 const calculateOrderLine = ({
   unit,
   unitPrice,
@@ -57,15 +127,6 @@ const calculateOrderLine = ({
 
     const hasSaleBonusPercent = saleBonusPercent !== null && saleBonusPercent !== undefined;
     const normalizedBonusPercent = Number(saleBonusPercent);
-    if (hasSaleBonusPercent && Number.isFinite(normalizedBonusPercent)) {
-      const convertedQuantity = (normalizedRequestedAmount * (1 + normalizedBonusPercent / 100)) / price;
-      if (Math.abs(convertedQuantity - Math.round(convertedQuantity)) >= 0.000001) {
-        throw new Error(
-          `con el ${roundMoney(normalizedBonusPercent).toLocaleString("es-CO")}% de vendaje, el valor debe producir unidades completas del producto`
-        );
-      }
-    }
-
     const rawQuantity = normalizedRequestedAmount / price;
     if (requireWholeUnitAmount && unit === "unit" && !Number.isInteger(rawQuantity)) {
       const lineLabel = type === "bonus"
@@ -218,6 +279,8 @@ module.exports = {
   calculateDeliveredCommission,
   calculateOrderLine,
   calculateOrderTotals,
+  calculateSaleBonus,
+  calculateSaleBonusOrder,
   normalizeCaptureMode,
   normalizeLineType,
   roundMoney,

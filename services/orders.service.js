@@ -5,10 +5,21 @@ const {
   calculateDeliveredCommission,
   calculateOrderLine,
   calculateOrderTotals,
+  calculateSaleBonus,
+  calculateSaleBonusOrder,
   normalizeLineType,
   roundMoney,
   validateBonusAllowance,
 } = require("../domain/sales-rules");
+const {
+  calculateRuleBoundBonusTotal,
+  calculateRuleBoundSaleFulfillmentTotal,
+  calculateRuleBoundSaleTotal,
+} = require("../domain/order-bonus-association");
+const {
+  buildOrderHistoryFilters,
+  normalizeOrderHistoryPagination,
+} = require("../domain/order-history-search");
 
 const isPastryCategoryName = (categoryName) => {
   return String(categoryName || "").toLowerCase().includes("pasteler");
@@ -69,76 +80,6 @@ const ensureCustomerCreditAccount = async (connection, customerId) => {
      VALUES (?, 0)`,
     [Number(customerId)]
   );
-};
-
-const calculateRuleBoundBonusTotal = (items) => {
-  const hasUiLineTypes = items.some((item) => item.uiLineType || item.ui_line_type);
-  if (hasUiLineTypes) {
-    return items.reduce((total, item) => (
-      (item.lineType || item.line_type) === "bonus"
-        && String(item.uiLineType || item.ui_line_type || "") === "sale_bonus"
-        ? total + Number(item.commercialValue || item.commercial_value || 0)
-        : total
-    ), 0);
-  }
-
-  const saleProductIds = new Set(
-    items
-      .filter((item) => (item.lineType || item.line_type) === "sale")
-      .map((item) => Number(item.productId || item.product_id || 0))
-  );
-  return items.reduce((total, item) => (
-    (item.lineType || item.line_type) === "bonus"
-      && saleProductIds.has(Number(item.productId || item.product_id || 0))
-      ? total + Number(item.commercialValue || item.commercial_value || 0)
-      : total
-  ), 0);
-};
-
-const calculateRuleBoundSaleTotal = (items) => {
-  const hasUiLineTypes = items.some((item) => item.uiLineType || item.ui_line_type);
-  if (hasUiLineTypes) {
-    return items.reduce((total, item) => (
-      (item.lineType || item.line_type) === "sale"
-        && String(item.uiLineType || item.ui_line_type || "") === "sale_bonus"
-        ? total + Number(item.lineTotal || item.line_total || 0)
-        : total
-    ), 0);
-  }
-
-  const bonusProductIds = new Set(
-    items
-      .filter((item) => (item.lineType || item.line_type) === "bonus")
-      .map((item) => Number(item.productId || item.product_id || 0))
-  );
-  return items.reduce((total, item) => (
-    (item.lineType || item.line_type) === "sale"
-      && bonusProductIds.has(Number(item.productId || item.product_id || 0))
-      ? total + Number(item.lineTotal || item.line_total || 0)
-      : total
-  ), 0);
-};
-
-const calculateRuleBoundSaleFulfillmentTotal = (items) => {
-  const hasUiLineTypes = items.some((item) => item.uiLineType || item.ui_line_type);
-  const bonusProductIds = new Set(
-    items
-      .filter((item) => (item.lineType || item.line_type) === "bonus")
-      .map((item) => Number(item.productId || item.product_id || 0))
-  );
-
-  return items.reduce((total, item) => {
-    const isRuleBoundSale = (item.lineType || item.line_type) === "sale"
-      && (hasUiLineTypes
-        ? String(item.uiLineType || item.ui_line_type || "") === "sale_bonus"
-        : bonusProductIds.has(Number(item.productId || item.product_id || 0)));
-    if (!isRuleBoundSale) return total;
-
-    const quantity = Number(item.quantity || 0);
-    const unitPrice = Number(item.unitPrice || item.unit_price || 0);
-    const taxPercent = Number(item.taxPercent || item.tax_percent || 0);
-    return total + quantity * unitPrice * (1 + taxPercent / 100);
-  }, 0);
 };
 
 const addCustomerCreditMovement = async (
@@ -266,44 +207,37 @@ const listOrders = async ({
   search,
   dateFrom,
   dateTo,
+  salesAgentUserId,
+  customerId,
+  productId,
+  includeCancelled,
   page,
   pageSize,
   actorUserId,
   canViewAll = false,
 }) => {
   const db = await connect();
-  const currentPage = Math.max(Number(page || 1), 1);
-  const currentPageSize = Math.min(Math.max(Number(pageSize || 20), 1), 500);
-  const offset = (currentPage - 1) * currentPageSize;
-  const filters = [];
-  const values = [];
-
-  if (!canViewAll) {
-    filters.push("o.sales_agent_user_id = ?");
-    values.push(Number(actorUserId || 0));
-  }
-
-  if (status) {
-    filters.push("o.status = ?");
-    values.push(status);
-  }
-
-  if (search) {
-    filters.push("(CAST(o.id AS CHAR) LIKE ? OR c.name LIKE ? OR seller.full_name LIKE ?)");
-    values.push(`%${search}%`, `%${search}%`, `%${search}%`);
-  }
-
-  if (dateFrom) {
-    filters.push("o.order_date >= ?");
-    values.push(String(dateFrom).slice(0, 10));
-  }
-
-  if (dateTo) {
-    filters.push("o.order_date <= ?");
-    values.push(String(dateTo).slice(0, 10));
-  }
-
-  const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const pagination = normalizeOrderHistoryPagination({ page, pageSize });
+  const { whereClause, values } = buildOrderHistoryFilters({
+    status,
+    search,
+    dateFrom,
+    dateTo,
+    salesAgentUserId,
+    customerId,
+    productId,
+    includeCancelled,
+    actorUserId,
+    canViewAll,
+  });
+  const [countRows] = await db.query(
+    `SELECT COUNT(*) AS total
+     FROM orders o
+     INNER JOIN customers c ON c.id = o.customer_id
+     LEFT JOIN users seller ON seller.id = o.sales_agent_user_id
+     ${whereClause}`,
+    values
+  );
   const [rows] = await db.query(
     `
       SELECT
@@ -328,6 +262,20 @@ const listOrders = async ({
         o.bonus_minimum_amount,
         o.seller_commission_percent,
         o.bonus_total,
+        ROUND(COALESCE((
+          SELECT SUM(sale_item.line_total) * o.bonus_percent / 100
+          FROM order_items sale_item
+          WHERE sale_item.order_id = o.id
+            AND sale_item.line_type = 'sale'
+            AND COALESCE(sale_item.commercial_mode, sale_item.line_type) = 'sale_bonus'
+        ), 0), 2) AS generated_bonus_total,
+        ROUND(COALESCE((
+          SELECT SUM(bonus_item.commercial_value)
+          FROM order_items bonus_item
+          WHERE bonus_item.order_id = o.id
+            AND bonus_item.line_type = 'bonus'
+            AND COALESCE(bonus_item.commercial_mode, bonus_item.line_type) = 'sale_bonus'
+        ), 0), 2) AS physical_bonus_total,
         o.gift_total,
         o.exchange_total,
         o.credit_redeemed_amount,
@@ -375,16 +323,24 @@ const listOrders = async ({
       ORDER BY o.created_at DESC, o.id DESC
       LIMIT ? OFFSET ?
     `,
-    [...values, currentPageSize, offset]
+    [...values, pagination.pageSize, pagination.offset]
   );
+
+  const responsePagination = normalizeOrderHistoryPagination({
+    page: pagination.page,
+    pageSize: pagination.pageSize,
+    total: countRows[0]?.total,
+  });
 
   return {
     code: 1,
     message: "pedidos listados",
     data: {
       items: rows,
-      page: currentPage,
-      pageSize: currentPageSize,
+      total: responsePagination.total,
+      page: responsePagination.page,
+      pageSize: responsePagination.pageSize,
+      totalPages: responsePagination.totalPages,
     },
   };
 };
@@ -403,6 +359,7 @@ const listOrderItems = async ({ orderId }) => {
         p.unit AS product_unit,
         p.includes_bonus,
         oi.line_type,
+        COALESCE(oi.commercial_mode, oi.line_type) AS commercial_mode,
         oi.capture_mode,
         oi.requested_amount,
         oi.quantity,
@@ -921,20 +878,7 @@ const listOrderBaseData = async ({
     "c.status = 'active'",
   ];
   const customerValues = [];
-  const requestedSellerId = Number(salesAgentUserId || 0);
-
-  if (canViewAllCustomers && requestedSellerId > 0) {
-    customerFilters.push(
-      `EXISTS (
-        SELECT 1
-        FROM seller_customer_assignments sca
-        WHERE sca.customer_id = c.id
-          AND sca.sales_agent_user_id = ?
-          AND sca.is_active = 1
-      )`
-    );
-    customerValues.push(requestedSellerId);
-  } else if (!canViewAllCustomers) {
+  if (!canViewAllCustomers) {
     customerFilters.push(
       `EXISTS (
         SELECT 1
@@ -1531,11 +1475,42 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
       : Number(actorUserId || 0);
     const orderDate = payload.p_order_date || null;
     const deliveryDate = payload.p_delivery_date || null;
+    const clientRequestKey = String(payload.p_client_request_key || "").trim() || null;
     const db = await connect();
     const connection = await db.getConnection();
+    let createdOrderId = null;
+    let orderWasCommitted = false;
 
     try {
       await connection.beginTransaction();
+      if (clientRequestKey) {
+        const [existingOrders] = await connection.query(
+          `SELECT
+             o.id,
+             o.status,
+             EXISTS(SELECT 1 FROM sales_commissions sc WHERE sc.order_id = o.id) AS has_commission
+           FROM orders o
+           WHERE o.client_request_key = ?
+             AND o.sales_agent_user_id = ?
+           LIMIT 1`,
+          [clientRequestKey, salesAgentUserId]
+        );
+        if (existingOrders.length) {
+          await connection.rollback();
+          const existing = existingOrders[0];
+          return {
+            code: 1,
+            message: `El pedido #${existing.id} ya estaba guardado`,
+            data: {
+              order_id: Number(existing.id),
+              status: existing.status,
+              order_created: true,
+              duplicate_prevented: true,
+              operational_pending: Number(existing.has_commission || 0) === 0,
+            },
+          };
+        }
+      }
       if (!branchId || !customerId || !salesAgentUserId || !orderDate) {
         await connection.rollback();
         return { code: 0, message: "sucursal, vendedor, cliente y fecha son obligatorios", data: null };
@@ -1562,25 +1537,34 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         return { code: 0, message: "sucursal no encontrada o inactiva", data: null };
       }
 
+      const customerAccessClause = canViewAllCustomers
+        ? ""
+        : `AND EXISTS (
+             SELECT 1
+             FROM seller_customer_assignments sca
+             WHERE sca.customer_id = c.id
+               AND sca.sales_agent_user_id = ?
+               AND sca.is_active = 1
+           )`;
       const [customers] = await connection.query(
         `SELECT c.id
          FROM customers c
          WHERE c.id = ?
            AND c.status = 'active'
            AND c.deleted_at IS NULL
-           AND EXISTS (
-             SELECT 1
-             FROM seller_customer_assignments sca
-             WHERE sca.customer_id = c.id
-               AND sca.sales_agent_user_id = ?
-               AND sca.is_active = 1
-           )
+           ${customerAccessClause}
          LIMIT 1`,
-        [customerId, salesAgentUserId]
+        canViewAllCustomers ? [customerId] : [customerId, salesAgentUserId]
       );
       if (!customers.length) {
         await connection.rollback();
-        return { code: 0, message: "cliente no asignado al vendedor o inactivo", data: null };
+        return {
+          code: 0,
+          message: canViewAllCustomers
+            ? "cliente no encontrado o inactivo"
+            : "cliente no asignado al vendedor o inactivo",
+          data: null,
+        };
       }
 
       const [settingsRows] = await connection.query(
@@ -1638,6 +1622,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
             productId,
             lineGroupKey: String(item.line_group_key || item.p_line_group_key || `line-${normalizedItems.length + 1}`),
             categoryName: products[0].category_name || null,
+            unit: products[0].unit,
             uiLineType,
             ...calculateOrderLine({
               unit: products[0].unit,
@@ -1657,6 +1642,54 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           await connection.rollback();
           return { code: 0, message: error.message, data: null };
         }
+      }
+
+      const saleBonusSales = normalizedItems.filter((item) => (
+        item.lineType === "sale" && item.uiLineType === "sale_bonus"
+      ));
+      if (saleBonusSales.length) {
+        const eligibleSaleTotal = normalizedItems.reduce((total, item) => (
+          item.lineType === "sale" && !isPastryCategoryName(item.categoryName)
+            ? total + Number(item.lineTotal || 0)
+            : total
+        ), 0);
+        const officialBonus = calculateSaleBonusOrder({
+          lines: saleBonusSales.map((item) => ({
+            key: item.lineGroupKey,
+            unit: item.unit,
+            unitPrice: item.unitPrice,
+            taxPercent: item.taxPercent,
+            paidValue: item.lineTotal,
+            saleQuantity: item.quantity,
+          })),
+          bonusPercent: settings.bonus_percent,
+          maxCompanyLoss: settings.bonus_max_company_loss_amount,
+          enabled: eligibleSaleTotal >= Number(settings.bonus_minimum_amount || 0),
+        });
+        normalizedItems = normalizedItems.filter((item) => !(
+          item.lineType === "bonus" && item.uiLineType === "sale_bonus"
+        ));
+        officialBonus.allocations.forEach((allocation) => {
+          if (allocation.bonusQuantity <= 0) return;
+          const sale = saleBonusSales.find((item) => item.lineGroupKey === allocation.key);
+          normalizedItems.push({
+            productId: sale.productId,
+            lineGroupKey: sale.lineGroupKey,
+            categoryName: sale.categoryName,
+            unit: sale.unit,
+            uiLineType: "sale_bonus",
+            lineType: "bonus",
+            captureMode: "quantity",
+            requestedAmount: null,
+            quantity: allocation.bonusQuantity,
+            unitPrice: sale.unitPrice,
+            taxPercent: sale.taxPercent,
+            lineSubtotal: 0,
+            lineTax: 0,
+            lineTotal: 0,
+            commercialValue: allocation.physicalValue,
+          });
+        });
       }
 
       const [sellers] = await connection.query(
@@ -1719,9 +1752,10 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
            branch_id, customer_id, sales_agent_user_id, route_id,
            order_date, delivery_date, status, subtotal, tax_total, grand_total,
            bonus_percent, bonus_minimum_amount, bonus_max_company_loss_amount, seller_commission_percent,
-           bonus_total, gift_total, exchange_total, credit_redeemed_amount, notes, created_by
+           bonus_total, gift_total, exchange_total, credit_redeemed_amount, notes, created_by,
+           client_request_key
          )
-         VALUES (?, ?, ?, NULL, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, NULL, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           branchId,
           customerId,
@@ -1741,23 +1775,26 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           creditRedeemedAmount,
           payload.p_notes || null,
           actorUserId || null,
+          clientRequestKey,
         ]
       );
       const orderId = Number(orderResult.insertId);
+      createdOrderId = orderId;
 
       for (const item of normalizedItems) {
         await connection.query(
           `INSERT INTO order_items (
-             order_id, product_id, line_group_key, line_type, capture_mode, requested_amount,
+             order_id, product_id, line_group_key, line_type, commercial_mode, capture_mode, requested_amount,
              quantity, unit_price, tax_percent, line_subtotal, line_tax,
              line_total, commercial_value
            )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             orderId,
             item.productId,
             item.lineGroupKey,
             item.lineType,
+            item.uiLineType || item.lineType,
             item.captureMode,
             item.requestedAmount,
             item.quantity,
@@ -1793,6 +1830,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         grandTotal: totals.grandTotal,
       });
       await connection.commit();
+      orderWasCommitted = true;
       const operationalResult = await confirmOrder(
         { p_order_id: orderId },
         actorUserId,
@@ -1801,8 +1839,13 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
       if (operationalResult.code !== 1) {
         return {
           code: 0,
-          message: `el pedido se guardo en borrador, pero no pudieron aplicarse sus movimientos: ${operationalResult.message}`,
-          data: { order_id: orderId, status: "draft" },
+          message: `Pedido #${orderId} guardado con movimientos pendientes: ${operationalResult.message}`,
+          data: {
+            order_id: orderId,
+            status: operationalResult.data?.status || "draft",
+            order_created: true,
+            operational_pending: true,
+          },
         };
       }
       return {
@@ -1816,7 +1859,47 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         },
       };
     } catch (error) {
-      await connection.rollback();
+      if (!orderWasCommitted) {
+        await connection.rollback();
+      }
+      if (!orderWasCommitted && clientRequestKey && error?.code === "ER_DUP_ENTRY") {
+        const [existingOrders] = await connection.query(
+          `SELECT
+             o.id,
+             o.status,
+             EXISTS(SELECT 1 FROM sales_commissions sc WHERE sc.order_id = o.id) AS has_commission
+           FROM orders o
+           WHERE o.client_request_key = ?
+             AND o.sales_agent_user_id = ?
+           LIMIT 1`,
+          [clientRequestKey, salesAgentUserId]
+        );
+        if (existingOrders.length) {
+          const existing = existingOrders[0];
+          return {
+            code: 1,
+            message: `El pedido #${existing.id} ya estaba guardado`,
+            data: {
+              order_id: Number(existing.id),
+              status: existing.status,
+              order_created: true,
+              duplicate_prevented: true,
+              operational_pending: Number(existing.has_commission || 0) === 0,
+            },
+          };
+        }
+      }
+      if (orderWasCommitted && createdOrderId) {
+        return {
+          code: 0,
+          message: `Pedido #${createdOrderId} guardado con movimientos pendientes: ${error.message}`,
+          data: {
+            order_id: createdOrderId,
+            order_created: true,
+            operational_pending: true,
+          },
+        };
+      }
       throw error;
     } finally {
       connection.release();
@@ -1893,6 +1976,7 @@ const getOrderPrintData = async ({
        p.includes_bonus,
        pc.name AS category_name,
        oi.line_type,
+       COALESCE(oi.commercial_mode, oi.line_type) AS commercial_mode,
        oi.capture_mode,
        oi.requested_amount,
        oi.quantity,
@@ -2110,6 +2194,121 @@ const recalculateDeliveredOrderCommission = async ({ connection, orderId, order,
 
   return deliveredCommission;
 };
+
+const retryOrderOperations = async ({ orderId, actorUserId, canViewAll = false }) => {
+  const normalizedOrderId = Number(orderId || 0);
+  if (!Number.isInteger(normalizedOrderId) || normalizedOrderId <= 0) {
+    return { code: 0, message: "pedido invalido", data: null };
+  }
+
+  const db = await connect();
+  const [rows] = await db.query(
+    `SELECT
+       o.id,
+       o.status,
+       o.sales_agent_user_id,
+       EXISTS(SELECT 1 FROM sales_commissions sc WHERE sc.order_id = o.id) AS has_commission
+     FROM orders o
+     WHERE o.id = ?
+       AND (? = 1 OR o.sales_agent_user_id = ?)
+     LIMIT 1`,
+    [normalizedOrderId, canViewAll ? 1 : 0, Number(actorUserId || 0)]
+  );
+
+  if (!rows.length) {
+    return { code: 0, message: "pedido no encontrado o sin acceso", data: null };
+  }
+
+  const order = rows[0];
+  if (order.status === "cancelled") {
+    return { code: 0, message: "un pedido cancelado no puede reintentar movimientos", data: null };
+  }
+  if (order.status === "draft" && Number(order.has_commission || 0) > 0) {
+    return {
+      code: 1,
+      message: `Los movimientos del pedido #${normalizedOrderId} ya estaban aplicados`,
+      data: { order_id: normalizedOrderId, status: "draft", operational_pending: false },
+    };
+  }
+
+  if (order.status === "draft") {
+    const result = await confirmOrder(
+      { p_order_id: normalizedOrderId },
+      actorUserId,
+      { retainDraftStatus: true }
+    );
+    return result.code === 1
+      ? {
+          code: 1,
+          message: `Movimientos del pedido #${normalizedOrderId} aplicados correctamente`,
+          data: { ...result.data, order_id: normalizedOrderId, operational_pending: false },
+        }
+      : {
+          ...result,
+          message: `Pedido #${normalizedOrderId} continúa con movimientos pendientes: ${result.message}`,
+          data: { ...(result.data || {}), order_id: normalizedOrderId, operational_pending: true },
+        };
+  }
+
+  let currentStatus = order.status;
+  if (["confirmed", "ready", "in_production"].includes(currentStatus)) {
+    const dispatchResult = await dispatchOrder({ p_order_id: normalizedOrderId }, actorUserId);
+    if (dispatchResult.code !== 1) {
+      return {
+        ...dispatchResult,
+        message: `Pedido #${normalizedOrderId} continúa con movimientos pendientes: ${dispatchResult.message}`,
+        data: { ...(dispatchResult.data || {}), order_id: normalizedOrderId, operational_pending: true },
+      };
+    }
+    currentStatus = "dispatched";
+  }
+
+  if (currentStatus === "dispatched") {
+    const deliveryResult = await deliverOrder({ p_order_id: normalizedOrderId }, actorUserId);
+    if (deliveryResult.code !== 1) {
+      return {
+        ...deliveryResult,
+        message: `Pedido #${normalizedOrderId} continúa con movimientos pendientes: ${deliveryResult.message}`,
+        data: { ...(deliveryResult.data || {}), order_id: normalizedOrderId, operational_pending: true },
+      };
+    }
+    await db.query(
+      "UPDATE orders SET status = 'draft', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'delivered'",
+      [normalizedOrderId]
+    );
+    await db.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'order.retry_operations', 'orders', ?, JSON_OBJECT(
+         'operational_pending', false,
+         'restored_status', 'draft'
+       ))`,
+      [actorUserId || null, String(normalizedOrderId)]
+    );
+    currentStatus = "draft";
+  }
+
+  if (currentStatus === "delivered") {
+    return {
+      code: 1,
+      message: `Los movimientos del pedido #${normalizedOrderId} ya estaban aplicados`,
+      data: { order_id: normalizedOrderId, status: currentStatus, operational_pending: false },
+    };
+  }
+
+  if (currentStatus !== "draft") {
+    return {
+      code: 0,
+      message: `el pedido no puede reintentar movimientos desde el estado ${currentStatus}`,
+      data: { order_id: normalizedOrderId, status: currentStatus, operational_pending: true },
+    };
+  }
+
+  return {
+    code: 1,
+    message: `Movimientos del pedido #${normalizedOrderId} aplicados correctamente`,
+    data: { order_id: normalizedOrderId, status: "draft", operational_pending: false },
+  };
+};
 const upsertOrderItem = async (payload, actorUserId) => {
   const orderId = Number(payload.p_order_id || 0);
   const orderItemId = Number(payload.p_order_item_id || 0);
@@ -2199,10 +2398,77 @@ const upsertOrderItem = async (payload, actorUserId) => {
       previousCommitment = commitmentRows[0] || null;
     }
 
+    const [previousBonusRows] = await connection.query(
+      `SELECT
+         oi.id,
+         oi.quantity,
+         COALESCE((
+           SELECT SUM(psr.delivered_quantity)
+           FROM production_sale_reservations psr
+           WHERE psr.order_item_id = oi.id AND psr.status = 'delivered'
+         ), 0) AS directly_delivered_quantity,
+         COALESCE((
+           SELECT COUNT(*)
+           FROM production_sale_reservations psr
+           WHERE psr.order_item_id = oi.id
+             AND psr.status IN ('reserved', 'partially_delivered', 'delivered')
+         ), 0) AS reservation_count,
+         COALESCE((
+           SELECT SUM(psr.quantity)
+           FROM production_sale_reservations psr
+           WHERE psr.order_item_id = oi.id
+             AND psr.status IN ('reserved', 'partially_delivered', 'delivered')
+         ), 0) AS reserved_quantity
+       FROM order_items oi
+       WHERE oi.order_id = ?
+         AND oi.line_group_key = ?
+         AND oi.line_type = 'bonus'
+       LIMIT 1
+       FOR UPDATE`,
+      [orderId, lineGroupKey]
+    );
+    const previousBonusItem = previousBonusRows[0] || null;
+    const previousBonusIsPrimary = Number(previousBonusItem?.id || 0) > 0
+      && Number(previousBonusItem.id) === Number(previousItem?.id || 0);
+    const previousBonusStockQuantity = previousBonusItem && !previousBonusIsPrimary
+      ? Math.max(Number(previousBonusItem.quantity || 0) - Number(previousBonusItem.directly_delivered_quantity || 0), 0)
+      : 0;
+    let previousBonusCommitment = null;
+    if (previousBonusItem?.id && !previousBonusIsPrimary) {
+      const [bonusCommitmentRows] = await connection.query(
+        `SELECT id, committed_quantity, applied_quantity, status
+         FROM product_sale_inventory_commitments
+         WHERE order_item_id = ?
+         FOR UPDATE`,
+        [Number(previousBonusItem.id)]
+      );
+      previousBonusCommitment = bonusCommitmentRows[0] || null;
+    }
+
     const wantsRemoval =
       payload.p_remove === true ||
       (String(payload.p_capture_mode || "quantity") === "quantity" &&
         Number(payload.p_quantity || 0) <= 0);
+    const wantsSaleBonus = !wantsRemoval
+      && lineType === "sale"
+      && String(payload.p_ui_line_type || "") === "sale_bonus";
+    const mutatesSaleGroup = lineType === "sale" || previousLineType === "sale";
+    const touchesAssociatedBonus = mutatesSaleGroup && (Boolean(previousBonusItem) || wantsSaleBonus);
+
+    if (mutatesSaleGroup && previousBonusItem && !wantsSaleBonus) {
+      if (Number(previousBonusItem.reservation_count || 0) > 0) {
+        await connection.rollback();
+        return {
+          code: 0,
+          message: "no puedes retirar el vendaje porque tiene reservas o entregas desde produccion",
+          data: null,
+        };
+      }
+      await connection.query(
+        "DELETE FROM order_items WHERE id = ? AND order_id = ?",
+        [Number(previousBonusItem.id), orderId]
+      );
+    }
 
     if (wantsRemoval) {
       const [reservationRows] = await connection.query(
@@ -2324,12 +2590,13 @@ const upsertOrderItem = async (payload, actorUserId) => {
 
       await connection.query(
         `INSERT INTO order_items (
-           order_id, product_id, line_group_key, line_type, capture_mode, requested_amount,
+           order_id, product_id, line_group_key, line_type, commercial_mode, capture_mode, requested_amount,
            quantity, unit_price, tax_percent, line_subtotal, line_tax,
            line_total, commercial_value
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
+           commercial_mode = VALUES(commercial_mode),
            capture_mode = VALUES(capture_mode),
            requested_amount = VALUES(requested_amount),
            quantity = VALUES(quantity),
@@ -2344,6 +2611,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
           productId,
           lineGroupKey,
           calculated.lineType,
+          String(payload.p_ui_line_type || calculated.lineType),
           calculated.captureMode,
           calculated.requestedAmount,
           calculated.quantity,
@@ -2355,6 +2623,119 @@ const upsertOrderItem = async (payload, actorUserId) => {
           calculated.commercialValue,
         ]
       );
+
+      if (wantsSaleBonus) {
+        const [eligibleTotalRows] = await connection.query(
+          `SELECT COALESCE(SUM(oi.line_total), 0) AS eligible_total
+           FROM order_items oi
+           INNER JOIN products eligible_product ON eligible_product.id = oi.product_id
+           LEFT JOIN product_categories eligible_category ON eligible_category.id = eligible_product.category_id
+           WHERE oi.order_id = ?
+             AND oi.line_type = 'sale'
+             AND LOWER(COALESCE(eligible_category.name, '')) NOT LIKE '%pasteler%'`,
+          [orderId]
+        );
+        const [otherRoundedBonusRows] = await connection.query(
+          `SELECT
+             sale.line_total AS paid_value,
+             sale.quantity AS sale_quantity,
+             sale.unit_price,
+             sale.tax_percent,
+             bonus.quantity AS bonus_quantity
+           FROM order_items sale
+           INNER JOIN order_items bonus
+             ON bonus.order_id = sale.order_id
+            AND bonus.line_group_key = sale.line_group_key
+            AND bonus.line_type = 'bonus'
+           WHERE sale.order_id = ?
+             AND sale.line_type = 'sale'
+             AND sale.line_group_key <> ?`,
+          [orderId, lineGroupKey]
+        );
+        const marginAlreadyUsed = otherRoundedBonusRows.reduce((total, row) => {
+          const commercialUnitPrice = Number(row.unit_price || 0) * (1 + Number(row.tax_percent || 0) / 100);
+          const availableValue = Number(row.paid_value || 0)
+            * (1 + Number(orders[0].bonus_percent || 0) / 100);
+          const physicalTotal = (Number(row.sale_quantity || 0) + Number(row.bonus_quantity || 0))
+            * commercialUnitPrice;
+          return total + Math.max(roundMoney(physicalTotal - availableValue), 0);
+        }, 0);
+        const saleBonus = calculateSaleBonus({
+          unit: products[0].unit,
+          unitPrice: calculated.unitPrice,
+          taxPercent: calculated.taxPercent,
+          paidValue: calculated.lineTotal,
+          saleQuantity: calculated.quantity,
+          bonusPercent: orders[0].bonus_percent,
+          maxCompanyLoss: Math.max(
+            Number(orders[0].bonus_max_company_loss_amount || 0) - marginAlreadyUsed,
+            0
+          ),
+          enabled: Number(eligibleTotalRows[0]?.eligible_total || 0) >= Number(orders[0].bonus_minimum_amount || 0),
+        });
+
+        if (saleBonus.bonusQuantity < Number(previousBonusItem?.reserved_quantity || 0)) {
+          await connection.rollback();
+          return {
+            code: 0,
+            message: "el vendaje calculado no puede ser menor que lo reservado o entregado desde produccion",
+            data: null,
+          };
+        }
+
+        if (saleBonus.bonusQuantity > 0) {
+          const bonusCalculated = calculateOrderLine({
+            unit: products[0].unit,
+            unitPrice: products[0].base_price,
+            taxPercent: products[0].rate_percent,
+            lineType: "bonus",
+            captureMode: "quantity",
+            quantity: saleBonus.bonusQuantity,
+            requireWholeUnitAmount: true,
+          });
+          await connection.query(
+            `INSERT INTO order_items (
+               order_id, product_id, line_group_key, line_type, commercial_mode, capture_mode, requested_amount,
+               quantity, unit_price, tax_percent, line_subtotal, line_tax,
+               line_total, commercial_value
+             ) VALUES (?, ?, ?, 'bonus', 'sale_bonus', 'quantity', NULL, ?, ?, ?, 0, 0, 0, ?)
+             ON DUPLICATE KEY UPDATE
+               product_id = VALUES(product_id),
+               commercial_mode = 'sale_bonus',
+               capture_mode = VALUES(capture_mode),
+               requested_amount = NULL,
+               quantity = VALUES(quantity),
+               unit_price = VALUES(unit_price),
+               tax_percent = VALUES(tax_percent),
+               line_subtotal = 0,
+               line_tax = 0,
+               line_total = 0,
+               commercial_value = VALUES(commercial_value)`,
+            [
+              orderId,
+              productId,
+              lineGroupKey,
+              bonusCalculated.quantity,
+              bonusCalculated.unitPrice,
+              bonusCalculated.taxPercent,
+              bonusCalculated.commercialValue,
+            ]
+          );
+        } else if (previousBonusItem) {
+          if (Number(previousBonusItem.reservation_count || 0) > 0) {
+            await connection.rollback();
+            return {
+              code: 0,
+              message: "el nuevo valor retiraria un vendaje que ya tiene reservas o entregas",
+              data: null,
+            };
+          }
+          await connection.query(
+            "DELETE FROM order_items WHERE id = ? AND order_id = ?",
+            [Number(previousBonusItem.id), orderId]
+          );
+        }
+      }
     }
 
     if (["dispatched", "delivered"].includes(orders[0].status) || hasOperationalEffects) {
@@ -2438,11 +2819,94 @@ const upsertOrderItem = async (payload, actorUserId) => {
           ]
         );
       }
+
+      if (touchesAssociatedBonus) {
+        const [currentBonusRows] = await connection.query(
+          `SELECT
+             oi.id,
+             oi.quantity,
+             COALESCE((
+               SELECT SUM(psr.delivered_quantity)
+               FROM production_sale_reservations psr
+               WHERE psr.order_item_id = oi.id AND psr.status = 'delivered'
+             ), 0) AS directly_delivered_quantity
+           FROM order_items oi
+           WHERE oi.order_id = ?
+             AND oi.line_group_key = ?
+             AND oi.line_type = 'bonus'
+           LIMIT 1
+           FOR UPDATE`,
+          [orderId, lineGroupKey]
+        );
+        const currentBonusItem = currentBonusRows[0] || null;
+        const currentBonusStockQuantity = currentBonusItem
+          ? Math.max(Number(currentBonusItem.quantity || 0) - Number(currentBonusItem.directly_delivered_quantity || 0), 0)
+          : 0;
+        const bonusStockDifference = Number((currentBonusStockQuantity - previousBonusStockQuantity).toFixed(3));
+        const bonusInventoryWasApplied = previousBonusCommitment
+          ? previousBonusCommitment.status === "applied"
+          : true;
+
+        if (bonusInventoryWasApplied && bonusStockDifference !== 0) {
+          await connection.query(
+            `INSERT IGNORE INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
+             VALUES (?, ?, 0, 0)`,
+            [Number(orders[0].branch_id), productId]
+          );
+          await connection.query(
+            `UPDATE stock_products
+             SET quantity_on_hand = quantity_on_hand - ?, updated_at = CURRENT_TIMESTAMP
+             WHERE branch_id = ? AND product_id = ?`,
+            [bonusStockDifference, Number(orders[0].branch_id), productId]
+          );
+          await connection.query(
+            `INSERT INTO inventory_movements (
+               branch_id, item_type, raw_material_id, product_id, movement_type,
+               quantity, unit_cost, reference_type, reference_id, notes, created_by
+             ) VALUES (?, 'product', NULL, ?, ?, ?, NULL, 'order', ?, ?, ?)`,
+            [
+              Number(orders[0].branch_id),
+              productId,
+              bonusStockDifference > 0 ? "sale_out" : "adjustment_in",
+              Math.abs(bonusStockDifference),
+              orderId,
+              `Conciliacion de vendaje por edicion de pedido despachado #${orderId}`,
+              actorUserId || null,
+            ]
+          );
+        }
+
+        if (currentBonusItem?.id) {
+          await connection.query(
+            `INSERT INTO product_sale_inventory_commitments (
+               order_id, order_item_id, branch_id, product_id, committed_quantity,
+               applied_quantity, status, applied_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+               committed_quantity = VALUES(committed_quantity),
+               applied_quantity = VALUES(applied_quantity),
+               status = VALUES(status),
+               applied_at = VALUES(applied_at),
+               updated_at = CURRENT_TIMESTAMP`,
+            [
+              orderId,
+              Number(currentBonusItem.id),
+              Number(orders[0].branch_id),
+              productId,
+              currentBonusStockQuantity,
+              bonusInventoryWasApplied ? currentBonusStockQuantity : 0,
+              bonusInventoryWasApplied ? "applied" : "pending",
+              bonusInventoryWasApplied ? new Date() : null,
+            ]
+          );
+        }
+      }
     }
 
     const [itemRows] = await connection.query(
       `SELECT
          oi.product_id,
+         oi.line_group_key,
          oi.line_type,
          oi.line_subtotal,
          oi.line_tax,
@@ -2640,6 +3104,7 @@ const confirmOrder = async (payload, actorUserId, { retainDraftStatus = false } 
     const [items] = await connection.query(
       `SELECT
          oi.product_id,
+         oi.line_group_key,
          oi.line_type,
          oi.line_subtotal,
          oi.line_tax,
@@ -3368,23 +3833,37 @@ const updateOrderCustomer = async ({ orderId, customerId, actorUserId, canViewAl
       return { code: 0, message: "el pedido no tiene un vendedor asignado", data: null };
     }
 
+    const customerAccessClause = canViewAll
+      ? ""
+      : `AND EXISTS (
+           SELECT 1
+           FROM seller_customer_assignments sca
+           WHERE sca.customer_id = c.id
+             AND sca.sales_agent_user_id = ?
+             AND sca.is_active = 1
+         )`;
     const [customers] = await connection.query(
       `SELECT c.id, c.name, c.tax_id, c.phone, c.address, c.neighborhood
        FROM customers c
-       INNER JOIN seller_customer_assignments sca
-         ON sca.customer_id = c.id
-        AND sca.sales_agent_user_id = ?
-        AND sca.is_active = 1
        WHERE c.id = ?
          AND c.status = 'active'
          AND c.deleted_at IS NULL
+         ${customerAccessClause}
        LIMIT 1`,
-      [Number(order.sales_agent_user_id), normalizedCustomerId]
+      canViewAll
+        ? [normalizedCustomerId]
+        : [normalizedCustomerId, Number(order.sales_agent_user_id)]
     );
 
     if (!customers.length) {
       await connection.rollback();
-      return { code: 0, message: "el cliente no esta asignado al vendedor del pedido", data: null };
+      return {
+        code: 0,
+        message: canViewAll
+          ? "el cliente seleccionado no esta activo"
+          : "el cliente no esta asignado al vendedor del pedido",
+        data: null,
+      };
     }
 
     if (Number(order.customer_id) !== normalizedCustomerId) {
@@ -5242,6 +5721,7 @@ module.exports = {
   getSalesSettings,
   updateSalesSettings,
   createOrder,
+  retryOrderOperations,
   getOrderPrintData,
   confirmOrderPrint,
   upsertOrderItem,
