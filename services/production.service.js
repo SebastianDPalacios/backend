@@ -766,9 +766,28 @@ const findActiveBakerForUser = async (dbOrConnection, userId) => {
   return rows[0] || null;
 };
 
-const listMyProductionBaseData = async ({ userId } = {}) => {
+const listActiveBakers = async (dbOrConnection) => {
+  const [rows] = await dbOrConnection.query(
+    `SELECT
+       e.id,
+       e.user_id,
+       COALESCE(u.full_name, e.employee_code, CONCAT('Panadero #', e.id)) AS name
+     FROM employees e
+     LEFT JOIN users u ON u.id = e.user_id
+     WHERE e.job_type = 'baker'
+       AND e.status = 'active'
+       AND e.deleted_at IS NULL
+     ORDER BY name, e.id`
+  );
+  return rows;
+};
+
+const listMyProductionBaseData = async ({ userId, bakerEmployeeId, canManageAll = false } = {}) => {
   const db = await connect();
-  const baker = await findActiveBakerForUser(db, userId);
+  const bakers = canManageAll ? await listActiveBakers(db) : [];
+  const baker = canManageAll
+    ? bakers.find((item) => Number(item.id) === Number(bakerEmployeeId)) || null
+    : await findActiveBakerForUser(db, userId);
 
   const [branches] = await db.query(
     `
@@ -891,6 +910,8 @@ const listMyProductionBaseData = async ({ userId } = {}) => {
     message: 'datos de produccion del panadero obtenidos',
     data: {
       baker,
+      bakers: canManageAll ? bakers : (baker ? [baker] : []),
+      can_manage_all_bakers: Boolean(canManageAll),
       branches,
       recipes: recipes.map((recipe) => ({
         ...recipe,
@@ -901,14 +922,22 @@ const listMyProductionBaseData = async ({ userId } = {}) => {
   };
 };
 
-const registerMyProductionBatch = async (payload, actorUserId) => {
+const registerMyProductionBatch = async (payload, actorUserId, { canManageAll = false } = {}) => {
   const db = await connect();
-  const baker = await findActiveBakerForUser(db, actorUserId);
+  let baker = null;
+  if (canManageAll) {
+    const bakers = await listActiveBakers(db);
+    baker = bakers.find((item) => Number(item.id) === Number(payload?.p_baker_employee_id)) || null;
+  } else {
+    baker = await findActiveBakerForUser(db, actorUserId);
+  }
 
   if (!baker) {
     return {
       code: 0,
-      message: 'Tu usuario no tiene un empleado panadero activo asociado.',
+      message: canManageAll
+        ? 'Selecciona un panadero activo para registrar la produccion.'
+        : 'Tu usuario no tiene un empleado panadero activo asociado.',
       data: null,
     };
   }

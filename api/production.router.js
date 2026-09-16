@@ -46,6 +46,13 @@ const canManageProduction = requirePermission("production.manage");
 const canRegisterBakerProduction = requirePermission("production.baker", "production.manage");
 const canRegisterPackaging = requirePermission("production.packaging", "production.manage");
 const canViewIngredientUsage = requirePermission("production.baker", "production.manage");
+const isProductionAdministrator = (user = {}) => {
+  const roles = Array.isArray(user.roles) ? user.roles : [];
+  const permissions = Array.isArray(user.permissions) ? user.permissions : [];
+  const codes = (items) => items.map((item) => typeof item === "string" ? item : item?.code || item?.permission_code || item?.name);
+  return codes(roles).some((code) => ["ADMIN", "SUPER_ADMIN"].includes(code))
+    || codes(permissions).includes("production.manage");
+};
 
 router.get("/plans", verifyToken, canManageProduction, async (req, res, next) => {
   try {
@@ -70,8 +77,10 @@ router.post("/plans", verifyToken, canManageProduction, async (req, res, next) =
 
 router.get("/my-plans", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
   try {
+    const canManageAll = isProductionAdministrator(req.user);
     const result = await listProductionPlans({
-      userId: req.user.userId,
+      userId: canManageAll ? undefined : req.user.userId,
+      bakerEmployeeId: canManageAll ? (req.query.bakerEmployeeId || req.query.baker_employee_id) : undefined,
       plannedDate: req.query.plannedDate || req.query.planned_date,
       dateFrom: req.query.dateFrom || req.query.date_from,
       dateTo: req.query.dateTo || req.query.date_to,
@@ -84,7 +93,11 @@ router.get("/my-plans", verifyToken, canRegisterBakerProduction, async (req, res
 
 router.get("/my-base-data", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
   try {
-    const result = await listMyProductionBaseData({ userId: req.user.userId });
+    const result = await listMyProductionBaseData({
+      userId: req.user.userId,
+      bakerEmployeeId: req.query.bakerEmployeeId || req.query.baker_employee_id,
+      canManageAll: isProductionAdministrator(req.user),
+    });
     res.json(result);
   } catch (error) {
     next(error);
@@ -111,7 +124,9 @@ router.post("/plans/:id/cancel", verifyToken, canManageProduction, async (req, r
 
 router.post("/my-batches", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
   try {
-    const result = await registerMyProductionBatch(req.body, req.user.userId);
+    const result = await registerMyProductionBatch(req.body, req.user.userId, {
+      canManageAll: isProductionAdministrator(req.user),
+    });
     res.json(result);
   } catch (error) {
     next(error);
