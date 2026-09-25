@@ -1,9 +1,10 @@
 const { connect } = require("../data-access");
+const { getOperationalMonth } = require("../domain/operational-date");
 
 const toMonthRange = (month) => {
   const selectedMonth = /^\d{4}-\d{2}$/.test(String(month || ""))
     ? String(month)
-    : new Date().toISOString().slice(0, 7);
+    : getOperationalMonth();
   const [year, monthNumber] = selectedMonth.split("-").map((value) => Number(value));
   const lastDay = new Date(year, monthNumber, 0).getDate();
 

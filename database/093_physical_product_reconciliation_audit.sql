@@ -1,0 +1,23 @@
+CREATE TABLE IF NOT EXISTS physical_product_reconciliations (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  commercial_product_id BIGINT UNSIGNED NOT NULL,
+  physical_product_id BIGINT UNSIGNED NOT NULL,
+  branch_id BIGINT UNSIGNED NOT NULL,
+  previous_physical_product_id BIGINT UNSIGNED NULL,
+  commercial_stock_before DECIMAL(14,3) NOT NULL DEFAULT 0,
+  physical_stock_before DECIMAL(14,3) NOT NULL DEFAULT 0,
+  confirmed_physical_stock DECIMAL(14,3) NOT NULL,
+  inventory_delta DECIMAL(14,3) NOT NULL DEFAULT 0,
+  backup_before_json JSON NOT NULL,
+  result_after_json JSON NOT NULL,
+  reason VARCHAR(500) NULL,
+  approved_by BIGINT UNSIGNED NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_physical_reconciliation_products (commercial_product_id, physical_product_id, created_at),
+  KEY idx_physical_reconciliation_branch (branch_id, created_at),
+  CONSTRAINT fk_physical_reconciliation_commercial FOREIGN KEY (commercial_product_id) REFERENCES products (id),
+  CONSTRAINT fk_physical_reconciliation_physical FOREIGN KEY (physical_product_id) REFERENCES products (id),
+  CONSTRAINT fk_physical_reconciliation_branch FOREIGN KEY (branch_id) REFERENCES branches (id),
+  CONSTRAINT fk_physical_reconciliation_actor FOREIGN KEY (approved_by) REFERENCES users (id)
+) ENGINE=InnoDB;

@@ -20,6 +20,82 @@ const {
   buildOrderHistoryFilters,
   normalizeOrderHistoryPagination,
 } = require("../domain/order-history-search");
+const { buildReturnableCommercialGroups } = require("../domain/sales-return-groups");
+const { normalizeRawMaterialEntryQuantity } = require("../domain/raw-material-entry-rounding");
+const { resolveWholesalePrice } = require("../domain/wholesale-pricing");
+const { resolvePhysicalProduct } = require("../domain/physical-product");
+
+const resolveOrderProductPrice = async ({
+  connection,
+  customerId,
+  productId,
+  effectiveDate,
+  regularPrice,
+  lock = false,
+}) => {
+  const lockClause = lock ? " FOR UPDATE" : "";
+  const [profiles] = await connection.query(
+    `SELECT profile.id, profile.price_list_id, price_list.name AS price_list_name
+       FROM customer_wholesale_profiles profile
+       INNER JOIN wholesale_price_lists price_list
+         ON price_list.id = profile.price_list_id
+        AND price_list.is_active = 1
+      WHERE profile.customer_id = ?
+        AND profile.is_active = 1
+        AND profile.valid_from <= ?
+        AND (profile.valid_to IS NULL OR profile.valid_to >= ?)
+      ORDER BY profile.valid_from DESC, profile.id DESC
+      LIMIT 1${lockClause}`,
+    [customerId, effectiveDate, effectiveDate]
+  );
+
+  const profile = profiles[0] || null;
+  let special = null;
+  let general = null;
+  if (profile) {
+    const [configuredPrices] = await connection.query(
+      `SELECT id, price_list_id, product_id, customer_id, wholesale_price, valid_from, valid_to
+         FROM wholesale_product_prices
+        WHERE price_list_id = ?
+          AND product_id = ?
+          AND is_active = 1
+          AND valid_from <= ?
+          AND (valid_to IS NULL OR valid_to >= ?)
+          AND (customer_id = ? OR customer_id IS NULL)
+        ORDER BY (customer_id IS NOT NULL) DESC, valid_from DESC, id DESC${lockClause}`,
+      [profile.price_list_id, productId, effectiveDate, effectiveDate, customerId]
+    );
+    special = configuredPrices.find((price) => Number(price.customer_id) === Number(customerId)) || null;
+    general = configuredPrices.find((price) => price.customer_id == null) || null;
+  }
+
+  const resolution = resolveWholesalePrice({
+    customerIsWholesale: Boolean(profile),
+    regularPrice,
+    customerSpecialPrice: special
+      ? { id: special.id, price: special.wholesale_price, active: true, validFrom: special.valid_from, validTo: special.valid_to }
+      : null,
+    generalWholesalePrice: general
+      ? { id: general.id, price: general.wholesale_price, active: true, validFrom: general.valid_from, validTo: general.valid_to }
+      : null,
+    effectiveDate,
+  });
+
+  const selectedConfiguration = resolution.priceSource === "customer_special"
+    ? special
+    : (resolution.priceSource === "wholesale_general" ? general : null);
+
+  return {
+    regularPriceReference: resolution.regularUnitPrice,
+    wholesalePriceFound: selectedConfiguration ? Number(selectedConfiguration.wholesale_price) : null,
+    appliedPrice: resolution.appliedUnitPrice,
+    priceOrigin: resolution.priceSource,
+    priceConfigurationId: resolution.priceConfigurationId,
+    priceListId: selectedConfiguration ? Number(profile.price_list_id) : null,
+    priceListName: selectedConfiguration ? profile.price_list_name : null,
+    customerIsWholesale: Boolean(profile),
+  };
+};
 
 const isPastryCategoryName = (categoryName) => {
   return String(categoryName || "").toLowerCase().includes("pasteler");
@@ -353,6 +429,7 @@ const listOrderItems = async ({ orderId }) => {
         oi.id,
         oi.order_id,
         oi.product_id,
+        COALESCE(oi.inventory_product_id, oi.product_id) AS inventory_product_id,
         oi.line_group_key,
         p.sku AS product_sku,
         p.name AS product_name,
@@ -364,6 +441,18 @@ const listOrderItems = async ({ orderId }) => {
         oi.requested_amount,
         oi.quantity,
         oi.unit_price,
+        oi.regular_price_reference,
+        oi.wholesale_price_found,
+        oi.applied_price,
+        oi.price_origin,
+        oi.wholesale_price_configuration_id,
+        oi.wholesale_price_list_id,
+        COALESCE(oi.wholesale_price_list_name, wholesale_list.name) AS wholesale_price_list_name,
+        oi.sale_bonus_invoiced_value,
+        oi.sale_bonus_percent_applied,
+        oi.sale_bonus_value_applied,
+        oi.sale_bonus_product_price_used,
+        oi.sale_bonus_result_quantity,
         oi.tax_percent,
         oi.line_subtotal,
         oi.line_tax,
@@ -371,6 +460,7 @@ const listOrderItems = async ({ orderId }) => {
         oi.commercial_value
       FROM order_items oi
       INNER JOIN products p ON p.id = oi.product_id
+      LEFT JOIN wholesale_price_lists wholesale_list ON wholesale_list.id = oi.wholesale_price_list_id
       WHERE oi.order_id = ?
       ORDER BY p.name, FIELD(oi.line_type, 'sale', 'bonus', 'gift', 'exchange')
     `,
@@ -986,6 +1076,124 @@ const listOrderBaseData = async ({
   };
 };
 
+const listOrderPricePreview = async ({
+  customerId,
+  effectiveDate,
+  actorUserId,
+  canViewAllCustomers = false,
+}) => {
+  const normalizedCustomerId = Number(customerId || 0);
+  const normalizedDate = String(effectiveDate || "").slice(0, 10);
+  if (!normalizedCustomerId || !/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)) {
+    return { code: 0, message: "cliente y fecha son obligatorios", data: null };
+  }
+
+  const db = await connect();
+  const accessClause = canViewAllCustomers
+    ? ""
+    : `AND EXISTS (
+         SELECT 1
+           FROM seller_customer_assignments assignment
+          WHERE assignment.customer_id = customer.id
+            AND assignment.sales_agent_user_id = ?
+            AND assignment.is_active = 1
+       )`;
+  const [customers] = await db.query(
+    `SELECT customer.id
+       FROM customers customer
+      WHERE customer.id = ?
+        AND customer.status = 'active'
+        AND customer.deleted_at IS NULL
+        ${accessClause}
+      LIMIT 1`,
+    canViewAllCustomers
+      ? [normalizedCustomerId]
+      : [normalizedCustomerId, Number(actorUserId || 0)]
+  );
+  if (!customers.length) {
+    return { code: 0, message: "cliente no encontrado, inactivo o sin acceso", data: null };
+  }
+
+  const [products] = await db.query(
+    `SELECT id, base_price
+       FROM products
+      WHERE is_active = 1
+        AND deleted_at IS NULL
+      ORDER BY id`
+  );
+  const [profiles] = await db.query(
+    `SELECT profile.id, profile.price_list_id, price_list.name AS price_list_name
+       FROM customer_wholesale_profiles profile
+       INNER JOIN wholesale_price_lists price_list
+         ON price_list.id = profile.price_list_id
+        AND price_list.is_active = 1
+      WHERE profile.customer_id = ?
+        AND profile.is_active = 1
+        AND profile.valid_from <= ?
+        AND (profile.valid_to IS NULL OR profile.valid_to >= ?)
+      ORDER BY profile.valid_from DESC, profile.id DESC
+      LIMIT 1`,
+    [normalizedCustomerId, normalizedDate, normalizedDate]
+  );
+  const profile = profiles[0] || null;
+  const [configuredPrices] = profile
+    ? await db.query(
+        `SELECT id, price_list_id, product_id, customer_id, wholesale_price, valid_from, valid_to
+           FROM wholesale_product_prices
+          WHERE price_list_id = ?
+            AND is_active = 1
+            AND valid_from <= ?
+            AND (valid_to IS NULL OR valid_to >= ?)
+            AND (customer_id = ? OR customer_id IS NULL)
+          ORDER BY product_id, (customer_id IS NOT NULL) DESC, valid_from DESC, id DESC`,
+        [profile.price_list_id, normalizedDate, normalizedDate, normalizedCustomerId]
+      )
+    : [[]];
+  const configuredByProduct = new Map();
+  configuredPrices.forEach((price) => {
+    const productPrices = configuredByProduct.get(Number(price.product_id)) || [];
+    productPrices.push(price);
+    configuredByProduct.set(Number(price.product_id), productPrices);
+  });
+  const prices = products.map((product) => {
+    const configured = configuredByProduct.get(Number(product.id)) || [];
+    const special = configured.find((price) => Number(price.customer_id) === normalizedCustomerId) || null;
+    const general = configured.find((price) => price.customer_id == null) || null;
+    const resolution = resolveWholesalePrice({
+      customerIsWholesale: Boolean(profile),
+      regularPrice: product.base_price,
+      customerSpecialPrice: special ? { id: special.id, price: special.wholesale_price } : null,
+      generalWholesalePrice: general ? { id: general.id, price: general.wholesale_price } : null,
+      effectiveDate: normalizedDate,
+    });
+    const selected = resolution.priceSource === "customer_special"
+      ? special
+      : (resolution.priceSource === "wholesale_general" ? general : null);
+    return {
+      product_id: Number(product.id),
+      regularPriceReference: resolution.regularUnitPrice,
+      wholesalePriceFound: selected ? Number(selected.wholesale_price) : null,
+      appliedPrice: resolution.appliedUnitPrice,
+      priceOrigin: resolution.priceSource,
+      priceConfigurationId: resolution.priceConfigurationId,
+      priceListId: selected ? Number(profile.price_list_id) : null,
+      priceListName: selected ? profile.price_list_name : null,
+      customerIsWholesale: Boolean(profile),
+    };
+  });
+
+  return {
+    code: 1,
+    message: "precios de venta resueltos",
+    data: {
+      customer_id: normalizedCustomerId,
+      effective_date: normalizedDate,
+      customer_is_wholesale: prices.some((price) => price.customerIsWholesale),
+      prices,
+    },
+  };
+};
+
 const listSellerCustomerAssignments = async () => {
   const db = await connect();
   const [sellers] = await db.query(
@@ -1575,6 +1783,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
       );
       const settings = settingsRows[0];
       let normalizedItems = [];
+      const priceResolutionByProduct = new Map();
 
       for (const item of items) {
         const productId = Number(item.product_id || item.p_product_id || 0);
@@ -1582,6 +1791,7 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         const [products] = await connection.query(
           `SELECT
              p.id,
+             COALESCE(p.physical_product_id, p.id) AS inventory_product_id,
              p.unit,
              p.base_price,
              p.includes_bonus,
@@ -1599,6 +1809,23 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         if (!products.length || !lineType) {
           await connection.rollback();
           return { code: 0, message: "uno de los productos no es valido", data: null };
+        }
+        let priceResolution = priceResolutionByProduct.get(productId);
+        if (!priceResolution) {
+          try {
+            priceResolution = await resolveOrderProductPrice({
+              connection,
+              customerId,
+              productId,
+              effectiveDate: String(orderDate).slice(0, 10),
+              regularPrice: products[0].base_price,
+              lock: true,
+            });
+            priceResolutionByProduct.set(productId, priceResolution);
+          } catch (error) {
+            await connection.rollback();
+            return { code: 0, message: error.message, data: null };
+          }
         }
         if (lineType === "bonus" && isPastryCategoryName(products[0].category_name)) {
           await connection.rollback();
@@ -1620,13 +1847,15 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
         try {
           normalizedItems.push({
             productId,
+            inventoryProductId: Number(products[0].inventory_product_id),
             lineGroupKey: String(item.line_group_key || item.p_line_group_key || `line-${normalizedItems.length + 1}`),
             categoryName: products[0].category_name || null,
             unit: products[0].unit,
             uiLineType,
+            ...priceResolution,
             ...calculateOrderLine({
               unit: products[0].unit,
-              unitPrice: products[0].base_price,
+              unitPrice: priceResolution.appliedPrice,
               taxPercent: products[0].rate_percent,
               lineType,
               captureMode: item.capture_mode || item.p_capture_mode || "quantity",
@@ -1670,13 +1899,19 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
           item.lineType === "bonus" && item.uiLineType === "sale_bonus"
         ));
         officialBonus.allocations.forEach((allocation) => {
-          if (allocation.bonusQuantity <= 0) return;
           const sale = saleBonusSales.find((item) => item.lineGroupKey === allocation.key);
+          sale.saleBonusInvoicedValue = allocation.invoicedValue;
+          sale.saleBonusPercentApplied = allocation.bonusPercentApplied;
+          sale.saleBonusValueApplied = allocation.generatedValue;
+          sale.saleBonusProductPriceUsed = allocation.productPriceUsed;
+          sale.saleBonusResultQuantity = allocation.formulaResultQuantity;
+          if (allocation.bonusQuantity <= 0) return;
           normalizedItems.push({
             productId: sale.productId,
             lineGroupKey: sale.lineGroupKey,
             categoryName: sale.categoryName,
             unit: sale.unit,
+            inventoryProductId: sale.inventoryProductId,
             uiLineType: "sale_bonus",
             lineType: "bonus",
             captureMode: "quantity",
@@ -1688,6 +1923,13 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
             lineTax: 0,
             lineTotal: 0,
             commercialValue: allocation.physicalValue,
+            regularPriceReference: sale.regularPriceReference,
+            wholesalePriceFound: sale.wholesalePriceFound,
+            appliedPrice: sale.appliedPrice,
+            priceOrigin: sale.priceOrigin,
+            priceConfigurationId: sale.priceConfigurationId,
+            priceListId: sale.priceListId,
+            priceListName: sale.priceListName,
           });
         });
       }
@@ -1784,14 +2026,18 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
       for (const item of normalizedItems) {
         await connection.query(
           `INSERT INTO order_items (
-             order_id, product_id, line_group_key, line_type, commercial_mode, capture_mode, requested_amount,
+             order_id, product_id, inventory_product_id, line_group_key, line_type, commercial_mode, capture_mode, requested_amount,
              quantity, unit_price, tax_percent, line_subtotal, line_tax,
-             line_total, commercial_value
+             line_total, commercial_value, regular_price_reference, wholesale_price_found,
+             applied_price, price_origin, wholesale_price_configuration_id, wholesale_price_list_id,
+             wholesale_price_list_name, sale_bonus_invoiced_value, sale_bonus_percent_applied,
+             sale_bonus_value_applied, sale_bonus_product_price_used, sale_bonus_result_quantity
            )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             orderId,
             item.productId,
+            item.inventoryProductId,
             item.lineGroupKey,
             item.lineType,
             item.uiLineType || item.lineType,
@@ -1804,6 +2050,18 @@ const createOrder = async (payload, actorUserId, { canViewAllCustomers = false }
             item.lineTax,
             item.lineTotal,
             item.commercialValue,
+            item.regularPriceReference,
+            item.wholesalePriceFound,
+            item.appliedPrice,
+            item.priceOrigin,
+            item.priceConfigurationId,
+            item.priceListId,
+            item.priceListName,
+            item.saleBonusInvoicedValue ?? null,
+            item.saleBonusPercentApplied ?? null,
+            item.saleBonusValueApplied ?? null,
+            item.saleBonusProductPriceUsed ?? null,
+            item.saleBonusResultQuantity ?? null,
           ]
         );
       }
@@ -2335,7 +2593,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
       `SELECT
          id, branch_id, customer_id, status, bonus_percent, bonus_minimum_amount, bonus_max_company_loss_amount,
          sales_agent_user_id, seller_commission_percent, credit_redeemed_amount,
-         actual_delivered_at
+         actual_delivered_at, order_date
        FROM orders
        WHERE id = ?
        FOR UPDATE`,
@@ -2497,6 +2755,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
       const [products] = await connection.query(
         `SELECT
            p.id,
+           COALESCE(p.physical_product_id, p.id) AS inventory_product_id,
            p.unit,
            p.base_price,
            pc.name AS category_name,
@@ -2515,6 +2774,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
         await connection.rollback();
         return { code: 0, message: "producto no encontrado o inactivo", data: null };
       }
+      const inventoryProductId = Number(products[0].inventory_product_id);
       if (lineType === "bonus" && isPastryCategoryName(products[0].category_name)) {
         await connection.rollback();
         return {
@@ -2524,11 +2784,26 @@ const upsertOrderItem = async (payload, actorUserId) => {
         };
       }
 
+      let priceResolution;
+      try {
+        priceResolution = await resolveOrderProductPrice({
+          connection,
+          customerId: Number(orders[0].customer_id),
+          productId,
+          effectiveDate: String(orders[0].order_date).slice(0, 10),
+          regularPrice: products[0].base_price,
+          lock: true,
+        });
+      } catch (error) {
+        await connection.rollback();
+        return { code: 0, message: error.message, data: null };
+      }
+
       let calculated;
       try {
         calculated = calculateOrderLine({
           unit: products[0].unit,
-          unitPrice: products[0].base_price,
+          unitPrice: priceResolution.appliedPrice,
           taxPercent: products[0].rate_percent,
           lineType,
           captureMode: payload.p_capture_mode || "quantity",
@@ -2590,12 +2865,15 @@ const upsertOrderItem = async (payload, actorUserId) => {
 
       await connection.query(
         `INSERT INTO order_items (
-           order_id, product_id, line_group_key, line_type, commercial_mode, capture_mode, requested_amount,
+           order_id, product_id, inventory_product_id, line_group_key, line_type, commercial_mode, capture_mode, requested_amount,
            quantity, unit_price, tax_percent, line_subtotal, line_tax,
-           line_total, commercial_value
+           line_total, commercial_value, regular_price_reference, wholesale_price_found,
+           applied_price, price_origin, wholesale_price_configuration_id, wholesale_price_list_id,
+           wholesale_price_list_name
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
+           inventory_product_id = VALUES(inventory_product_id),
            commercial_mode = VALUES(commercial_mode),
            capture_mode = VALUES(capture_mode),
            requested_amount = VALUES(requested_amount),
@@ -2605,10 +2883,18 @@ const upsertOrderItem = async (payload, actorUserId) => {
            line_subtotal = VALUES(line_subtotal),
            line_tax = VALUES(line_tax),
            line_total = VALUES(line_total),
-           commercial_value = VALUES(commercial_value)`,
+           commercial_value = VALUES(commercial_value),
+           regular_price_reference = VALUES(regular_price_reference),
+           wholesale_price_found = VALUES(wholesale_price_found),
+           applied_price = VALUES(applied_price),
+           price_origin = VALUES(price_origin),
+           wholesale_price_configuration_id = VALUES(wholesale_price_configuration_id),
+           wholesale_price_list_id = VALUES(wholesale_price_list_id),
+           wholesale_price_list_name = VALUES(wholesale_price_list_name)`,
         [
           orderId,
           productId,
+          Number(products[0].inventory_product_id),
           lineGroupKey,
           calculated.lineType,
           String(payload.p_ui_line_type || calculated.lineType),
@@ -2621,7 +2907,27 @@ const upsertOrderItem = async (payload, actorUserId) => {
           calculated.lineTax,
           calculated.lineTotal,
           calculated.commercialValue,
+          priceResolution.regularPriceReference,
+          priceResolution.wholesalePriceFound,
+          priceResolution.appliedPrice,
+          priceResolution.priceOrigin,
+          priceResolution.priceConfigurationId,
+          priceResolution.priceListId,
+          priceResolution.priceListName,
         ]
+      );
+
+      await connection.query(
+        `UPDATE order_items
+         SET sale_bonus_invoiced_value = NULL,
+             sale_bonus_percent_applied = NULL,
+             sale_bonus_value_applied = NULL,
+             sale_bonus_product_price_used = NULL,
+             sale_bonus_result_quantity = NULL
+         WHERE order_id = ?
+           AND line_group_key = ?
+           AND line_type = 'sale'`,
+        [orderId, lineGroupKey]
       );
 
       if (wantsSaleBonus) {
@@ -2674,6 +2980,27 @@ const upsertOrderItem = async (payload, actorUserId) => {
           enabled: Number(eligibleTotalRows[0]?.eligible_total || 0) >= Number(orders[0].bonus_minimum_amount || 0),
         });
 
+        await connection.query(
+          `UPDATE order_items
+           SET sale_bonus_invoiced_value = ?,
+               sale_bonus_percent_applied = ?,
+               sale_bonus_value_applied = ?,
+               sale_bonus_product_price_used = ?,
+               sale_bonus_result_quantity = ?
+           WHERE order_id = ?
+             AND line_group_key = ?
+             AND line_type = 'sale'`,
+          [
+            saleBonus.invoicedValue,
+            saleBonus.bonusPercentApplied,
+            saleBonus.allowance,
+            saleBonus.productPriceUsed,
+            saleBonus.formulaResultQuantity,
+            orderId,
+            lineGroupKey,
+          ]
+        );
+
         if (saleBonus.bonusQuantity < Number(previousBonusItem?.reserved_quantity || 0)) {
           await connection.rollback();
           return {
@@ -2686,7 +3013,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
         if (saleBonus.bonusQuantity > 0) {
           const bonusCalculated = calculateOrderLine({
             unit: products[0].unit,
-            unitPrice: products[0].base_price,
+            unitPrice: priceResolution.appliedPrice,
             taxPercent: products[0].rate_percent,
             lineType: "bonus",
             captureMode: "quantity",
@@ -2695,12 +3022,15 @@ const upsertOrderItem = async (payload, actorUserId) => {
           });
           await connection.query(
             `INSERT INTO order_items (
-               order_id, product_id, line_group_key, line_type, commercial_mode, capture_mode, requested_amount,
+               order_id, product_id, inventory_product_id, line_group_key, line_type, commercial_mode, capture_mode, requested_amount,
                quantity, unit_price, tax_percent, line_subtotal, line_tax,
-               line_total, commercial_value
-             ) VALUES (?, ?, ?, 'bonus', 'sale_bonus', 'quantity', NULL, ?, ?, ?, 0, 0, 0, ?)
+               line_total, commercial_value, regular_price_reference, wholesale_price_found,
+               applied_price, price_origin, wholesale_price_configuration_id, wholesale_price_list_id,
+               wholesale_price_list_name
+             ) VALUES (?, ?, ?, ?, 'bonus', 'sale_bonus', 'quantity', NULL, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE
                product_id = VALUES(product_id),
+               inventory_product_id = VALUES(inventory_product_id),
                commercial_mode = 'sale_bonus',
                capture_mode = VALUES(capture_mode),
                requested_amount = NULL,
@@ -2710,15 +3040,30 @@ const upsertOrderItem = async (payload, actorUserId) => {
                line_subtotal = 0,
                line_tax = 0,
                line_total = 0,
-               commercial_value = VALUES(commercial_value)`,
+               commercial_value = VALUES(commercial_value),
+               regular_price_reference = VALUES(regular_price_reference),
+               wholesale_price_found = VALUES(wholesale_price_found),
+               applied_price = VALUES(applied_price),
+               price_origin = VALUES(price_origin),
+               wholesale_price_configuration_id = VALUES(wholesale_price_configuration_id),
+               wholesale_price_list_id = VALUES(wholesale_price_list_id),
+               wholesale_price_list_name = VALUES(wholesale_price_list_name)`,
             [
               orderId,
               productId,
+              Number(products[0].inventory_product_id),
               lineGroupKey,
               bonusCalculated.quantity,
               bonusCalculated.unitPrice,
               bonusCalculated.taxPercent,
               bonusCalculated.commercialValue,
+              priceResolution.regularPriceReference,
+              priceResolution.wholesalePriceFound,
+              priceResolution.appliedPrice,
+              priceResolution.priceOrigin,
+              priceResolution.priceConfigurationId,
+              priceResolution.priceListId,
+              priceResolution.priceListName,
             ]
           );
         } else if (previousBonusItem) {
@@ -2769,14 +3114,14 @@ const upsertOrderItem = async (payload, actorUserId) => {
         await connection.query(
           `INSERT IGNORE INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
            VALUES (?, ?, 0, 0)`,
-          [Number(orders[0].branch_id), productId]
+          [Number(orders[0].branch_id), inventoryProductId]
         );
         await connection.query(
           `UPDATE stock_products
            SET quantity_on_hand = quantity_on_hand - ?,
                updated_at = CURRENT_TIMESTAMP
            WHERE branch_id = ? AND product_id = ?`,
-          [stockDifference, Number(orders[0].branch_id), productId]
+          [stockDifference, Number(orders[0].branch_id), inventoryProductId]
         );
         await connection.query(
           `INSERT INTO inventory_movements (
@@ -2785,7 +3130,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
            ) VALUES (?, 'product', NULL, ?, ?, ?, NULL, 'order', ?, ?, ?)`,
           [
             Number(orders[0].branch_id),
-            productId,
+            inventoryProductId,
             stockDifference > 0 ? "sale_out" : "adjustment_in",
             Math.abs(stockDifference),
             orderId,
@@ -2811,7 +3156,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
             orderId,
             Number(currentItem.id),
             Number(orders[0].branch_id),
-            productId,
+            inventoryProductId,
             currentStockQuantity,
             inventoryWasApplied ? currentStockQuantity : 0,
             inventoryWasApplied ? "applied" : "pending",
@@ -2851,13 +3196,13 @@ const upsertOrderItem = async (payload, actorUserId) => {
           await connection.query(
             `INSERT IGNORE INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
              VALUES (?, ?, 0, 0)`,
-            [Number(orders[0].branch_id), productId]
+            [Number(orders[0].branch_id), inventoryProductId]
           );
           await connection.query(
             `UPDATE stock_products
              SET quantity_on_hand = quantity_on_hand - ?, updated_at = CURRENT_TIMESTAMP
              WHERE branch_id = ? AND product_id = ?`,
-            [bonusStockDifference, Number(orders[0].branch_id), productId]
+            [bonusStockDifference, Number(orders[0].branch_id), inventoryProductId]
           );
           await connection.query(
             `INSERT INTO inventory_movements (
@@ -2866,7 +3211,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
              ) VALUES (?, 'product', NULL, ?, ?, ?, NULL, 'order', ?, ?, ?)`,
             [
               Number(orders[0].branch_id),
-              productId,
+              inventoryProductId,
               bonusStockDifference > 0 ? "sale_out" : "adjustment_in",
               Math.abs(bonusStockDifference),
               orderId,
@@ -2892,7 +3237,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
               orderId,
               Number(currentBonusItem.id),
               Number(orders[0].branch_id),
-              productId,
+              inventoryProductId,
               currentBonusStockQuantity,
               bonusInventoryWasApplied ? currentBonusStockQuantity : 0,
               bonusInventoryWasApplied ? "applied" : "pending",
@@ -3328,10 +3673,10 @@ const cancelOrder = async (payload, actorUserId) => {
                FROM product_sale_inventory_commitments
               WHERE order_id = ? AND status = 'applied'
               GROUP BY product_id`
-          : `SELECT product_id, SUM(quantity) AS quantity
+          : `SELECT COALESCE(inventory_product_id, product_id) AS product_id, SUM(quantity) AS quantity
                FROM order_items
               WHERE order_id = ?
-              GROUP BY product_id`,
+              GROUP BY COALESCE(inventory_product_id, product_id)`,
         [orderId]
       );
       for (const item of items) {
@@ -4632,12 +4977,19 @@ const listSalesReturnOptions = async ({ actorUserId, canViewAll = false } = {}) 
          oi.id AS order_item_id,
          oi.order_id,
          oi.product_id,
+         COALESCE(oi.inventory_product_id, oi.product_id) AS inventory_product_id,
          p.name AS product_name,
          p.sku AS product_sku,
          p.unit AS product_unit,
+         oi.line_group_key,
          oi.line_type,
+         oi.commercial_mode,
          oi.quantity,
          oi.unit_price,
+         COALESCE(oi.applied_price, oi.unit_price) AS original_applied_price,
+         COALESCE(oi.price_origin, 'regular') AS original_price_origin,
+         oi.wholesale_price_list_id,
+         oi.wholesale_price_list_name,
          oi.line_total,
          oi.commercial_value,
          GREATEST(
@@ -4656,28 +5008,48 @@ const listSalesReturnOptions = async ({ actorUserId, canViewAll = false } = {}) 
        LEFT JOIN sales_returns sr ON sr.id = sri.sales_return_id
        WHERE oi.order_id IN (${placeholders})
        GROUP BY
-         oi.id, oi.order_id, oi.product_id, p.name, p.sku, p.unit,
-         oi.line_type, oi.quantity, oi.unit_price, oi.line_total,
+         oi.id, oi.order_id, oi.product_id, oi.inventory_product_id, p.name, p.sku, p.unit,
+         oi.line_group_key, oi.line_type, oi.commercial_mode, oi.quantity, oi.unit_price, oi.line_total,
+         oi.applied_price, oi.price_origin, oi.wholesale_price_list_id, oi.wholesale_price_list_name,
          oi.commercial_value
        HAVING returnable_quantity > 0
-       ORDER BY p.name`,
+       ORDER BY oi.order_id, oi.line_group_key, p.name, FIELD(oi.line_type, 'sale', 'bonus', 'gift', 'exchange')`,
       orderIds
     );
-    items = itemRows;
+    items = buildReturnableCommercialGroups(itemRows);
   }
 
   const [products] = await db.query(
-    `SELECT id, sku, name, unit, base_price
-     FROM products
-     WHERE is_active = 1
-       AND deleted_at IS NULL
-     ORDER BY name`
+    `SELECT commercial.id, commercial.sku, commercial.name, commercial.unit, commercial.base_price,
+            COALESCE(commercial.physical_product_id, commercial.id) AS physical_product_id,
+            physical.name AS physical_product_name,
+            commercial.physical_product_id IS NOT NULL AS is_commercial_variant
+       FROM products commercial
+       INNER JOIN products physical
+         ON physical.id = COALESCE(commercial.physical_product_id, commercial.id)
+      WHERE commercial.is_active = 1
+        AND commercial.deleted_at IS NULL
+      ORDER BY commercial.name`
+  );
+
+  const [customers] = await db.query(
+    `SELECT id, name, tax_id AS document_number, phone, address, neighborhood
+       FROM customers
+      WHERE status = 'active'
+        AND deleted_at IS NULL
+      ORDER BY name`
+  );
+
+  const [priceLists] = await db.query(
+    `SELECT id, name
+       FROM wholesale_price_lists
+      ORDER BY name`
   );
 
   return {
     code: 1,
     message: "opciones de cambios y devoluciones listadas",
-    data: { orders, items, products },
+    data: { customers, orders, items, products, price_lists: priceLists },
   };
 };
 
@@ -4687,8 +5059,8 @@ const listSalesReturns = async ({ actorUserId, canViewAll = false, status } = {}
   const values = [];
 
   if (!canViewAll) {
-    filters.push("sr.sales_agent_user_id = ?");
-    values.push(Number(actorUserId || 0));
+    filters.push("(sr.sales_agent_user_id = ? OR sr.created_by = ?)");
+    values.push(Number(actorUserId || 0), Number(actorUserId || 0));
   }
   if (status) {
     filters.push("sr.status = ?");
@@ -4700,9 +5072,12 @@ const listSalesReturns = async ({ actorUserId, canViewAll = false, status } = {}
     `SELECT
        sr.id,
        sr.order_id,
+       sr.operation_type,
+       COALESCE(sr.customer_id, o.customer_id) AS customer_id,
        sr.sales_agent_user_id,
+       sr.created_by,
+       creator.full_name AS created_by_name,
        seller.full_name AS sales_agent_name,
-       o.customer_id,
        c.name AS customer_name,
        o.order_date,
        o.branch_id,
@@ -4717,13 +5092,27 @@ const listSalesReturns = async ({ actorUserId, canViewAll = false, status } = {}
        authorizer.full_name AS authorized_by_name,
        sr.authorized_at,
        sr.rejection_reason,
+       sr.annulled_by,
+       sr.annulled_at,
+       sr.annulment_reason,
+       commission_adjustment.treatment AS commission_treatment,
+       commission_adjustment.original_commission_base,
+       commission_adjustment.original_commission_amount,
+       commission_adjustment.adjusted_commission_base,
+       commission_adjustment.adjusted_commission_amount,
+       commission_adjustment.base_delta AS commission_base_delta,
+       commission_adjustment.commission_delta,
+       commission_adjustment.reversed_at AS commission_adjustment_reversed_at,
        sr.created_at
      FROM sales_returns sr
      INNER JOIN orders o ON o.id = sr.order_id
-     INNER JOIN customers c ON c.id = o.customer_id
+     INNER JOIN customers c ON c.id = COALESCE(sr.customer_id, o.customer_id)
      INNER JOIN branches b ON b.id = o.branch_id
      INNER JOIN users seller ON seller.id = sr.sales_agent_user_id
+     LEFT JOIN users creator ON creator.id = sr.created_by
      LEFT JOIN users authorizer ON authorizer.id = sr.authorized_by
+     LEFT JOIN sales_return_commission_adjustments commission_adjustment
+       ON commission_adjustment.sales_return_id = sr.id
      ${whereClause}
      ORDER BY sr.created_at DESC, sr.id DESC`,
     values
@@ -4738,12 +5127,18 @@ const listSalesReturns = async ({ actorUserId, canViewAll = false, status } = {}
          sri.id,
          sri.sales_return_id,
          sri.order_item_id,
+         COALESCE(oi.applied_price, oi.unit_price) AS original_applied_price,
+         COALESCE(oi.price_origin, 'regular') AS original_price_origin,
+         oi.wholesale_price_list_id AS original_wholesale_price_list_id,
+         oi.wholesale_price_list_name AS original_wholesale_price_list_name,
          sri.returned_product_id,
          returned.name AS returned_product_name,
          returned.sku AS returned_product_sku,
          sri.replacement_product_id,
          replacement.name AS replacement_product_name,
          replacement.sku AS replacement_product_sku,
+         sri.replacement_quantity,
+         sri.replacement_unit_price,
          sri.reason,
          sri.quantity,
          sri.returned_sale_value,
@@ -4752,6 +5147,7 @@ const listSalesReturns = async ({ actorUserId, canViewAll = false, status } = {}
          sri.replacement_commercial_value,
          sri.notes
        FROM sales_return_items sri
+       INNER JOIN order_items oi ON oi.id = sri.order_item_id
        INNER JOIN products returned ON returned.id = sri.returned_product_id
        LEFT JOIN products replacement ON replacement.id = sri.replacement_product_id
        WHERE sri.sales_return_id IN (${placeholders})
@@ -4780,12 +5176,231 @@ const listSalesReturns = async ({ actorUserId, canViewAll = false, status } = {}
   };
 };
 
+const listSalesOperationsReport = async ({
+  actorUserId,
+  canViewAll = false,
+  dateFrom,
+  dateTo,
+  salesAgentUserId,
+  customerId,
+  receivedProductId,
+  deliveredProductId,
+  operationType,
+  orderId,
+  customerPriceType,
+  priceListId,
+  physicalProductId,
+  commercialVariantId,
+  appliedPrice,
+  page = 1,
+  pageSize = 25,
+} = {}) => {
+  const db = await connect();
+  const normalizedPageSize = [25, 50, 100].includes(Number(pageSize)) ? Number(pageSize) : 25;
+  const normalizedPage = Math.max(Number.parseInt(page, 10) || 1, 1);
+  const offset = (normalizedPage - 1) * normalizedPageSize;
+  const baseSql = `
+    SELECT
+      CONCAT('return-', sr.id, '-', sri.id) AS row_key,
+      sr.id AS operation_id,
+      sr.operation_type,
+      DATE(sr.reported_at) AS operation_date,
+      sr.reported_at AS registered_at,
+      sr.order_id AS original_order_id,
+      sr.customer_id,
+      customer.name AS customer_name,
+      CASE WHEN COALESCE(oi.price_origin, 'regular') IN ('wholesale_general','customer_special') THEN 1 ELSE 0 END AS customer_is_wholesale,
+      CASE WHEN COALESCE(oi.price_origin, 'regular') IN ('wholesale_general','customer_special') THEN 'wholesale' ELSE 'regular' END AS customer_price_type,
+      oi.wholesale_price_list_id,
+      oi.wholesale_price_list_name,
+      sr.sales_agent_user_id,
+      seller.full_name AS sales_agent_name,
+      sri.returned_product_id AS received_product_id,
+      received.name AS received_product_name,
+      COALESCE(received.physical_product_id, received.id) AS received_physical_product_id,
+      received_physical.name AS received_physical_product_name,
+      sri.quantity AS received_quantity,
+      sri.replacement_product_id AS delivered_product_id,
+      replacement.name AS delivered_product_name,
+      COALESCE(replacement.physical_product_id, replacement.id) AS delivered_physical_product_id,
+      replacement_physical.name AS delivered_physical_product_name,
+      COALESCE(sri.replacement_quantity, 0) AS delivered_quantity,
+      COALESCE(oi.applied_price, oi.unit_price) AS original_applied_unit_price,
+      COALESCE(oi.price_origin, 'regular') AS original_price_origin,
+      CASE
+        WHEN sr.operation_type = 'exchange' THEN COALESCE(sri.replacement_unit_price, 0)
+        ELSE ROUND(COALESCE(sri.returned_commercial_value, 0) / NULLIF(sri.quantity, 0), 2)
+      END AS applied_unit_price,
+      CASE
+        WHEN sr.operation_type = 'exchange' THEN COALESCE(sri.replacement_commercial_value, 0)
+        ELSE COALESCE(sri.returned_commercial_value, 0)
+      END AS total_value,
+      sri.reason,
+      sri.notes,
+      sr.created_by AS registered_by,
+      creator.full_name AS registered_by_name,
+      sr.status
+    FROM sales_returns sr
+    INNER JOIN sales_return_items sri ON sri.sales_return_id = sr.id
+    INNER JOIN order_items oi ON oi.id = sri.order_item_id
+    INNER JOIN customers customer ON customer.id = sr.customer_id
+    INNER JOIN users seller ON seller.id = sr.sales_agent_user_id
+    INNER JOIN products received ON received.id = sri.returned_product_id
+    INNER JOIN products received_physical ON received_physical.id = COALESCE(received.physical_product_id, received.id)
+    LEFT JOIN products replacement ON replacement.id = sri.replacement_product_id
+    LEFT JOIN products replacement_physical ON replacement_physical.id = COALESCE(replacement.physical_product_id, replacement.id)
+    LEFT JOIN users creator ON creator.id = sr.created_by
+    UNION ALL
+    SELECT
+      CONCAT('gift-', sg.id, '-', sgi.id) AS row_key,
+      sg.id AS operation_id,
+      'gift' AS operation_type,
+      sg.gift_date AS operation_date,
+      sg.created_at AS registered_at,
+      NULL AS original_order_id,
+      sg.customer_id,
+      customer.name AS customer_name,
+      0 AS customer_is_wholesale,
+      'regular' AS customer_price_type,
+      NULL AS wholesale_price_list_id,
+      NULL AS wholesale_price_list_name,
+      sg.sales_agent_user_id,
+      seller.full_name AS sales_agent_name,
+      NULL AS received_product_id,
+      NULL AS received_product_name,
+      NULL AS received_physical_product_id,
+      NULL AS received_physical_product_name,
+      0 AS received_quantity,
+      sgi.product_id AS delivered_product_id,
+      delivered.name AS delivered_product_name,
+      COALESCE(delivered.physical_product_id, delivered.id) AS delivered_physical_product_id,
+      delivered_physical.name AS delivered_physical_product_name,
+      sgi.quantity AS delivered_quantity,
+      NULL AS original_applied_unit_price,
+      'regular' AS original_price_origin,
+      ROUND(COALESCE(sgi.commercial_value, 0) / NULLIF(sgi.quantity, 0), 2) AS applied_unit_price,
+      COALESCE(sgi.commercial_value, 0) AS total_value,
+      'gift' AS reason,
+      sg.notes,
+      sg.created_by AS registered_by,
+      creator.full_name AS registered_by_name,
+      sg.status
+    FROM sales_gifts sg
+    INNER JOIN sales_gift_items sgi ON sgi.sales_gift_id = sg.id
+    INNER JOIN customers customer ON customer.id = sg.customer_id
+    LEFT JOIN users seller ON seller.id = sg.sales_agent_user_id
+    INNER JOIN products delivered ON delivered.id = sgi.product_id
+    INNER JOIN products delivered_physical ON delivered_physical.id = COALESCE(delivered.physical_product_id, delivered.id)
+    LEFT JOIN users creator ON creator.id = sg.created_by`;
+
+  const filters = [];
+  const values = [];
+  const addNumericFilter = (column, value) => {
+    const normalized = Number(value || 0);
+    if (Number.isInteger(normalized) && normalized > 0) {
+      filters.push(`${column} = ?`);
+      values.push(normalized);
+    }
+  };
+  if (!canViewAll) {
+    filters.push("report.sales_agent_user_id = ?");
+    values.push(Number(actorUserId || 0));
+  } else {
+    addNumericFilter("report.sales_agent_user_id", salesAgentUserId);
+  }
+  addNumericFilter("report.customer_id", customerId);
+  addNumericFilter("report.received_product_id", receivedProductId);
+  addNumericFilter("report.delivered_product_id", deliveredProductId);
+  addNumericFilter("report.original_order_id", orderId);
+  addNumericFilter("report.wholesale_price_list_id", priceListId);
+  if (Number(physicalProductId || 0) > 0) {
+    filters.push("(report.received_physical_product_id = ? OR report.delivered_physical_product_id = ?)");
+    values.push(Number(physicalProductId), Number(physicalProductId));
+  }
+  if (Number(commercialVariantId || 0) > 0) {
+    filters.push("(report.received_product_id = ? OR report.delivered_product_id = ?)");
+    values.push(Number(commercialVariantId), Number(commercialVariantId));
+  }
+  if (["regular", "wholesale"].includes(String(customerPriceType || ""))) {
+    filters.push("report.customer_price_type = ?");
+    values.push(String(customerPriceType));
+  }
+  const normalizedAppliedPrice = Number(appliedPrice || 0);
+  if (Number.isFinite(normalizedAppliedPrice) && normalizedAppliedPrice > 0) {
+    filters.push("report.applied_unit_price = ?");
+    values.push(normalizedAppliedPrice);
+  }
+  if (["return", "exchange", "gift"].includes(String(operationType || ""))) {
+    filters.push("report.operation_type = ?");
+    values.push(String(operationType));
+  }
+  if (dateFrom) {
+    filters.push("report.operation_date >= ?");
+    values.push(String(dateFrom).slice(0, 10));
+  }
+  if (dateTo) {
+    filters.push("report.operation_date <= ?");
+    values.push(String(dateTo).slice(0, 10));
+  }
+  const whereSql = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const filteredSql = `FROM (${baseSql}) report ${whereSql}`;
+  const [[countRow], [items], [sellerTotals], [productTotals]] = await Promise.all([
+    db.query(`SELECT COUNT(*) AS total ${filteredSql}`, values),
+    db.query(`SELECT * ${filteredSql} ORDER BY operation_date DESC, registered_at DESC, row_key DESC LIMIT ? OFFSET ?`, [...values, normalizedPageSize, offset]),
+    db.query(
+      `SELECT sales_agent_user_id, sales_agent_name, COUNT(*) AS result_count,
+              SUM(received_quantity) AS received_quantity,
+              SUM(delivered_quantity) AS delivered_quantity,
+              SUM(total_value) AS total_value
+         ${filteredSql}
+        GROUP BY sales_agent_user_id, sales_agent_name
+        ORDER BY sales_agent_name`,
+      values
+    ),
+    db.query(
+      `SELECT COALESCE(delivered_physical_product_id, received_physical_product_id) AS product_id,
+              COALESCE(delivered_physical_product_name, received_physical_product_name) AS product_name,
+              operation_type, customer_price_type, COUNT(*) AS result_count,
+              SUM(received_quantity) AS received_quantity,
+              SUM(delivered_quantity) AS delivered_quantity,
+              SUM(total_value) AS total_value
+         ${filteredSql}
+        GROUP BY COALESCE(delivered_physical_product_id, received_physical_product_id),
+                 COALESCE(delivered_physical_product_name, received_physical_product_name), operation_type, customer_price_type
+        ORDER BY product_name, customer_price_type, operation_type`,
+      values
+    ),
+  ]);
+  const total = Number(countRow?.[0]?.total || 0);
+  return {
+    code: 1,
+    message: "reporte de cambios, devoluciones y obsequios obtenido",
+    data: {
+      items,
+      page: normalizedPage,
+      pageSize: normalizedPageSize,
+      total,
+      totalPages: Math.ceil(total / normalizedPageSize),
+      totalsBySeller: sellerTotals,
+      totalsByProduct: productTotals,
+    },
+  };
+};
+
 const createSalesReturn = async (payload, actorUserId) => {
   const orderId = Number(payload.p_order_id || 0);
+  const customerId = Number(payload.p_customer_id || 0);
+  const operationType = String(payload.p_operation_type || "").trim().toLowerCase();
+  const requestKey = String(payload.p_request_key || "").trim();
   const inputItems = Array.isArray(payload.p_items) ? payload.p_items : [];
+  const replacementInputs = inputItems.filter((item) => Number(item.replacement_product_id || 0) > 0
+    || Number(item.replacement_quantity || 0) > 0);
 
-  if (!orderId || !inputItems.length) {
-    return { code: 0, message: "selecciona un pedido y al menos un producto", data: null };
+  if (!customerId || !orderId || !["return", "exchange"].includes(operationType) || !requestKey || !inputItems.length) {
+    return { code: 0, message: "selecciona cliente, pedido, tipo de operación y al menos un producto", data: null };
+  }
+  if (operationType === "exchange" && !replacementInputs.length) {
+    return { code: 0, message: "selecciona el producto y la cantidad que se entregaran como reemplazo", data: null };
   }
 
   const db = await connect();
@@ -4793,9 +5408,29 @@ const createSalesReturn = async (payload, actorUserId) => {
 
   try {
     await connection.beginTransaction();
+    const [existingRequests] = await connection.query(
+      `SELECT id, credit_amount FROM sales_returns WHERE request_key = ?`,
+      [requestKey]
+    );
+    if (existingRequests.length) {
+      await connection.rollback();
+      return {
+        code: 1,
+        message: "la operación ya había sido registrada",
+        data: { sales_return_id: Number(existingRequests[0].id), credit_amount: Number(existingRequests[0].credit_amount || 0), idempotent: true },
+      };
+    }
+    const [customers] = await connection.query(
+      `SELECT id FROM customers WHERE id = ? AND status = 'active' AND deleted_at IS NULL`,
+      [customerId]
+    );
+    if (!customers.length) {
+      await connection.rollback();
+      return { code: 0, message: "el cliente seleccionado no existe o está inactivo", data: null };
+    }
     const [orders] = await connection.query(
       `SELECT
-         id, branch_id, status, sales_agent_user_id, actual_delivered_at,
+         id, branch_id, customer_id, status, sales_agent_user_id, actual_delivered_at,
          DATE_ADD(actual_delivered_at, INTERVAL 15 DAY) AS product_expires_at,
          DATE_ADD(actual_delivered_at, INTERVAL 17 DAY) AS report_deadline_at,
          CURRENT_TIMESTAMP <= DATE_ADD(actual_delivered_at, INTERVAL 17 DAY) AS report_is_open
@@ -4808,6 +5443,10 @@ const createSalesReturn = async (payload, actorUserId) => {
     if (!orders.length || orders[0].status !== "delivered" || !orders[0].actual_delivered_at) {
       await connection.rollback();
       return { code: 0, message: "solo puedes reportar productos de un pedido entregado", data: null };
+    }
+    if (Number(orders[0].customer_id) !== customerId) {
+      await connection.rollback();
+      return { code: 0, message: "el pedido original no corresponde al cliente seleccionado", data: null };
     }
     if (!Number(orders[0].report_is_open)) {
       await connection.rollback();
@@ -4823,16 +5462,29 @@ const createSalesReturn = async (payload, actorUserId) => {
     for (const input of inputItems) {
       const orderItemId = Number(input.order_item_id || 0);
       const quantity = Number(input.quantity || 0);
+      const replacementProductId = Number(input.replacement_product_id || 0);
+      const replacementQuantity = Number(input.replacement_quantity || 0);
+      let replacementUnitPrice = null;
       const reason = String(input.reason || "");
       const uniqueKey = String(orderItemId);
 
-      if (!orderItemId || !Number.isFinite(quantity) || quantity <= 0) {
+      if (!orderItemId || !Number.isInteger(quantity) || quantity <= 0) {
         await connection.rollback();
         return { code: 0, message: "revisa producto devuelto y cantidad", data: null };
       }
       if (!RETURN_REASONS.has(reason)) {
         await connection.rollback();
         return { code: 0, message: "selecciona un motivo de devolucion valido", data: null };
+      }
+      const hasReplacement = replacementProductId > 0 || replacementQuantity > 0;
+      if (operationType === "exchange" && hasReplacement
+        && (!replacementProductId || !Number.isInteger(replacementQuantity) || replacementQuantity <= 0)) {
+        await connection.rollback();
+        return { code: 0, message: "selecciona el producto y la cantidad que se entregarán como reemplazo", data: null };
+      }
+      if (operationType === "return" && (replacementProductId || replacementQuantity)) {
+        await connection.rollback();
+        return { code: 0, message: "una devolución no debe incluir producto de reemplazo", data: null };
       }
       if (seenItems.has(uniqueKey)) {
         await connection.rollback();
@@ -4875,6 +5527,23 @@ const createSalesReturn = async (payload, actorUserId) => {
       }
 
       const original = orderItems[0];
+      if (replacementProductId) {
+        const [replacementRows] = await connection.query(
+          `SELECT p.id, p.base_price, COALESCE(t.rate_percent, 0) AS tax_percent
+             FROM products p
+             LEFT JOIN tax_rates t ON t.id = p.tax_rate_id
+            WHERE p.id = ? AND p.is_active = 1 AND p.deleted_at IS NULL`,
+          [replacementProductId]
+        );
+        if (!replacementRows.length) {
+          await connection.rollback();
+          return { code: 0, message: "el producto de reemplazo no existe o está inactivo", data: null };
+        }
+        replacementUnitPrice = roundMoney(
+          Number(replacementRows[0].base_price || 0) *
+            (1 + Number(replacementRows[0].tax_percent || 0) / 100)
+        );
+      }
       const returnedCommercialValue = roundMoney(
         (Number(original.commercial_value || original.line_total || 0) /
           Number(original.quantity || 1)) *
@@ -4883,6 +5552,9 @@ const createSalesReturn = async (payload, actorUserId) => {
       normalizedItems.push({
         orderItemId,
         returnedProductId: Number(original.product_id),
+        replacementProductId: replacementProductId || null,
+        replacementQuantity: replacementProductId ? replacementQuantity : null,
+        replacementUnitPrice: replacementProductId ? replacementUnitPrice : null,
         reason,
         quantity,
         returnedSaleValue:
@@ -4891,7 +5563,9 @@ const createSalesReturn = async (payload, actorUserId) => {
             : 0,
         returnedCommercialValue,
         creditAmount: returnedCommercialValue,
-        replacementCommercialValue: 0,
+        replacementCommercialValue: replacementProductId
+          ? roundMoney(replacementUnitPrice * replacementQuantity)
+          : 0,
         notes: String(input.notes || "").trim() || null,
       });
     }
@@ -4901,12 +5575,15 @@ const createSalesReturn = async (payload, actorUserId) => {
     );
     const [result] = await connection.query(
       `INSERT INTO sales_returns (
-         order_id, sales_agent_user_id, status, reported_at,
+         order_id, operation_type, customer_id, request_key, sales_agent_user_id, status, reported_at,
          product_expires_at, report_deadline_at, notes, credit_amount, created_by
        )
-       VALUES (?, ?, 'pending_authorization', CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, 'pending_authorization', CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)`,
       [
         orderId,
+        operationType,
+        customerId,
+        requestKey,
         orders[0].sales_agent_user_id,
         orders[0].product_expires_at,
         orders[0].report_deadline_at,
@@ -4921,14 +5598,17 @@ const createSalesReturn = async (payload, actorUserId) => {
       await connection.query(
         `INSERT INTO sales_return_items (
            sales_return_id, order_item_id, returned_product_id,
-           replacement_product_id, reason, quantity, returned_sale_value,
+           replacement_product_id, replacement_quantity, replacement_unit_price, reason, quantity, returned_sale_value,
            returned_commercial_value, credit_amount, replacement_commercial_value, notes
          )
-         VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           salesReturnId,
           item.orderItemId,
           item.returnedProductId,
+          item.replacementProductId,
+          item.replacementQuantity,
+          item.replacementUnitPrice,
           item.reason,
           item.quantity,
           item.returnedSaleValue,
@@ -4944,20 +5624,39 @@ const createSalesReturn = async (payload, actorUserId) => {
       `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
        VALUES (?, 'sales_return.create', 'sales_returns', ?, JSON_OBJECT(
          'order_id', ?,
+         'operation_type', ?,
+         'customer_id', ?,
          'items_count', ?,
          'credit_amount', ?
        ))`,
-      [actorUserId || null, String(salesReturnId), orderId, normalizedItems.length, creditAmount]
+      [actorUserId || null, String(salesReturnId), orderId, operationType, customerId, normalizedItems.length, creditAmount]
     );
 
     await connection.commit();
     return {
       code: 1,
-      message: "devolucion reportada y pendiente de autorizacion",
+      message: operationType === "exchange" ? "cambio reportado y pendiente de autorización" : "devolución reportada y pendiente de autorización",
       data: { sales_return_id: salesReturnId, credit_amount: creditAmount },
     };
   } catch (error) {
     await connection.rollback();
+    if (error?.code === "ER_DUP_ENTRY" && requestKey) {
+      const [existingRequests] = await connection.query(
+        `SELECT id, credit_amount FROM sales_returns WHERE request_key = ?`,
+        [requestKey]
+      );
+      if (existingRequests.length) {
+        return {
+          code: 1,
+          message: "la operación ya había sido registrada",
+          data: {
+            sales_return_id: Number(existingRequests[0].id),
+            credit_amount: Number(existingRequests[0].credit_amount || 0),
+            idempotent: true,
+          },
+        };
+      }
+    }
     throw error;
   } finally {
     connection.release();
@@ -4970,7 +5669,7 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
   try {
     await connection.beginTransaction();
     const [returns] = await connection.query(
-      `SELECT sr.id, sr.order_id, sr.sales_agent_user_id, sr.status, o.branch_id, o.customer_id
+      `SELECT sr.id, sr.order_id, sr.operation_type, sr.sales_agent_user_id, sr.status, o.branch_id, o.customer_id
        FROM sales_returns sr
        INNER JOIN orders o ON o.id = sr.order_id
        WHERE sr.id = ?
@@ -4982,6 +5681,14 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
       return { code: 0, message: "devolucion no encontrada", data: null };
     }
     const salesReturn = returns[0];
+    if (salesReturn.status === "completed") {
+      await connection.rollback();
+      return {
+        code: 1,
+        message: "la operación ya había sido autorizada",
+        data: { sales_return_id: Number(salesReturn.id), idempotent: true },
+      };
+    }
     if (salesReturn.status !== "pending_authorization") {
       await connection.rollback();
       return { code: 0, message: "la devolucion ya fue procesada", data: null };
@@ -5007,23 +5714,49 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
       return { code: 0, message: "la devolucion no tiene productos", data: null };
     }
 
-    for (const item of items) {
-      await connection.query(
-        `INSERT INTO inventory_movements (
-           branch_id, item_type, raw_material_id, product_id, movement_type,
-           quantity, unit_cost, reference_type, reference_id, notes, created_by
-         )
-         VALUES (?, 'product', NULL, ?, 'return_in', ?, NULL,
-           'sales_return', ?, ?, ?)`,
-        [
-          salesReturn.branch_id,
-          item.returned_product_id,
-          item.quantity,
-          salesReturn.id,
-          `Devolucion no vendible: ${item.reason}`,
-          actorUserId,
-        ]
-      );
+    if (salesReturn.operation_type === "exchange") {
+      for (const item of items) {
+        const replacementProductId = Number(item.replacement_product_id || 0);
+        const replacementQuantity = Number(item.replacement_quantity || 0);
+        if (!replacementProductId || !Number.isInteger(replacementQuantity) || replacementQuantity <= 0) {
+          await connection.rollback();
+          return { code: 0, message: "el cambio no tiene un reemplazo válido", data: null };
+        }
+        const replacementPhysical = await resolvePhysicalProduct(connection, replacementProductId, { lock: true });
+        const inventoryProductId = replacementPhysical.physicalProductId;
+        const [stockRows] = await connection.query(
+          `SELECT quantity_on_hand
+             FROM stock_products
+            WHERE branch_id = ? AND product_id = ?
+            FOR UPDATE`,
+          [salesReturn.branch_id, inventoryProductId]
+        );
+        if (!stockRows.length || Number(stockRows[0].quantity_on_hand || 0) < replacementQuantity) {
+          await connection.rollback();
+          return { code: 0, message: "inventario insuficiente para entregar el producto de reemplazo", data: null };
+        }
+        await connection.query(
+          `UPDATE stock_products
+              SET quantity_on_hand = quantity_on_hand - ?, updated_at = CURRENT_TIMESTAMP
+            WHERE branch_id = ? AND product_id = ?`,
+          [replacementQuantity, salesReturn.branch_id, inventoryProductId]
+        );
+        await connection.query(
+          `INSERT INTO inventory_movements (
+             branch_id, item_type, raw_material_id, product_id, movement_type,
+             quantity, unit_cost, reference_type, reference_id, notes, created_by
+           ) VALUES (?, 'product', NULL, ?, 'sale_out', ?, ?, 'sales_return', ?, ?, ?)`,
+          [
+            salesReturn.branch_id,
+            inventoryProductId,
+            replacementQuantity,
+            Number(item.replacement_unit_price || 0),
+            salesReturn.id,
+            `Producto entregado en cambio #${salesReturn.id}`,
+            actorUserId || null,
+          ]
+        );
+      }
     }
 
     const returnedSalesTotal = roundMoney(
@@ -5067,36 +5800,65 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
        FOR UPDATE`,
       [salesReturn.order_id]
     );
+    let commissionTreatment = "no_effect";
+    let originalCommissionBase = 0;
+    let originalCommissionAmount = 0;
+    let adjustedCommissionBase = 0;
+    let adjustedCommissionAmount = 0;
     if (commissionRows.length) {
       const commission = commissionRows[0];
-      const newReturnedTotal = roundMoney(
-        Number(commission.returned_sales_total || 0) + returnedSalesTotal
-      );
-      const newBase = roundMoney(
-        Math.max(Number(commission.delivered_sales_total || 0) - newReturnedTotal, 0)
-      );
-      const newAmount = roundMoney(
-        newBase * (Number(commission.commission_percent || 0) / 100)
-      );
-      await connection.query(
-        `UPDATE sales_commissions
-         SET returned_sales_total = ?,
-             commission_base = ?,
-             commission_amount = ?,
-             status = 'adjusted',
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`,
-        [newReturnedTotal, newBase, newAmount, commission.id]
-      );
-      await connection.query(
-        `UPDATE orders
-         SET commission_base = ?,
-             commission_total = ?,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`,
-        [newBase, newAmount, salesReturn.order_id]
-      );
+      originalCommissionBase = roundMoney(commission.commission_base || 0);
+      originalCommissionAmount = roundMoney(commission.commission_amount || 0);
+      adjustedCommissionBase = originalCommissionBase;
+      adjustedCommissionAmount = originalCommissionAmount;
+      if (salesReturn.operation_type === "return") {
+        commissionTreatment = "reduce";
+        const newReturnedTotal = roundMoney(
+          Number(commission.returned_sales_total || 0) + returnedSalesTotal
+        );
+        adjustedCommissionBase = roundMoney(
+          Math.max(Number(commission.delivered_sales_total || 0) - newReturnedTotal, 0)
+        );
+        adjustedCommissionAmount = roundMoney(
+          adjustedCommissionBase * (Number(commission.commission_percent || 0) / 100)
+        );
+        await connection.query(
+          `UPDATE sales_commissions
+           SET returned_sales_total = ?, commission_base = ?, commission_amount = ?,
+               status = 'adjusted', updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`,
+          [newReturnedTotal, adjustedCommissionBase, adjustedCommissionAmount, commission.id]
+        );
+        await connection.query(
+          `UPDATE orders
+           SET commission_base = ?, commission_total = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`,
+          [adjustedCommissionBase, adjustedCommissionAmount, salesReturn.order_id]
+        );
+      }
     }
+
+    await connection.query(
+      `INSERT INTO sales_return_commission_adjustments (
+         sales_return_id, order_id, sales_agent_user_id, treatment,
+         original_commission_base, original_commission_amount,
+         adjusted_commission_base, adjusted_commission_amount,
+         base_delta, commission_delta, created_by
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        salesReturn.id,
+        salesReturn.order_id,
+        salesReturn.sales_agent_user_id,
+        commissionTreatment,
+        originalCommissionBase,
+        originalCommissionAmount,
+        adjustedCommissionBase,
+        adjustedCommissionAmount,
+        roundMoney(adjustedCommissionBase - originalCommissionBase),
+        roundMoney(adjustedCommissionAmount - originalCommissionAmount),
+        actorUserId || null,
+      ]
+    );
 
     await connection.query(
       `UPDATE sales_returns
@@ -5113,9 +5875,25 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
        VALUES (?, 'sales_return.authorize', 'sales_returns', ?, JSON_OBJECT(
          'order_id', ?,
          'returned_sales_total', ?,
-         'credit_amount', ?
+         'credit_amount', ?,
+         'commission_treatment', ?,
+         'commission_base_before', ?,
+         'commission_base_after', ?,
+         'commission_amount_before', ?,
+         'commission_amount_after', ?
        ))`,
-      [actorUserId, String(salesReturn.id), salesReturn.order_id, returnedSalesTotal, creditAmount]
+      [
+        actorUserId,
+        String(salesReturn.id),
+        salesReturn.order_id,
+        returnedSalesTotal,
+        creditAmount,
+        commissionTreatment,
+        originalCommissionBase,
+        adjustedCommissionBase,
+        originalCommissionAmount,
+        adjustedCommissionAmount,
+      ]
     );
 
     await connection.commit();
@@ -5131,6 +5909,90 @@ const authorizeSalesReturn = async ({ salesReturnId, canAuthorize = false }, act
     connection.release();
   }
 };
+const annulSalesExchange = async ({ salesReturnId, reason, canAnnul = false }, actorUserId) => {
+  const annulmentReason = String(reason || "").trim();
+  if (!canAnnul) return { code: 0, message: "solo un administrador puede anular un cambio", data: null };
+  if (annulmentReason.length < 5) return { code: 0, message: "indica el motivo de la anulación", data: null };
+
+  const db = await connect();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [returns] = await connection.query(
+      `SELECT sr.id, sr.operation_type, sr.status, o.branch_id
+         FROM sales_returns sr
+         INNER JOIN orders o ON o.id = sr.order_id
+        WHERE sr.id = ?
+        FOR UPDATE`,
+      [Number(salesReturnId || 0)]
+    );
+    if (!returns.length || returns[0].operation_type !== "exchange") {
+      await connection.rollback();
+      return { code: 0, message: "cambio no encontrado", data: null };
+    }
+    if (returns[0].status === "annulled") {
+      await connection.rollback();
+      return { code: 1, message: "el cambio ya estaba anulado", data: { sales_return_id: Number(returns[0].id), idempotent: true } };
+    }
+    if (returns[0].status !== "completed") {
+      await connection.rollback();
+      return { code: 0, message: "solo se puede anular un cambio autorizado", data: null };
+    }
+    const [items] = await connection.query(
+      `SELECT replacement_product_id, replacement_quantity, replacement_unit_price
+         FROM sales_return_items
+        WHERE sales_return_id = ?
+        FOR UPDATE`,
+      [returns[0].id]
+    );
+    for (const item of items) {
+      const productId = Number(item.replacement_product_id || 0);
+      const quantity = Number(item.replacement_quantity || 0);
+      if (!productId || quantity <= 0) continue;
+      const replacementPhysical = await resolvePhysicalProduct(connection, productId, { lock: true });
+      const inventoryProductId = replacementPhysical.physicalProductId;
+      await connection.query(
+        `INSERT INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
+         VALUES (?, ?, ?, 0)
+         ON DUPLICATE KEY UPDATE quantity_on_hand = quantity_on_hand + VALUES(quantity_on_hand), updated_at = CURRENT_TIMESTAMP`,
+        [returns[0].branch_id, inventoryProductId, quantity]
+      );
+      await connection.query(
+        `INSERT INTO inventory_movements (
+           branch_id, item_type, raw_material_id, product_id, movement_type,
+           quantity, unit_cost, reference_type, reference_id, notes, created_by
+         ) VALUES (?, 'product', NULL, ?, 'adjustment_in', ?, ?, 'sales_return', ?, ?, ?)`,
+        [returns[0].branch_id, inventoryProductId, quantity, Number(item.replacement_unit_price || 0), returns[0].id, `Reversión por anulación del cambio #${returns[0].id}`, actorUserId || null]
+      );
+    }
+    await connection.query(
+      `UPDATE sales_return_commission_adjustments
+          SET reversed_by = ?, reversed_at = CURRENT_TIMESTAMP, reversal_reason = ?
+        WHERE sales_return_id = ? AND reversed_at IS NULL`,
+      [actorUserId || null, annulmentReason, returns[0].id]
+    );
+    await connection.query(
+      `UPDATE sales_returns
+          SET status = 'annulled', annulled_by = ?, annulled_at = CURRENT_TIMESTAMP,
+              annulment_reason = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?`,
+      [actorUserId || null, annulmentReason, returns[0].id]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'sales_exchange.annul', 'sales_returns', ?, JSON_OBJECT('reason', ?))`,
+      [actorUserId || null, String(returns[0].id), annulmentReason]
+    );
+    await connection.commit();
+    return { code: 1, message: "cambio anulado e inventario compensado", data: { sales_return_id: Number(returns[0].id) } };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
 const rejectSalesReturn = async ({ salesReturnId, reason, canAuthorize = false }, actorUserId) => {
   const rejectionReason = String(reason || "").trim();
   if (rejectionReason.length < 5) {
@@ -5360,11 +6222,81 @@ const createProductionFromOrder = async (payload, actorUserId) => {
 };
 
 const receivePurchaseOrder = async (payload, actorUserId) => {
-  const out = await callProcedure("sp_receive_purchase_order", [
-    payload.p_purchase_order_id,
-    actorUserId || null,
-  ]);
-  return mapSpResult(out);
+  const purchaseOrderId = Number(payload.p_purchase_order_id || 0);
+  const db = await connect();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [orders] = await connection.query(
+      "SELECT id, branch_id, status FROM purchase_orders WHERE id = ? FOR UPDATE",
+      [purchaseOrderId]
+    );
+    if (!orders.length) {
+      await connection.rollback();
+      return { code: 0, message: "orden de compra no encontrada", data: null };
+    }
+    const order = orders[0];
+    if (!["draft", "sent", "partially_received"].includes(order.status)) {
+      await connection.rollback();
+      return { code: 0, message: `la orden de compra no se puede recibir desde el estado ${order.status}`, data: null };
+    }
+    const [items] = await connection.query(
+      `SELECT id, raw_material_id, quantity, unit_cost FROM purchase_order_items
+       WHERE purchase_order_id = ? ORDER BY id FOR UPDATE`,
+      [purchaseOrderId]
+    );
+    if (!items.length) {
+      await connection.rollback();
+      return { code: 0, message: "la orden de compra no tiene items", data: null };
+    }
+    for (const item of items) {
+      const { originalQuantity, normalizedQuantity } = normalizeRawMaterialEntryQuantity(item.quantity);
+      await connection.query(
+        `INSERT IGNORE INTO stock_raw_materials (branch_id, raw_material_id, quantity_on_hand, min_stock)
+         VALUES (?, ?, 0, 0)`,
+        [order.branch_id, item.raw_material_id]
+      );
+      await connection.query(
+        `SELECT quantity_on_hand FROM stock_raw_materials
+         WHERE branch_id = ? AND raw_material_id = ? FOR UPDATE`,
+        [order.branch_id, item.raw_material_id]
+      );
+      await connection.query(
+        `UPDATE stock_raw_materials SET quantity_on_hand = quantity_on_hand + ?
+         WHERE branch_id = ? AND raw_material_id = ?`,
+        [normalizedQuantity, order.branch_id, item.raw_material_id]
+      );
+      const [movementResult] = await connection.query(
+        `INSERT INTO inventory_movements
+          (branch_id, item_type, raw_material_id, product_id, movement_type, quantity, unit_cost,
+           reference_type, reference_id, notes, created_by)
+         VALUES (?, 'raw_material', ?, NULL, 'purchase_in', ?, ?, 'purchase_order', ?, ?, ?)`,
+        [order.branch_id, item.raw_material_id, normalizedQuantity, item.unit_cost, purchaseOrderId,
+          `received from purchase_order_item ${item.id}`, actorUserId || null]
+      );
+      await connection.query(
+        `INSERT INTO raw_material_stock_entry_audits
+          (raw_material_id, branch_id, inventory_movement_id, source_type, source_id,
+           original_quantity, normalized_quantity, actor_user_id)
+         VALUES (?, ?, ?, 'purchase_order', ?, ?, ?, ?)`,
+        [item.raw_material_id, order.branch_id, movementResult.insertId, item.id,
+          originalQuantity, normalizedQuantity, actorUserId || null]
+      );
+    }
+    await connection.query("UPDATE purchase_orders SET status = 'received' WHERE id = ?", [purchaseOrderId]);
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'purchase_order.receive', 'purchase_orders', ?, JSON_OBJECT('items_count', ?))`,
+      [actorUserId || null, String(purchaseOrderId), items.length]
+    );
+    await connection.commit();
+    return { code: 1, message: "orden de compra recibida", data: { purchase_order_id: purchaseOrderId, items_count: items.length } };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 };
 
 const createPurchaseOrder = async (payload, actorUserId) => {
@@ -5708,12 +6640,14 @@ const getPurchaseOrderDetail = async ({ purchaseOrderId }) => {
 };
 
 module.exports = {
+  resolveOrderProductPrice,
   getCustomerCreditBalance,
   listOrders,
   listOrderItems,
   listProductionReservations,
   listProductionReservationOptions,
   listOrderBaseData,
+  listOrderPricePreview,
   listSellerCustomerAssignments,
   assignCustomerToSeller,
   syncSellerCustomers,
@@ -5741,8 +6675,10 @@ module.exports = {
   createSalesGift,
   listSalesReturnOptions,
   listSalesReturns,
+  listSalesOperationsReport,
   createSalesReturn,
   authorizeSalesReturn,
+  annulSalesExchange,
   rejectSalesReturn,
   createProductionFromOrder,
   createPurchaseOrder,

@@ -1,0 +1,4 @@
+-- Plantilla documental: la aprobación debe ejecutarse desde la API administrativa,
+-- que bloquea existencias, crea respaldo, movimiento compensatorio y auditoría.
+-- No ejecutar UPDATE directo. Endpoint: POST /wholesale/duplicate-products/approve
+-- Campos: commercialProductId, physicalProductId, branchId, confirmedPhysicalStock, reason.

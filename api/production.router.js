@@ -1,6 +1,6 @@
 const express = require("express");
 const { verifyToken, requirePermission } = require("../middlewares/auth.handler");
-const { listEmployees } = require("../services/employees.service");
+const { isProductionAdministrator } = require("../domain/production-access");
 const {
   listProductionOrders,
   createProductionOrder,
@@ -11,13 +11,17 @@ const {
   registerProductionOrderItemResult,
   listProductionBaseData,
   listMyProductionBaseData,
+  listPackagingActors,
   registerProductionResult,
   registerProductionBatch,
   registerMyProductionBatch,
   listPendingPackaging,
   createPackingReport,
+  correctPackingReportItem,
+  correctProductionBatchOutput,
+  listProductionRecordCorrections,
   listPackingHistory,
-  listJustifiedShortages,
+  getPackingDamageReport,
   registerProductionDamage,
   getRawMaterialUsageReport,
   getRawMaterialUsageByProductReport,
@@ -28,13 +32,6 @@ const {
   updateProductionPlan,
   cancelProductionPlan,
   listProductionPlans,
-  startProductionPlanItem,
-  finishProductionPlanItem,
-  startProductionPlanProduct,
-  saveProductionPlanProductProgress,
-  skipProductionPlanProduct,
-  finishProductionPlanProduct,
-  correctProductionPlanProduct,
   listUserNotifications,
   markUserNotificationViewed,
   closeProductionOrder,
@@ -46,13 +43,6 @@ const canManageProduction = requirePermission("production.manage");
 const canRegisterBakerProduction = requirePermission("production.baker", "production.manage");
 const canRegisterPackaging = requirePermission("production.packaging", "production.manage");
 const canViewIngredientUsage = requirePermission("production.baker", "production.manage");
-const isProductionAdministrator = (user = {}) => {
-  const roles = Array.isArray(user.roles) ? user.roles : [];
-  const permissions = Array.isArray(user.permissions) ? user.permissions : [];
-  const codes = (items) => items.map((item) => typeof item === "string" ? item : item?.code || item?.permission_code || item?.name);
-  return codes(roles).some((code) => ["ADMIN", "SUPER_ADMIN"].includes(code))
-    || codes(permissions).includes("production.manage");
-};
 
 router.get("/plans", verifyToken, canManageProduction, async (req, res, next) => {
   try {
@@ -132,30 +122,6 @@ router.post("/my-batches", verifyToken, canRegisterBakerProduction, async (req, 
     next(error);
   }
 });
-router.post("/plans/items/:id/start", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
-  try {
-    const result = await startProductionPlanItem({
-      productionPlanItemId: Number(req.params.id),
-      userId: req.user.userId,
-    });
-    res.json(result);
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.post("/plans/items/:id/finish", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
-  try {
-    const result = await finishProductionPlanItem({
-      productionPlanItemId: Number(req.params.id),
-      userId: req.user.userId,
-    });
-    res.json(result);
-  } catch (error) {
-    next(error);
-  }
-});
-
 router.get("/notifications", verifyToken, async (req, res, next) => {
   try {
     const result = await listUserNotifications({
@@ -299,7 +265,7 @@ router.post("/results", verifyToken, canManageProduction, async (req, res, next)
 
 router.post("/batches", verifyToken, canManageProduction, async (req, res, next) => {
   try {
-    const result = await registerProductionBatch(req.body, req.user.userId);
+    const result = await registerProductionBatch(req.body, req.user.userId, { canManageAll: true });
     res.json(result);
   } catch (error) {
     next(error);
@@ -320,12 +286,9 @@ router.get("/packaging/pending", verifyToken, canRegisterPackaging, async (req, 
 
 router.get("/packaging/packers", verifyToken, canRegisterPackaging, async (req, res, next) => {
   try {
-    const result = await listEmployees({
-      status: "active",
-      jobType: "packer",
-      search: req.query.search,
-      page: 1,
-      pageSize: 200,
+    const result = await listPackagingActors({
+      actorUserId: req.user.userId,
+      canManageAll: isProductionAdministrator(req.user),
     });
     res.json(result);
   } catch (error) {
@@ -335,24 +298,8 @@ router.get("/packaging/packers", verifyToken, canRegisterPackaging, async (req, 
 
 router.post("/packaging/reports", verifyToken, canRegisterPackaging, async (req, res, next) => {
   try {
-    const result = await createPackingReport(req.body, req.user.userId);
-    res.json(result);
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.get("/packaging/shortages", verifyToken, canManageProduction, async (req, res, next) => {
-  try {
-    const result = await listJustifiedShortages({
-      branchId: req.query.branchId || req.query.branch_id,
-      productId: req.query.productId || req.query.product_id,
-      missingReason: req.query.missingReason || req.query.missing_reason,
-      search: req.query.search,
-      dateFrom: req.query.dateFrom || req.query.date_from,
-      dateTo: req.query.dateTo || req.query.date_to,
-      page: req.query.page,
-      pageSize: req.query.pageSize,
+    const result = await createPackingReport(req.body, req.user.userId, {
+      canManageAll: isProductionAdministrator(req.user),
     });
     res.json(result);
   } catch (error) {
@@ -391,11 +338,43 @@ router.get("/reports/raw-material-usage-by-product", verifyToken, canViewIngredi
       recipeId: req.query.recipeId || req.query.recipe_id,
       productId: req.query.productId || req.query.product_id,
       rawMaterialId: req.query.rawMaterialId || req.query.raw_material_id,
+      actorUserId: req.user.userId,
+      canManageAll: isProductionAdministrator(req.user),
     });
     res.json(result);
   } catch (error) {
     next(error);
   }
+});
+
+router.post("/corrections/packing-items/:id", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    res.json(await correctPackingReportItem({
+      packingReportItemId: Number(req.params.id),
+      correctedQuantity: req.body?.corrected_quantity,
+      damages: req.body?.damages,
+      reason: req.body?.reason,
+    }, req.user.userId));
+  } catch (error) { next(error); }
+});
+
+router.post("/corrections/production-outputs/:id", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    res.json(await correctProductionBatchOutput({
+      productionBatchOutputId: Number(req.params.id),
+      correctedQuantity: req.body?.corrected_quantity,
+      correctedBatchQuantity: req.body?.corrected_batch_quantity,
+      reason: req.body?.reason,
+    }, req.user.userId));
+  } catch (error) { next(error); }
+});
+
+router.get("/corrections", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    res.json(await listProductionRecordCorrections({
+      productionBatchId: req.query.productionBatchId || req.query.production_batch_id,
+    }));
+  } catch (error) { next(error); }
 });
 
 router.get("/packaging/history", verifyToken, canRegisterPackaging, async (req, res, next) => {
@@ -406,6 +385,9 @@ router.get("/packaging/history", verifyToken, canRegisterPackaging, async (req, 
       search: req.query.search,
       page: req.query.page,
       pageSize: req.query.pageSize || req.query.page_size,
+      includeReconciliation: isProductionAdministrator(req.user),
+      actorUserId: req.user.userId,
+      canManageAll: isProductionAdministrator(req.user),
     });
     res.json(result);
   } catch (error) {
@@ -413,54 +395,6 @@ router.get("/packaging/history", verifyToken, canRegisterPackaging, async (req, 
   }
 });
 
-router.post("/plans/products/:id/start", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
-  try {
-    res.json(await startProductionPlanProduct({
-      productionPlanOutputId: Number(req.params.id),
-      userId: req.user.userId,
-    }));
-  } catch (error) { next(error); }
-});
-
-router.patch("/plans/products/:id/progress", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
-  try {
-    res.json(await saveProductionPlanProductProgress({
-      productionPlanOutputId: Number(req.params.id),
-      userId: req.user.userId,
-      payload: req.body,
-    }));
-  } catch (error) { next(error); }
-});
-
-router.post("/plans/products/:id/skip", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
-  try {
-    res.json(await skipProductionPlanProduct({
-      productionPlanOutputId: Number(req.params.id),
-      userId: req.user.userId,
-      justification: req.body?.p_justification,
-    }));
-  } catch (error) { next(error); }
-});
-
-router.post("/plans/products/:id/finish", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
-  try {
-    res.json(await finishProductionPlanProduct({
-      productionPlanOutputId: Number(req.params.id),
-      userId: req.user.userId,
-      payload: req.body,
-    }));
-  } catch (error) { next(error); }
-});
-
-router.patch("/plans/products/:id/correction", verifyToken, canRegisterBakerProduction, async (req, res, next) => {
-  try {
-    res.json(await correctProductionPlanProduct({
-      productionPlanOutputId: Number(req.params.id),
-      actorUser: req.user,
-      payload: req.body,
-    }));
-  } catch (error) { next(error); }
-});
 router.get("/reports/packing-summary", verifyToken, canManageProduction, async (req, res, next) => {
   try {
     const result = await getPackingSummaryReport({
@@ -472,6 +406,22 @@ router.get("/reports/packing-summary", verifyToken, canManageProduction, async (
   } catch (error) {
     next(error);
   }
+});
+
+router.get("/reports/packing-damages", verifyToken, canManageProduction, async (req, res, next) => {
+  try {
+    res.json(await getPackingDamageReport({
+      dateFrom: req.query.dateFrom || req.query.date_from,
+      dateTo: req.query.dateTo || req.query.date_to,
+      branchId: req.query.branchId || req.query.branch_id,
+      recipeId: req.query.recipeId || req.query.recipe_id,
+      productId: req.query.productId || req.query.product_id,
+      damageReason: req.query.damageReason || req.query.damage_reason,
+      packerEmployeeId: req.query.packerEmployeeId || req.query.packer_employee_id,
+      page: req.query.page,
+      pageSize: req.query.pageSize || req.query.page_size,
+    }));
+  } catch (error) { next(error); }
 });
 
 router.get("/reports/day", verifyToken, canManageProduction, async (req, res, next) => {

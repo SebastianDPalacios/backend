@@ -11,6 +11,7 @@ const {
   listProductionReservations,
   listProductionReservationOptions,
   listOrderBaseData,
+  listOrderPricePreview,
   listSellerCustomerAssignments,
   assignCustomerToSeller,
   syncSellerCustomers,
@@ -39,8 +40,10 @@ const {
   getCustomerCreditBalance,
   listSalesReturnOptions,
   listSalesReturns,
+  listSalesOperationsReport,
   createSalesReturn,
   authorizeSalesReturn,
+  annulSalesExchange,
   rejectSalesReturn,
   createProductionFromOrder,
   createPurchaseOrder,
@@ -228,6 +231,20 @@ router.get("/gifts", verifyToken, canManageOrders, async (req, res, next) => {
   }
 });
 
+router.get("/price-preview", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await listOrderPricePreview({
+      customerId: req.query.customerId,
+      effectiveDate: req.query.effectiveDate,
+      actorUserId: req.user.userId,
+      canViewAllCustomers: hasElevatedCustomerAccess(req.user),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.post("/gifts", verifyToken, canManageOrders, async (req, res, next) => {
   try {
     const result = await createSalesGift(req.body, req.user.userId, {
@@ -255,7 +272,7 @@ router.get("/returns/options", verifyToken, canManageOrders, async (req, res, ne
   try {
     const result = await listSalesReturnOptions({
       actorUserId: req.user.userId,
-      canViewAll: hasElevatedCustomerAccess(req.user),
+      canViewAll: true,
     });
     res.json(result);
   } catch (error) {
@@ -276,7 +293,7 @@ router.get("/returns", verifyToken, canManageOrders, async (req, res, next) => {
   }
 });
 
-router.post("/returns", verifyToken, canManageOrders, requireBodyOrderAccess, async (req, res, next) => {
+router.post("/returns", verifyToken, canManageOrders, async (req, res, next) => {
   try {
     const result = await createSalesReturn(req.body, req.user.userId);
     res.json(result);
@@ -473,6 +490,49 @@ router.put("/:id/delivery-date", verifyToken, canManageOrders, requireOrderAcces
       {
         orderId: Number(req.params.id),
         deliveryDate: req.body?.delivery_date,
+      },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/returns-report", verifyToken, canManageOrders, async (req, res, next) => {
+  try {
+    const result = await listSalesOperationsReport({
+      actorUserId: req.user.userId,
+      canViewAll: hasElevatedCustomerAccess(req.user),
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
+      salesAgentUserId: req.query.salesAgentUserId,
+      customerId: req.query.customerId,
+      receivedProductId: req.query.receivedProductId,
+      deliveredProductId: req.query.deliveredProductId,
+      operationType: req.query.operationType,
+      orderId: req.query.orderId,
+      customerPriceType: req.query.customerPriceType,
+      priceListId: req.query.priceListId,
+      physicalProductId: req.query.physicalProductId,
+      commercialVariantId: req.query.commercialVariantId,
+      appliedPrice: req.query.appliedPrice,
+      page: req.query.page,
+      pageSize: req.query.pageSize,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/returns/:id/annul", verifyToken, canManageOrders, requireAdministrativeRole, async (req, res, next) => {
+  try {
+    const result = await annulSalesExchange(
+      {
+        salesReturnId: Number(req.params.id),
+        reason: req.body?.reason,
+        canAnnul: true,
       },
       req.user.userId
     );

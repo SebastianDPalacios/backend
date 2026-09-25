@@ -1,0 +1,2 @@
+ALTER TABLE wholesale_product_prices
+  DROP CHECK chk_wholesale_product_prices_whole_value;

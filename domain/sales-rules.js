@@ -33,7 +33,19 @@ const calculateSaleBonusOrder = ({ lines = [], bonusPercent, maxCompanyLoss = 0,
     generatedBonusValue = roundMoney(generatedBonusValue + generatedValue);
 
     if (commercialUnitPrice <= 0 || paidValue <= 0 || generatedValue <= 0) {
-      return { ...line, generatedValue, bonusQuantity: 0, physicalValue: 0, roundingDifference: 0 };
+      return {
+        ...line,
+        generatedValue,
+        bonusQuantity: 0,
+        physicalValue: 0,
+        roundingDifference: 0,
+        invoicedValue: paidValue,
+        bonusPercentApplied: generatedValue > 0 ? roundMoney(bonusPercent) : 0,
+        productPriceUsed: commercialUnitPrice,
+        formulaResultQuantity: commercialUnitPrice > 0
+          ? roundQuantity((paidValue + generatedValue) / commercialUnitPrice)
+          : 0,
+      };
     }
 
     const availableValue = roundMoney(paidValue + generatedValue);
@@ -57,7 +69,17 @@ const calculateSaleBonusOrder = ({ lines = [], bonusPercent, maxCompanyLoss = 0,
     const bonusQuantity = roundQuantity(Math.max(totalQuantity - saleQuantity, 0));
     const physicalValue = roundMoney(bonusQuantity * commercialUnitPrice);
     physicalBonusValue = roundMoney(physicalBonusValue + physicalValue);
-    return { ...line, generatedValue, bonusQuantity, physicalValue, roundingDifference };
+    return {
+      ...line,
+      generatedValue,
+      bonusQuantity,
+      physicalValue,
+      roundingDifference,
+      invoicedValue: paidValue,
+      bonusPercentApplied: generatedValue > 0 ? roundMoney(bonusPercent) : 0,
+      productPriceUsed: commercialUnitPrice,
+      formulaResultQuantity: roundQuantity(rawTotalQuantity),
+    };
   });
 
   return { allocations, generatedBonusValue, physicalBonusValue, marginUsed };
@@ -82,6 +104,10 @@ const calculateSaleBonus = (options) => {
     bonusQuantity: allocation.bonusQuantity,
     bonusCommercialValue: allocation.physicalValue,
     marginUsed: result.marginUsed,
+    invoicedValue: allocation.invoicedValue,
+    bonusPercentApplied: allocation.bonusPercentApplied,
+    productPriceUsed: allocation.productPriceUsed,
+    formulaResultQuantity: allocation.formulaResultQuantity,
   };
 };
 

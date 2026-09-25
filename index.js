@@ -39,6 +39,7 @@ app.use("/api/admin-auth", require("./api/admin-auth.router"));
 app.use("/api/reports", require("./api/reports.router"));
 app.use("/api/standard", require("./api/standard.router"));
 app.use("/api/settings", require("./api/settings.router"));
+app.use("/api/wholesale", require("./api/wholesale.router"));
 
 app.use(logErrors);
 app.use(boomErrorHandler);

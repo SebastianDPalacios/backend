@@ -32,6 +32,7 @@ const poolConfig = () => ({
   connectionLimit: getDbEnv().connectionLimit,
   queueLimit: 0,
   multipleStatements: true,
+  timezone: "-05:00",
 });
 
 const connect = async () => {

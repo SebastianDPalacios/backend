@@ -88,8 +88,25 @@ const requirePermission = (...permissionCodes) => {
   };
 };
 
+const ADMINISTRATIVE_ROLE_CODES = new Set(["ADMIN", "SUPER_ADMIN", "ADMINISTRATIVO", "ADMINISTRATIVE"]);
+
+const requireAdministrativeRole = (req, res, next) => {
+  const roles = normalizeCodes(req.user ? req.user.roles : []);
+  const isAdministrator = Array.from(roles).some((role) =>
+    ADMINISTRATIVE_ROLE_CODES.has(String(role).trim().toUpperCase())
+  );
+
+  if (!isAdministrator) {
+    next(boom.forbidden("solo un administrador puede configurar Mayoristas"));
+    return;
+  }
+
+  next();
+};
+
 module.exports = {
   signToken,
   verifyToken,
   requirePermission,
+  requireAdministrativeRole,
 };

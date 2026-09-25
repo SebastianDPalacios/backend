@@ -1,5 +1,10 @@
 const { callProcedure, connect } = require("../data-access");
 const { mapSpResult } = require("./sp-response");
+const {
+  FINISHED_PRODUCT_UNIT,
+  validateFinishedProductUnit,
+  isWholeFinishedProductQuantity,
+} = require("../domain/finished-product-rules");
 
 const getRows = (payload) => {
   if (Array.isArray(payload)) return payload;
@@ -46,6 +51,41 @@ const saveRawMaterialInventoryUsage = async (rawMaterialId, payload) => {
     "UPDATE raw_materials SET inventory_usage_type = ? WHERE id = ?",
     [normalizeInventoryUsageType(payload), rawMaterialId]
   );
+};
+
+const savePhysicalProductRelation = async (productId, requestedPhysicalProductId) => {
+  const db = await connect();
+  const physicalProductId = requestedPhysicalProductId ? Number(requestedPhysicalProductId) : null;
+  if (!physicalProductId) {
+    await db.query("UPDATE products SET physical_product_id = NULL WHERE id = ?", [Number(productId)]);
+    return;
+  }
+  if (Number(productId) === physicalProductId) {
+    throw new Error("un producto no puede ser variante de sí mismo");
+  }
+  const [targets] = await db.query(
+    `SELECT id
+       FROM products
+      WHERE id = ? AND physical_product_id IS NULL AND is_active = 1 AND deleted_at IS NULL AND unit = ?
+      LIMIT 1`,
+    [physicalProductId, FINISHED_PRODUCT_UNIT]
+  );
+  if (!targets.length) throw new Error("selecciona un producto físico principal activo");
+  await db.query("UPDATE products SET physical_product_id = ? WHERE id = ?", [physicalProductId, Number(productId)]);
+};
+
+const validatePhysicalProductRelation = async (productId, requestedPhysicalProductId) => {
+  const physicalProductId = requestedPhysicalProductId ? Number(requestedPhysicalProductId) : null;
+  if (!physicalProductId) return null;
+  if (Number(productId || 0) === physicalProductId) return "un producto no puede ser variante de sí mismo";
+  const db = await connect();
+  const [targets] = await db.query(
+    `SELECT id FROM products
+      WHERE id = ? AND physical_product_id IS NULL AND is_active = 1 AND deleted_at IS NULL AND unit = ?
+      LIMIT 1`,
+    [physicalProductId, FINISHED_PRODUCT_UNIT]
+  );
+  return targets.length ? null : "selecciona un producto físico principal activo";
 };
 
 const enrichRawMaterialPackages = async (payload) => {
@@ -112,9 +152,22 @@ const listProducts = async ({ onlyActive, categoryId, search, page, pageSize }) 
   if (result.code === 1 && Array.isArray(result.data?.items) && result.data.items.length) {
     const db = await connect();
     const ids = result.data.items.map((item) => Number(item.id)).filter(Boolean);
-    const [rows] = await db.query(`SELECT id, includes_bonus FROM products WHERE id IN (${ids.map(() => "?").join(",")})`, ids);
-    const flags = new Map(rows.map((row) => [Number(row.id), Number(row.includes_bonus || 0)]));
-    result.data.items = result.data.items.map((item) => ({ ...item, includes_bonus: flags.get(Number(item.id)) || 0 }));
+    const [rows] = await db.query(
+      `SELECT p.id, p.includes_bonus, p.physical_product_id, physical.name AS physical_product_name
+         FROM products p
+         LEFT JOIN products physical ON physical.id = p.physical_product_id
+        WHERE p.id IN (${ids.map(() => "?").join(",")})`,
+      ids
+    );
+    const flags = new Map(rows.map((row) => [Number(row.id), row]));
+    result.data.items = result.data.items.map((item) => ({
+      ...item,
+      unit: FINISHED_PRODUCT_UNIT,
+      includes_bonus: Number(flags.get(Number(item.id))?.includes_bonus || 0),
+      physical_product_id: flags.get(Number(item.id))?.physical_product_id || null,
+      physical_product_name: flags.get(Number(item.id))?.physical_product_name || item.name,
+      is_commercial_variant: Boolean(flags.get(Number(item.id))?.physical_product_id),
+    }));
   }
   return result;
 };
@@ -281,6 +334,19 @@ const updateSupplier = async (payload, actorUserId) => {
 };
 
 const createProduct = async (payload, actorUserId) => {
+  const unitValidation = validateFinishedProductUnit(payload.p_unit);
+  if (!unitValidation.valid) {
+    return { code: 0, message: "Los productos terminados solo pueden manejarse en Unidades.", data: null };
+  }
+  if (!isWholeFinishedProductQuantity(payload.p_min_stock ?? 0, { allowZero: true })) {
+    return { code: 0, message: "El stock minimo del producto debe ser una cantidad entera.", data: null };
+  }
+  if (payload.p_units_per_bag !== null && payload.p_units_per_bag !== undefined
+    && payload.p_units_per_bag !== "" && !isWholeFinishedProductQuantity(payload.p_units_per_bag)) {
+    return { code: 0, message: "Las unidades por bulto deben ser una cantidad entera mayor a cero.", data: null };
+  }
+  const physicalRelationError = await validatePhysicalProductRelation(null, payload.p_physical_product_id);
+  if (physicalRelationError) return { code: 0, message: physicalRelationError, data: null };
   let out;
   try {
     const db = await connect();
@@ -312,7 +378,7 @@ const createProduct = async (payload, actorUserId) => {
       payload.p_description || null,
       payload.p_category_id || null,
       payload.p_tax_rate_id || null,
-      payload.p_unit || null,
+      FINISHED_PRODUCT_UNIT,
       payload.p_base_price ?? null,
       payload.p_min_stock ?? null,
       payload.p_units_per_bag ?? null,
@@ -347,18 +413,32 @@ const createProduct = async (payload, actorUserId) => {
   if (result.code === 1 && result.data?.product_id) {
     const db = await connect();
     await db.query("UPDATE products SET includes_bonus = ? WHERE id = ?", [Number(payload.p_includes_bonus || 0), Number(result.data.product_id)]);
+    await savePhysicalProductRelation(Number(result.data.product_id), payload.p_physical_product_id);
   }
   return result;
 };
 
 const updateProduct = async (payload, actorUserId) => {
+  const unitValidation = validateFinishedProductUnit(payload.p_unit);
+  if (!unitValidation.valid) {
+    return { code: 0, message: "Los productos terminados solo pueden manejarse en Unidades.", data: null };
+  }
+  if (!isWholeFinishedProductQuantity(payload.p_min_stock ?? 0, { allowZero: true })) {
+    return { code: 0, message: "El stock minimo del producto debe ser una cantidad entera.", data: null };
+  }
+  if (payload.p_units_per_bag !== null && payload.p_units_per_bag !== undefined
+    && payload.p_units_per_bag !== "" && !isWholeFinishedProductQuantity(payload.p_units_per_bag)) {
+    return { code: 0, message: "Las unidades por bulto deben ser una cantidad entera mayor a cero.", data: null };
+  }
+  const physicalRelationError = await validatePhysicalProductRelation(payload.p_product_id, payload.p_physical_product_id);
+  if (physicalRelationError) return { code: 0, message: physicalRelationError, data: null };
   const out = await callProcedure("sp_product_update", [
     payload.p_product_id,
     payload.p_name || null,
     payload.p_description || null,
     payload.p_category_id || null,
     payload.p_tax_rate_id || null,
-    payload.p_unit || null,
+    FINISHED_PRODUCT_UNIT,
     payload.p_base_price ?? null,
     payload.p_min_stock ?? null,
     payload.p_units_per_bag ?? null,
@@ -369,11 +449,15 @@ const updateProduct = async (payload, actorUserId) => {
   if (result.code === 1) {
     const db = await connect();
     await db.query("UPDATE products SET includes_bonus = ? WHERE id = ?", [Number(payload.p_includes_bonus || 0), Number(payload.p_product_id)]);
+    await savePhysicalProductRelation(Number(payload.p_product_id), payload.p_physical_product_id);
   }
   return result;
 };
 
 const updateProductYield = async (payload, actorUserId) => {
+  if (!isWholeFinishedProductQuantity(payload.p_units_per_bag)) {
+    return { code: 0, message: "Las unidades por bulto deben ser una cantidad entera mayor a cero.", data: null };
+  }
   const out = await callProcedure("sp_product_yield_update", [
     payload.p_product_id,
     payload.p_units_per_bag ?? null,

@@ -1,5 +1,15 @@
-﻿const { callProcedure, connect } = require("../data-access");
+const { callProcedure, connect } = require("../data-access");
+const { getOperationalDate, getOperationalMonth, validateOperationalDate } = require("../domain/operational-date");
 const { mapSpResult } = require("./sp-response");
+const {
+  sanitizePackagingBatchForIndependentCount,
+  normalizeInformationalPlanStatus,
+  calculateClosedCountComparison,
+} = require("../domain/production-flow");
+const {
+  validateProductionRegistrationDate,
+  validateProductionRequestKey,
+} = require("../domain/production-registration");
 
 const listProductionOrders = async ({ status, search, page, pageSize }) => {
   const db = await connect();
@@ -782,6 +792,41 @@ const listActiveBakers = async (dbOrConnection) => {
   return rows;
 };
 
+const findActivePackerForUser = async (dbOrConnection, userId) => {
+  const [rows] = await dbOrConnection.query(
+    `SELECT e.id, e.user_id, e.job_type, u.full_name, u.username, u.email
+       FROM employees e
+       INNER JOIN users u ON u.id = e.user_id
+      WHERE e.user_id = ?
+        AND e.job_type = 'packer'
+        AND e.status = 'active'
+        AND e.deleted_at IS NULL
+      LIMIT 1`,
+    [Number(userId)]
+  );
+  return rows[0] || null;
+};
+
+const listPackagingActors = async ({ actorUserId, canManageAll = false } = {}) => {
+  const db = await connect();
+  if (!canManageAll) {
+    const packer = await findActivePackerForUser(db, actorUserId);
+    return {
+      code: packer ? 1 : 0,
+      message: packer ? "Empaquetador obtenido." : "Tu usuario no tiene un empleado empaquetador activo asociado.",
+      data: packer ? [packer] : [],
+    };
+  }
+  const [rows] = await db.query(
+    `SELECT e.id, e.user_id, e.job_type, u.full_name, u.username, u.email
+       FROM employees e
+       INNER JOIN users u ON u.id = e.user_id
+      WHERE e.job_type = 'packer' AND e.status = 'active' AND e.deleted_at IS NULL
+      ORDER BY u.full_name, e.id`
+  );
+  return { code: 1, message: "Empaquetadores obtenidos.", data: rows };
+};
+
 const listMyProductionBaseData = async ({ userId, bakerEmployeeId, canManageAll = false } = {}) => {
   const db = await connect();
   const bakers = canManageAll ? await listActiveBakers(db) : [];
@@ -947,7 +992,8 @@ const registerMyProductionBatch = async (payload, actorUserId, { canManageAll = 
       ...payload,
       p_baker_employee_id: Number(baker.id),
     },
-    actorUserId
+    actorUserId,
+    { canManageAll }
   );
 };
 const registerProductionResult = async (payload, actorUserId) => {
@@ -1076,6 +1122,7 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
   const requestedRecipeId = Number(payload.p_recipe_id || 0);
   const bakerEmployeeId = Number(payload.p_baker_employee_id || 0);
   const batchQuantity = Number(payload.p_batch_quantity || 1);
+  const requestKeyValidation = validateProductionRequestKey(payload.p_client_request_key);
   const selectedOutputs = Array.isArray(payload.p_outputs) ? payload.p_outputs : payload.p_outputs_json || [];
   const requestedOutputMap = new Map();
   selectedOutputs.forEach((item) => {
@@ -1094,22 +1141,59 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
       data: null,
     };
   }
+  if (!requestKeyValidation.valid) {
+    if (ownsTransaction) connection.release();
+    return { code: 0, message: requestKeyValidation.message, data: null };
+  }
+  const clientRequestKey = requestKeyValidation.requestKey;
 
   try {
     if (ownsTransaction) await connection.beginTransaction();
+
+    const [existingBatchRows] = await connection.query(
+      `SELECT id, recipe_id, created_by
+         FROM production_batches
+        WHERE client_request_key = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [clientRequestKey]
+    );
+    if (existingBatchRows.length) {
+      if (ownsTransaction) await connection.rollback();
+      if (Number(existingBatchRows[0].created_by) !== Number(actorUserId)) {
+        return { code: 0, message: "El identificador de la solicitud ya fue utilizado.", data: null };
+      }
+      return {
+        code: 1,
+        message: "Esta produccion ya habia sido registrada.",
+        data: {
+          production_batch_id: Number(existingBatchRows[0].id),
+          recipe_id: Number(existingBatchRows[0].recipe_id),
+          replayed: true,
+        },
+      };
+    }
+
+    const dateValidation = validateProductionRegistrationDate({
+      producedDate: payload.p_produced_date,
+      currentDate: getOperationalDate(),
+      canManageAll: Boolean(options.canManageAll),
+      retroactiveReason: payload.p_retroactive_reason,
+    });
+    if (!dateValidation.valid) {
+      if (ownsTransaction) await connection.rollback();
+      return { code: 0, message: dateValidation.message, data: null };
+    }
 
     const [recipeRows] = await connection.query(
       `SELECT current_recipe.id,
               current_recipe.recipe_family_id,
               current_recipe.version_no,
               current_recipe.notes
-         FROM recipes requested
-         INNER JOIN recipes current_recipe
-           ON current_recipe.recipe_family_id = COALESCE(requested.recipe_family_id, requested.id)
+         FROM recipes current_recipe
+        WHERE current_recipe.id = ?
           AND current_recipe.is_current = 1
           AND current_recipe.is_active = 1
-        WHERE requested.id = ?
-        ORDER BY current_recipe.version_no DESC
         LIMIT 1
         FOR UPDATE`,
       [requestedRecipeId]
@@ -1147,9 +1231,12 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
     }
 
     const [availableOutputs] = await connection.query(
-      `SELECT ro.id, ro.product_id, ro.expected_quantity, ro.packing_note, p.name AS product_name
+      `SELECT ro.id, ro.product_id,
+              COALESCE(p.physical_product_id, p.id) AS physical_product_id,
+              ro.expected_quantity, ro.packing_note, physical.name AS product_name
          FROM recipe_outputs ro
          INNER JOIN products p ON p.id = ro.product_id
+         INNER JOIN products physical ON physical.id = COALESCE(p.physical_product_id, p.id)
         WHERE ro.recipe_id = ?
         ORDER BY ro.sort_order, ro.id`,
       [recipeId]
@@ -1245,16 +1332,17 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
     const [batchInsert] = await connection.query(
       `INSERT INTO production_batches (
          branch_id, recipe_id, baker_employee_id, produced_date, batch_quantity,
-         status, notes, created_by
-       ) VALUES (?, ?, ?, COALESCE(?, CURRENT_DATE), ?, 'pending_packaging', ?, ?)`,
+         status, notes, created_by, client_request_key
+       ) VALUES (?, ?, ?, ?, ?, 'pending_packaging', ?, ?, ?)`,
       [
         branchId,
         recipeId,
         bakerEmployeeId,
-        payload.p_produced_date || null,
+        dateValidation.producedDate,
         batchQuantity,
         payload.p_notes || null,
         actorUserId || null,
+        clientRequestKey,
       ]
     );
     const productionBatchId = Number(batchInsert.insertId);
@@ -1312,7 +1400,7 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
          ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)`,
         [
           productionBatchId,
-          Number(output.product_id),
+          Number(output.physical_product_id),
           Number(output.expected_quantity),
           producedQuantity,
           actorUserId || null,
@@ -1322,11 +1410,15 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
 
       reconciliationResults.push(await reconcilePendingProductSales(connection, {
         branchId,
-        productId: Number(output.product_id),
+        productId: Number(output.physical_product_id),
         productionBatchId,
         businessDate: productionBusinessDate,
         actorUserId,
       }));
+    }
+    if (new Set(outputRows.map((output) => Number(output.physical_product_id))).size !== outputRows.length) {
+      if (ownsTransaction) await connection.rollback();
+      return { code: 0, message: "La receta contiene variantes que apuntan al mismo producto físico.", data: null };
     }
 
     await connection.query(
@@ -1334,7 +1426,8 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
        VALUES (?, 'production_batch.register_current_recipe', 'production_batches', ?,
          JSON_OBJECT(
            'recipe_id', ?, 'version_no', ?, 'baker_employee_id', ?, 'arrobas', ?,
-           'outputs', ?, 'prior_sales_reconciled', ?
+           'outputs', ?, 'prior_sales_reconciled', ?, 'retroactive_reason', ?,
+           'executed_by', ?
          ))`,
       [
         actorUserId || null,
@@ -1348,6 +1441,8 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
           (total, row) => total + Number(row.pending_sales_quantity || 0),
           0
         ),
+        dateValidation.retroactiveReason,
+        actorUserId || null,
       ]
     );
 
@@ -1364,6 +1459,26 @@ const registerProductionBatch = async (payload, actorUserId, options = {}) => {
     };
   } catch (error) {
     if (ownsTransaction) await connection.rollback();
+    if (error?.code === "ER_DUP_ENTRY" && clientRequestKey) {
+      const [existingBatchRows] = await db.query(
+        "SELECT id, recipe_id, created_by FROM production_batches WHERE client_request_key = ? LIMIT 1",
+        [clientRequestKey]
+      );
+      if (existingBatchRows.length) {
+        if (Number(existingBatchRows[0].created_by) !== Number(actorUserId)) {
+          return { code: 0, message: "El identificador de la solicitud ya fue utilizado.", data: null };
+        }
+        return {
+          code: 1,
+          message: "Esta produccion ya habia sido registrada.",
+          data: {
+            production_batch_id: Number(existingBatchRows[0].id),
+            recipe_id: Number(existingBatchRows[0].recipe_id),
+            replayed: true,
+          },
+        };
+      }
+    }
     throw error;
   } finally {
     if (ownsTransaction) connection.release();
@@ -1377,198 +1492,611 @@ const listPendingPackaging = async ({ branchId, search } = {}) => {
   ]);
   const result = mapSpResult(out);
   const batches = Array.isArray(result.data) ? result.data : [];
-  result.data = batches.map((batch) => ({
-    ...batch,
-    items: (Array.isArray(batch.items) ? batch.items : []).map((item) => {
-      const safeItem = { ...item };
-      ["produced_quantity", "expected_quantity", "counted_quantity", "packed_quantity", "damaged_quantity", "missing_quantity"].forEach((field) => delete safeItem[field]);
-      return safeItem;
-    }),
-  }));
+  result.data = batches.map(sanitizePackagingBatchForIndependentCount);
   return result;
 };
 
-const createPackingReport = async (payload, actorUserId) => {
+const createPackingReport = async (payload, actorUserId, { canManageAll = false } = {}) => {
+  const batchId = Number(payload.p_production_batch_id || 0);
+  const requestedPackerEmployeeId = Number(payload.p_packer_employee_id || 0);
+  const clientRequestKey = String(payload.p_client_request_key || "").trim();
+  const validRequestKey = /^[A-Za-z0-9:_-]{16,100}$/.test(clientRequestKey);
   const submittedItems = Array.isArray(payload.p_items) ? payload.p_items : payload.p_items_json || [];
-  const items = submittedItems.map((item) => {
-    const damages = Array.isArray(item.damages) ? item.damages : [];
-    const damagedQuantity = damages.reduce((total, damage) => total + Number(damage.quantity || 0), 0);
-    const damageNotes = damages
-      .filter((damage) => Number(damage.quantity || 0) > 0)
-      .map((damage) => `${Number(damage.quantity)}: ${String(damage.reason_label || damage.reason || "Daño").trim()}${damage.notes ? ` (${String(damage.notes).trim()})` : ""}`)
-      .join("; ");
-    return {
-      ...item,
-      damaged_quantity: damagedQuantity,
-      damage_reason: damages.find((damage) => Number(damage.quantity || 0) > 0)?.reason || null,
-      notes: [damageNotes, item.notes].filter(Boolean).join(". ") || null,
-    };
-  });
-  const outputIds = items.map((item) => Number(item.production_batch_output_id));
-  const validOutputIds = outputIds.filter((id) => Number.isInteger(id) && id > 0);
-  const validMissingReasons = new Set([
-    "count_difference",
-    "handling_loss",
-    "suspected_theft",
-    "other",
-  ]);
-  const validDamageReasons = new Set([
-    "production",
-    "oven",
-    "cut",
-    "packaging",
-  ]);
+  const validDamageReasons = new Set(["production", "oven", "cut", "packaging"]);
+  const items = submittedItems.map((item) => ({
+    productionBatchOutputId: Number(item.production_batch_output_id || 0),
+    packedQuantity: Number(item.packed_quantity || 0),
+    notes: String(item.notes || "").trim() || null,
+    damages: (Array.isArray(item.damages) ? item.damages : []).map((damage) => ({
+      quantity: Number(damage.quantity || 0),
+      reason: String(damage.reason || "").trim(),
+      detail: String(damage.notes || "").trim() || null,
+    })),
+  }));
+  const packedDateValidation = validateOperationalDate(payload.p_packed_date);
 
-  if (!items.length) {
-    return { code: 0, message: "Agrega al menos un producto contado.", data: null };
+  if (!packedDateValidation.valid) {
+    return { code: 0, message: packedDateValidation.message, data: null };
+  }
+  const packedDate = packedDateValidation.operationalDate;
+
+  const db = await connect();
+  const assignedPacker = canManageAll ? null : await findActivePackerForUser(db, actorUserId);
+  const packerEmployeeId = canManageAll ? requestedPackerEmployeeId : Number(assignedPacker?.id || 0);
+  if (!batchId || !packerEmployeeId || !items.length) {
+    return { code: 0, message: "Selecciona lote, contador y al menos un producto contado.", data: null };
+  }
+  if (!validRequestKey) {
+    return { code: 0, message: "El cierre no tiene un identificador idempotente válido.", data: null };
+  }
+  if (items.some((item) => !Number.isInteger(item.productionBatchOutputId) || item.productionBatchOutputId <= 0)
+    || new Set(items.map((item) => item.productionBatchOutputId)).size !== items.length) {
+    return { code: 0, message: "Cada producto debe aparecer una sola vez en el conteo.", data: null };
+  }
+  const invalidQuantity = items.some((item) => !Number.isInteger(item.packedQuantity) || item.packedQuantity < 0
+    || item.damages.some((damage) => !Number.isInteger(damage.quantity) || damage.quantity <= 0 || !validDamageReasons.has(damage.reason)));
+  if (invalidQuantity) {
+    return { code: 0, message: "Revisa la cantidad empacada y los daños. Cada daño requiere cantidad y motivo.", data: null };
   }
 
-  if (validOutputIds.length !== items.length) {
-    return { code: 0, message: "Hay un producto de produccion invalido en el reporte.", data: null };
-  }
-
-  if (new Set(validOutputIds).size !== validOutputIds.length) {
-    return {
-      code: 0,
-      message: "Cada producto debe aparecer una sola vez en el reporte de conteo.",
-      data: null,
-    };
-  }
-
-  if (items.some((item) => (item.damages || []).some((damage) => Number(damage.quantity || 0) <= 0 || !validDamageReasons.has(damage.reason)))) {
-    return { code: 0, message: "Cada daño debe tener una cantidad mayor a cero y un motivo válido.", data: null };
-  }
-
-  if (validOutputIds.length) {
-    const db = await connect();
-    const [outputRows] = await db.query(
-      `SELECT id, produced_quantity, packed_quantity, damaged_quantity, missing_quantity, direct_delivered_quantity
-         FROM production_batch_outputs
-        WHERE production_batch_id = ? AND id IN (?)`,
-      [Number(payload.p_production_batch_id), validOutputIds]
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [replayedReports] = await connection.query(
+      `SELECT id, created_by FROM packing_reports WHERE client_request_key = ? LIMIT 1`,
+      [clientRequestKey]
     );
-    const outputsById = new Map(outputRows.map((row) => [Number(row.id), row]));
-    if (outputsById.size !== validOutputIds.length) {
-      return { code: 0, message: "Uno o más productos ya no están disponibles para empaque.", data: null };
-    }
-    let exceedsAvailable = false;
-    items.forEach((item) => {
-      const output = outputsById.get(Number(item.production_batch_output_id));
-      if (!output) return;
-      const available = Math.max(
-        Number(output.produced_quantity || 0)
-          - Number(output.packed_quantity || 0)
-          - Number(output.damaged_quantity || 0)
-          - Number(output.missing_quantity || 0)
-          - Number(output.direct_delivered_quantity || 0),
-        0
-      );
-      const packed = Number(item.packed_quantity || 0);
-      const damaged = Number(item.damaged_quantity || 0);
-      if (packed + damaged > available) {
-        exceedsAvailable = true;
-        return;
+    if (replayedReports.length) {
+      await connection.rollback();
+      if (!canManageAll && Number(replayedReports[0].created_by) !== Number(actorUserId)) {
+        return { code: 0, message: "El identificador del conteo pertenece a otro usuario.", data: null };
       }
-      item.missing_quantity = Math.max(available - packed - damaged, 0);
-      item.counted_quantity = packed + damaged + item.missing_quantity;
-      item.missing_reason = item.missing_quantity > 0 ? "count_difference" : null;
-      if (item.missing_quantity > 0) {
-        item.notes = [item.notes, "Faltante calculado automaticamente por diferencia"].filter(Boolean).join(". ");
-      }
-    });
-    if (exceedsAvailable) {
       return {
-        code: 0,
-        message: "La suma de empacados y dañados supera la cantidad disponible de uno de los productos.",
-        data: null,
+        code: 1,
+        message: "Conteo guardado correctamente.",
+        data: { packing_report_id: Number(replayedReports[0].id), replayed: true },
       };
     }
-  }
 
-  const hasInvalidQuantity = items.some((item) => {
-    const counted = Number(item.counted_quantity || 0);
-    const packed = Number(item.packed_quantity || 0);
-    const damaged = Number(item.damaged_quantity || 0);
-    const missing = Number(item.missing_quantity || 0);
-
-    return [counted, packed, damaged, missing].some((value) => !Number.isFinite(value) || value < 0)
-      || counted <= 0
-      || packed + damaged > counted;
-  });
-
-  if (hasInvalidQuantity) {
-    return {
-      code: 0,
-      message: "Revisa las cantidades de empacados y dañados. Deben ser valores válidos mayores o iguales a cero.",
-      data: null,
-    };
-  }
-
-  const unjustifiedDamage = items.some((item) => {
-    const damaged = Number(item.damaged_quantity || 0);
-    return damaged > 0 && !validDamageReasons.has(item.damage_reason);
-  });
-
-  if (unjustifiedDamage) {
-    return {
-      code: 0,
-      message: "Todo producto dañado debe indicar si ocurrió en producción, horneo, corte o empaque.",
-      data: null,
-    };
-  }
-
-  const unjustifiedMissing = items.some((item) => {
-    const missing = Number(item.missing_quantity || 0);
-    return missing > 0
-      && (!validMissingReasons.has(item.missing_reason) || !String(item.notes || "").trim());
-  });
-
-  if (unjustifiedMissing) {
-    return {
-      code: 0,
-      message: "Todo faltante debe incluir un motivo y una explicacion.",
-      data: null,
-    };
-  }
-
-  const out = await callProcedure("sp_packing_report_create", [
-    payload.p_production_batch_id || null,
-    payload.p_packer_employee_id || null,
-    payload.p_packed_date || null,
-    JSON.stringify(items),
-    payload.p_notes || null,
-    actorUserId || null,
-  ]);
-  const result = mapSpResult(out);
-  if (result.code === 1) {
-    result.data = {
-      ...(result.data || {}),
-      missing_quantity: items.reduce((total, item) => total + Number(item.missing_quantity || 0), 0),
-    };
-  }
-
-  if (result.code === 1 && validOutputIds.length) {
-    const db = await connect();
-    await db.query(
-      `UPDATE production_batch_outputs
-          SET counted_by = ?,
-              counted_at = CURRENT_TIMESTAMP
-        WHERE id IN (?)
-          AND counted_quantity > 0`,
-      [actorUserId || null, validOutputIds]
+    const [batchRows] = await connection.query(
+      `SELECT id, branch_id, status
+         FROM production_batches
+        WHERE id = ?
+        FOR UPDATE`,
+      [batchId]
     );
-  }
+    if (!batchRows.length) {
+      await connection.rollback();
+      return { code: 0, message: "El lote no existe.", data: null };
+    }
 
-  return result;
+    const [packerRows] = await connection.query(
+      `SELECT id
+         FROM employees
+        WHERE id = ? AND job_type = 'packer' AND status = 'active' AND deleted_at IS NULL
+        LIMIT 1`,
+      [packerEmployeeId]
+    );
+    if (!packerRows.length) {
+      await connection.rollback();
+      return { code: 0, message: "El contador o empaquetador no existe o está inactivo.", data: null };
+    }
+
+    const outputIds = items.map((item) => item.productionBatchOutputId);
+    const [outputRows] = await connection.query(
+      `SELECT id, product_id, produced_quantity, counted_at
+         FROM production_batch_outputs
+        WHERE production_batch_id = ? AND id IN (?)
+        FOR UPDATE`,
+      [batchId, outputIds]
+    );
+    if (outputRows.length !== outputIds.length) {
+      await connection.rollback();
+      return { code: 0, message: "Uno o más productos no pertenecen al lote seleccionado.", data: null };
+    }
+    const processedOutputs = outputRows.filter((row) => row.counted_at !== null);
+    if (processedOutputs.length) {
+      const [existingRows] = await connection.query(
+        `SELECT pri.packing_report_id, pr.created_by
+           FROM packing_report_items pri
+           INNER JOIN packing_reports pr ON pr.id = pri.packing_report_id
+          WHERE pri.production_batch_output_id IN (?)
+          ORDER BY pri.packing_report_id DESC
+          FOR UPDATE`,
+        [processedOutputs.map((row) => Number(row.id))]
+      );
+      await connection.rollback();
+      if (processedOutputs.length === outputRows.length && existingRows.length) {
+        if (!canManageAll && Number(existingRows[0].created_by) !== Number(actorUserId)) {
+          return { code: 0, message: "Este producto ya fue contado por otro usuario.", data: null };
+        }
+        return {
+          code: 1,
+          message: "Conteo guardado correctamente.",
+          data: { packing_report_id: Number(existingRows[0].packing_report_id), replayed: true },
+        };
+      }
+      return { code: 0, message: "Uno o más productos ya tienen un conteo registrado.", data: null };
+    }
+    if (!["pending_packaging", "partially_packed"].includes(String(batchRows[0].status || ""))) {
+      await connection.rollback();
+      return { code: 0, message: "El lote ya no está pendiente de conteo.", data: null };
+    }
+    const outputsById = new Map(outputRows.map((row) => [Number(row.id), row]));
+
+    const [reportInsert] = await connection.query(
+      `INSERT INTO packing_reports (
+         production_batch_id, packer_employee_id, packed_date, notes, created_by, client_request_key
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+      [batchId, packerEmployeeId, packedDate, payload.p_notes || null,
+        actorUserId || null, clientRequestKey]
+    );
+    const reportId = Number(reportInsert.insertId);
+    const branchId = Number(batchRows[0].branch_id);
+
+    for (const item of items) {
+      const output = outputsById.get(item.productionBatchOutputId);
+      const damagedQuantity = item.damages.reduce((total, damage) => total + damage.quantity, 0);
+      const countedQuantity = item.packedQuantity + damagedQuantity;
+      const reconciliation = calculateClosedCountComparison({
+        producedQuantity: output.produced_quantity,
+        packedQuantity: item.packedQuantity,
+        damagedQuantity,
+        closed: true,
+      });
+      const damageSummary = item.damages.map((damage) => `${damage.quantity}: ${damage.reason}${damage.detail ? ` (${damage.detail})` : ""}`).join("; ");
+      const notes = [damageSummary, item.notes].filter(Boolean).join(". ") || null;
+
+      const [packingItemInsert] = await connection.query(
+        `INSERT INTO packing_report_items (
+           packing_report_id, production_batch_output_id, product_id,
+           counted_quantity, packed_quantity, damaged_quantity, missing_quantity,
+           damage_reason, missing_reason, notes,
+           produced_quantity, found_quantity, shortage_quantity, surplus_quantity,
+           reconciliation_status
+         ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?)`,
+        [reportId, item.productionBatchOutputId, Number(output.product_id), countedQuantity,
+          item.packedQuantity, damagedQuantity, item.damages[0]?.reason || null, notes,
+          reconciliation.produced_quantity, reconciliation.found_quantity,
+          reconciliation.shortage_quantity, reconciliation.surplus_quantity,
+          reconciliation.reconciliation_status]
+      );
+      const packingReportItemId = Number(packingItemInsert.insertId);
+
+      for (const damage of item.damages) {
+        await connection.query(
+          `INSERT INTO production_damages (
+             production_batch_id, production_batch_output_id, packing_report_item_id, product_id,
+             responsible_employee_id, damage_stage, quantity, damaged_date, notes, created_by
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [batchId, item.productionBatchOutputId, packingReportItemId, Number(output.product_id), packerEmployeeId,
+            damage.reason, damage.quantity, packedDate, damage.detail, actorUserId || null]
+        );
+      }
+
+      await connection.query(
+        `UPDATE production_batch_outputs
+            SET counted_quantity = counted_quantity + ?,
+                packed_quantity = packed_quantity + ?,
+                damaged_quantity = damaged_quantity + ?,
+                counted_by = ?, counted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?`,
+        [countedQuantity, item.packedQuantity, damagedQuantity, actorUserId || null, item.productionBatchOutputId]
+      );
+
+      if (item.packedQuantity > 0) {
+        await connection.query(
+          `INSERT INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
+           VALUES (?, ?, ?, 0)
+           ON DUPLICATE KEY UPDATE quantity_on_hand = quantity_on_hand + VALUES(quantity_on_hand), updated_at = CURRENT_TIMESTAMP`,
+          [branchId, Number(output.product_id), item.packedQuantity]
+        );
+        await connection.query(
+          `INSERT INTO inventory_movements (
+             branch_id, item_type, raw_material_id, product_id, movement_type,
+             quantity, unit_cost, reference_type, reference_id, notes, created_by
+           ) VALUES (?, 'product', NULL, ?, 'production_in', ?, NULL, 'packing_report', ?, ?, ?)`,
+          [branchId, Number(output.product_id), item.packedQuantity, reportId, payload.p_notes || null, actorUserId || null]
+        );
+      }
+    }
+
+    const [pendingRows] = await connection.query(
+      `SELECT COUNT(*) AS pending
+         FROM production_batch_outputs
+        WHERE production_batch_id = ? AND counted_at IS NULL`,
+      [batchId]
+    );
+    await connection.query(
+      "UPDATE production_batches SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      [Number(pendingRows[0]?.pending || 0) === 0 ? "packed" : "partially_packed", batchId]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'packing.report.create', 'packing_reports', ?,
+         JSON_OBJECT('production_batch_id', ?, 'packer_employee_id', ?, 'independent_machine_count', true,
+           'operational_date', ?, 'retroactive_date', ?))`,
+      [actorUserId || null, String(reportId), batchId, packerEmployeeId, packedDate, packedDateValidation.retroactive]
+    );
+
+    await connection.commit();
+    return {
+      code: 1,
+      message: "Conteo guardado correctamente.",
+      data: { packing_report_id: reportId },
+    };
+  } catch (error) {
+    await connection.rollback();
+    if (error?.code === "ER_DUP_ENTRY" && clientRequestKey) {
+      const [existingRows] = await db.query(
+        "SELECT id, created_by FROM packing_reports WHERE client_request_key = ? LIMIT 1",
+        [clientRequestKey]
+      );
+      if (existingRows.length) {
+        if (!canManageAll && Number(existingRows[0].created_by) !== Number(actorUserId)) {
+          return { code: 0, message: "El identificador del conteo pertenece a otro usuario.", data: null };
+        }
+        return {
+          code: 1,
+          message: "Conteo guardado correctamente.",
+          data: { packing_report_id: Number(existingRows[0].id), replayed: true },
+        };
+      }
+    }
+    throw error;
+  } finally {
+    connection.release();
+  }
 };
 
-const listPackingHistory = async ({ dateFrom, dateTo, search, page = 1, pageSize = 20 } = {}) => {
+const normalizeCorrectionReason = (value) => {
+  const reason = String(value || "").trim();
+  return reason.length >= 5 ? reason.slice(0, 500) : null;
+};
+
+const correctPackingReportItem = async ({ packingReportItemId, correctedQuantity, damages, reason }, actorUserId) => {
+  const itemId = Number(packingReportItemId || 0);
+  const corrected = Number(correctedQuantity);
+  const validDamageReasons = new Set(["production", "oven", "cut", "packaging"]);
+  const correctedDamages = (Array.isArray(damages) ? damages : []).map((damage) => ({
+    quantity: Number(damage.quantity || 0),
+    reason: String(damage.reason || "").trim(),
+    detail: String(damage.detail || damage.notes || "").trim() || null,
+  }));
+  const correctionReason = normalizeCorrectionReason(reason);
+  const invalidDamage = correctedDamages.some((damage) => !Number.isInteger(damage.quantity)
+    || damage.quantity <= 0 || !validDamageReasons.has(damage.reason));
+  if (!itemId || !Number.isInteger(corrected) || corrected < 0 || invalidDamage || !correctionReason) {
+    return { code: 0, message: "Indica cantidades enteras, el motivo de cada daño y una justificación de al menos 5 caracteres.", data: null };
+  }
+
+  const db = await connect();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query(
+      `SELECT pri.id, pri.production_batch_output_id, pri.product_id,
+              COALESCE(product.physical_product_id, pri.product_id) AS inventory_product_id,
+              pri.packed_quantity, pri.damaged_quantity,
+              pbo.produced_quantity, pbo.counted_at,
+              pr.production_batch_id, pr.packer_employee_id, pr.packed_date, pb.branch_id
+         FROM packing_report_items pri
+         INNER JOIN packing_reports pr ON pr.id = pri.packing_report_id
+         INNER JOIN production_batches pb ON pb.id = pr.production_batch_id
+         INNER JOIN production_batch_outputs pbo ON pbo.id = pri.production_batch_output_id
+         INNER JOIN products product ON product.id = pri.product_id
+        WHERE pri.id = ?
+        FOR UPDATE`,
+      [itemId]
+    );
+    if (!rows.length || rows[0].counted_at === null) {
+      await connection.rollback();
+      return { code: 0, message: "El conteo cerrado no existe.", data: null };
+    }
+    const row = rows[0];
+    const original = Number(row.packed_quantity || 0);
+    const [originalDamageRows] = await connection.query(
+      `SELECT quantity, damage_stage AS reason, notes AS detail
+         FROM production_damages
+        WHERE packing_report_item_id = ?
+        ORDER BY id`,
+      [itemId]
+    );
+    const originalDamages = originalDamageRows.map((damage) => ({
+      quantity: Number(damage.quantity), reason: damage.reason, detail: damage.detail || null,
+    }));
+    const originalDamageTotal = originalDamages.reduce((total, damage) => total + damage.quantity, 0);
+    const correctedDamageTotal = correctedDamages.reduce((total, damage) => total + damage.quantity, 0);
+    if (corrected === original && JSON.stringify(correctedDamages) === JSON.stringify(originalDamages)) {
+      await connection.rollback();
+      return { code: 0, message: "La corrección no contiene cambios.", data: null };
+    }
+    const delta = corrected - original;
+    const damageDelta = correctedDamageTotal - originalDamageTotal;
+
+    await connection.query(
+      `INSERT IGNORE INTO stock_products (branch_id, product_id, quantity_on_hand, min_stock)
+       VALUES (?, ?, 0, 0)`,
+      [Number(row.branch_id), Number(row.inventory_product_id)]
+    );
+    const [stockRows] = await connection.query(
+      `SELECT quantity_on_hand FROM stock_products WHERE branch_id = ? AND product_id = ? FOR UPDATE`,
+      [Number(row.branch_id), Number(row.inventory_product_id)]
+    );
+    if (delta < 0 && Number(stockRows[0]?.quantity_on_hand || 0) < Math.abs(delta)) {
+      await connection.rollback();
+      return { code: 0, message: "No hay inventario suficiente para retirar la diferencia corregida.", data: null };
+    }
+
+    const [correctionInsert] = await connection.query(
+      `INSERT INTO production_record_corrections (
+         correction_type, production_batch_id, production_batch_output_id, packing_report_item_id,
+         original_quantity, corrected_quantity, original_damages_json, corrected_damages_json,
+         inventory_delta, raw_materials_adjusted,
+         reason, corrected_by
+       ) VALUES ('packing', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      [Number(row.production_batch_id), Number(row.production_batch_output_id), itemId,
+        original, corrected, JSON.stringify(originalDamages), JSON.stringify(correctedDamages),
+        delta, correctionReason, actorUserId]
+    );
+    const correctionId = Number(correctionInsert.insertId);
+    const reconciliation = calculateClosedCountComparison({
+      producedQuantity: row.produced_quantity,
+      packedQuantity: corrected,
+      damagedQuantity: correctedDamageTotal,
+      closed: true,
+    });
+
+    await connection.query(
+      `UPDATE packing_report_items
+          SET packed_quantity = ?, damaged_quantity = ?, damage_reason = ?, counted_quantity = ?,
+              produced_quantity = ?, found_quantity = ?,
+              shortage_quantity = ?, surplus_quantity = ?, reconciliation_status = ?
+        WHERE id = ?`,
+      [corrected, correctedDamageTotal, correctedDamages[0]?.reason || null,
+        corrected + correctedDamageTotal, reconciliation.produced_quantity, reconciliation.found_quantity,
+        reconciliation.shortage_quantity, reconciliation.surplus_quantity,
+        reconciliation.reconciliation_status, itemId]
+    );
+    await connection.query("DELETE FROM production_damages WHERE packing_report_item_id = ?", [itemId]);
+    for (const damage of correctedDamages) {
+      await connection.query(
+        `INSERT INTO production_damages (
+           production_batch_id, production_batch_output_id, packing_report_item_id, product_id,
+           responsible_employee_id, damage_stage, quantity, damaged_date, notes, created_by
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [Number(row.production_batch_id), Number(row.production_batch_output_id), itemId,
+          Number(row.inventory_product_id), Number(row.packer_employee_id), damage.reason, damage.quantity,
+          row.packed_date, damage.detail, actorUserId]
+      );
+    }
+    await connection.query(
+      `UPDATE production_batch_outputs
+          SET packed_quantity = packed_quantity + ?, damaged_quantity = damaged_quantity + ?,
+              counted_quantity = counted_quantity + ?,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?`,
+      [delta, damageDelta, delta + damageDelta, Number(row.production_batch_output_id)]
+    );
+    if (delta !== 0) {
+      await connection.query(
+        `UPDATE stock_products SET quantity_on_hand = quantity_on_hand + ?
+          WHERE branch_id = ? AND product_id = ?`,
+        [delta, Number(row.branch_id), Number(row.inventory_product_id)]
+      );
+      await connection.query(
+        `INSERT INTO inventory_movements (
+           branch_id, item_type, raw_material_id, product_id, movement_type,
+           quantity, unit_cost, reference_type, reference_id, notes, created_by
+         ) VALUES (?, 'product', NULL, ?, ?, ?, NULL, 'production_correction', ?, ?, ?)`,
+        [Number(row.branch_id), Number(row.inventory_product_id), delta > 0 ? "adjustment_in" : "adjustment_out",
+          Math.abs(delta), correctionId, correctionReason, actorUserId]
+      );
+    }
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'production.packing.correct', 'production_record_corrections', ?,
+         JSON_OBJECT('packing_report_item_id', ?, 'original', ?, 'corrected', ?,
+           'original_damages', CAST(? AS JSON), 'corrected_damages', CAST(? AS JSON), 'reason', ?))`,
+      [actorUserId, String(correctionId), itemId, original, corrected,
+        JSON.stringify(originalDamages), JSON.stringify(correctedDamages), correctionReason]
+    );
+    await connection.commit();
+    return { code: 1, message: "Conteo corregido con trazabilidad.", data: { correction_id: correctionId } };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+const correctProductionBatchOutput = async ({ productionBatchOutputId, correctedQuantity, correctedBatchQuantity, reason }, actorUserId) => {
+  const outputId = Number(productionBatchOutputId || 0);
+  const corrected = Number(correctedQuantity);
+  const requestedBatchQuantity = correctedBatchQuantity === undefined || correctedBatchQuantity === null || correctedBatchQuantity === ""
+    ? null : Number(correctedBatchQuantity);
+  const correctionReason = normalizeCorrectionReason(reason);
+  if (!outputId || !Number.isInteger(corrected) || corrected <= 0 || !correctionReason
+    || (requestedBatchQuantity !== null && (!Number.isFinite(requestedBatchQuantity) || requestedBatchQuantity <= 0))) {
+    return { code: 0, message: "Indica cantidades válidas y un motivo de al menos 5 caracteres.", data: null };
+  }
+
+  const db = await connect();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query(
+      `SELECT pbo.id, pbo.production_batch_id, pbo.product_id, pbo.produced_quantity,
+              pb.branch_id, pb.recipe_id, pb.batch_quantity
+         FROM production_batch_outputs pbo
+         INNER JOIN production_batches pb ON pb.id = pbo.production_batch_id
+        WHERE pbo.id = ? AND pbo.baker_reported_at IS NOT NULL
+        FOR UPDATE`,
+      [outputId]
+    );
+    if (!rows.length) {
+      await connection.rollback();
+      return { code: 0, message: "La producción cerrada no existe.", data: null };
+    }
+    const row = rows[0];
+    const original = Number(row.produced_quantity || 0);
+    const originalBatchQuantity = Number(row.batch_quantity || 0);
+    const nextBatchQuantity = requestedBatchQuantity ?? originalBatchQuantity;
+    if (corrected === original && nextBatchQuantity === originalBatchQuantity) {
+      await connection.rollback();
+      return { code: 0, message: "La corrección no contiene cambios.", data: null };
+    }
+
+    const [correctionInsert] = await connection.query(
+      `INSERT INTO production_record_corrections (
+         correction_type, production_batch_id, production_batch_output_id,
+         original_quantity, corrected_quantity, original_batch_quantity,
+         corrected_batch_quantity, inventory_delta, raw_materials_adjusted,
+         reason, corrected_by
+       ) VALUES ('production', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+      [Number(row.production_batch_id), outputId, original, corrected,
+        originalBatchQuantity, nextBatchQuantity, nextBatchQuantity !== originalBatchQuantity ? 1 : 0,
+        correctionReason, actorUserId]
+    );
+    const correctionId = Number(correctionInsert.insertId);
+    const batchDelta = nextBatchQuantity - originalBatchQuantity;
+
+    if (batchDelta !== 0) {
+      const [materialRows] = await connection.query(
+        `SELECT usage_rows.raw_material_id, rm.unit_cost,
+                ROUND(SUM(usage_rows.quantity_per_batch) * ABS(?), 3) AS adjustment_quantity
+           FROM (
+             SELECT ri.raw_material_id,
+                    ri.quantity * (1 + ri.wastage_percent / 100) AS quantity_per_batch
+               FROM recipe_items ri WHERE ri.recipe_id = ?
+             UNION ALL
+             SELECT roi.raw_material_id,
+                    roi.quantity * (1 + roi.wastage_percent / 100) AS quantity_per_batch
+               FROM recipe_output_items roi
+               INNER JOIN recipe_outputs ro ON ro.id = roi.recipe_output_id
+              WHERE ro.recipe_id = ? AND ro.product_id IN (
+                SELECT product_id FROM production_batch_outputs WHERE production_batch_id = ?
+              )
+           ) usage_rows
+           INNER JOIN raw_materials rm ON rm.id = usage_rows.raw_material_id
+          GROUP BY usage_rows.raw_material_id, rm.unit_cost`,
+        [batchDelta, Number(row.recipe_id), Number(row.recipe_id), Number(row.production_batch_id)]
+      );
+      for (const material of materialRows) {
+        const quantity = Number(material.adjustment_quantity || 0);
+        if (quantity <= 0) continue;
+        await connection.query(
+          `INSERT IGNORE INTO stock_raw_materials (branch_id, raw_material_id, quantity_on_hand, min_stock)
+           VALUES (?, ?, 0, 0)`,
+          [Number(row.branch_id), Number(material.raw_material_id)]
+        );
+        const [stockRows] = await connection.query(
+          `SELECT quantity_on_hand FROM stock_raw_materials
+            WHERE branch_id = ? AND raw_material_id = ? FOR UPDATE`,
+          [Number(row.branch_id), Number(material.raw_material_id)]
+        );
+        if (batchDelta > 0 && Number(stockRows[0]?.quantity_on_hand || 0) < quantity) {
+          await connection.rollback();
+          return { code: 0, message: "No hay materia prima suficiente para aplicar la corrección.", data: null };
+        }
+        await connection.query(
+          `UPDATE stock_raw_materials SET quantity_on_hand = quantity_on_hand + ?
+            WHERE branch_id = ? AND raw_material_id = ?`,
+          [batchDelta > 0 ? -quantity : quantity, Number(row.branch_id), Number(material.raw_material_id)]
+        );
+        await connection.query(
+          `INSERT INTO inventory_movements (
+             branch_id, item_type, raw_material_id, product_id, movement_type,
+             quantity, unit_cost, reference_type, reference_id, notes, created_by
+           ) VALUES (?, 'raw_material', ?, NULL, ?, ?, ?, 'production_correction', ?, ?, ?)`,
+          [Number(row.branch_id), Number(material.raw_material_id),
+            batchDelta > 0 ? "production_out" : "adjustment_in", quantity,
+            material.unit_cost ?? null, correctionId, correctionReason, actorUserId]
+        );
+      }
+      await connection.query(
+        "UPDATE production_batches SET batch_quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [nextBatchQuantity, Number(row.production_batch_id)]
+      );
+    }
+
+    await connection.query(
+      "UPDATE production_batch_outputs SET produced_quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      [corrected, outputId]
+    );
+    const [packingRows] = await connection.query(
+      `SELECT id, packed_quantity, damaged_quantity FROM packing_report_items
+        WHERE production_batch_output_id = ? FOR UPDATE`,
+      [outputId]
+    );
+    for (const packing of packingRows) {
+      const reconciliation = calculateClosedCountComparison({
+        producedQuantity: corrected,
+        packedQuantity: packing.packed_quantity,
+        damagedQuantity: packing.damaged_quantity,
+        closed: true,
+      });
+      await connection.query(
+        `UPDATE packing_report_items
+            SET produced_quantity = ?, found_quantity = ?, shortage_quantity = ?,
+                surplus_quantity = ?, reconciliation_status = ?
+          WHERE id = ?`,
+        [reconciliation.produced_quantity, reconciliation.found_quantity,
+          reconciliation.shortage_quantity, reconciliation.surplus_quantity,
+          reconciliation.reconciliation_status, Number(packing.id)]
+      );
+    }
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'production.output.correct', 'production_record_corrections', ?,
+         JSON_OBJECT('production_batch_output_id', ?, 'original', ?, 'corrected', ?,
+           'original_batch_quantity', ?, 'corrected_batch_quantity', ?, 'reason', ?))`,
+      [actorUserId, String(correctionId), outputId, original, corrected,
+        originalBatchQuantity, nextBatchQuantity, correctionReason]
+    );
+    await connection.commit();
+    return { code: 1, message: "Producción corregida con trazabilidad.", data: { correction_id: correctionId } };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+const listProductionRecordCorrections = async ({ productionBatchId } = {}) => {
+  const db = await connect();
+  const params = [];
+  const where = productionBatchId ? "WHERE correction.production_batch_id = ?" : "";
+  if (productionBatchId) params.push(Number(productionBatchId));
+  const [rows] = await db.query(
+    `SELECT correction.*, product.name AS product_name, product.sku AS product_sku,
+            actor.full_name AS corrected_by_name
+       FROM production_record_corrections correction
+       INNER JOIN production_batch_outputs output ON output.id = correction.production_batch_output_id
+       INNER JOIN products product ON product.id = output.product_id
+       INNER JOIN users actor ON actor.id = correction.corrected_by
+       ${where}
+      ORDER BY correction.created_at DESC, correction.id DESC
+      LIMIT 500`,
+    params
+  );
+  return { code: 1, message: "Historial de correcciones obtenido.", data: rows };
+};
+
+const listPackingHistory = async ({ dateFrom, dateTo, search, page = 1, pageSize = 20, includeReconciliation = false, actorUserId, canManageAll = false } = {}) => {
   const db = await connect();
   const currentPage = Math.max(Number(page || 1), 1);
   const limit = Math.min(Math.max(Number(pageSize || 20), 1), 100);
   const offset = (currentPage - 1) * limit;
   const filters = [];
   const params = [];
+
+  if (!canManageAll) {
+    filters.push("packer.user_id = ?");
+    params.push(Number(actorUserId));
+  }
 
   if (dateFrom) {
     filters.push("pr.packed_date >= ?");
@@ -1602,7 +2130,7 @@ const listPackingHistory = async ({ dateFrom, dateTo, search, page = 1, pageSize
   const [countRows] = await db.query(`SELECT COUNT(*) AS total ${joins} ${where}`, params);
   const [reports] = await db.query(
     `SELECT pr.id, pr.production_batch_id, pr.packed_date, pr.notes, pr.created_at,
-            pb.produced_date, pb.status AS batch_status, b.id AS branch_id, b.name AS branch_name,
+            pb.produced_date, pb.batch_quantity, pb.status AS batch_status, b.id AS branch_id, b.name AS branch_name,
             r.id AS recipe_id, r.notes AS recipe_name, packer_user.full_name AS packer_name,
             creator.full_name AS created_by_name
        ${joins}
@@ -1618,20 +2146,43 @@ const listPackingHistory = async ({ dateFrom, dateTo, search, page = 1, pageSize
 
   const reportIds = reports.map((report) => Number(report.id));
   const placeholders = reportIds.map(() => "?").join(",");
+  const reconciliationFields = includeReconciliation
+    ? `, pri.produced_quantity, pri.found_quantity, pri.shortage_quantity,
+       pri.surplus_quantity, pri.reconciliation_status`
+    : "";
   const [items] = await db.query(
-    `SELECT pri.id, pri.packing_report_id, pri.product_id, p.name AS product_name, p.sku AS product_sku,
+    `SELECT pri.id, pri.packing_report_id, pri.production_batch_output_id, pri.product_id, p.name AS product_name, p.sku AS product_sku,
             pri.packed_quantity, pri.damaged_quantity, pri.missing_quantity,
             pri.damage_reason, pri.missing_reason, pri.notes, pri.created_at
+            ${reconciliationFields}
        FROM packing_report_items pri
        INNER JOIN products p ON p.id = pri.product_id
       WHERE pri.packing_report_id IN (${placeholders})
       ORDER BY pri.packing_report_id DESC, p.name`,
     reportIds
   );
+  const itemIds = items.map((item) => Number(item.id));
+  let damagesByItem = {};
+  if (itemIds.length) {
+    const damagePlaceholders = itemIds.map(() => "?").join(",");
+    const [damageRows] = await db.query(
+      `SELECT packing_report_item_id, id, quantity, damage_stage AS reason, notes AS detail
+         FROM production_damages
+        WHERE packing_report_item_id IN (${damagePlaceholders})
+        ORDER BY id`,
+      itemIds
+    );
+    damagesByItem = damageRows.reduce((grouped, damage) => {
+      const key = String(damage.packing_report_item_id);
+      if (!grouped[key]) grouped[key] = [];
+      grouped[key].push(damage);
+      return grouped;
+    }, {});
+  }
   const itemsByReport = items.reduce((grouped, item) => {
     const key = String(item.packing_report_id);
     if (!grouped[key]) grouped[key] = [];
-    grouped[key].push(item);
+    grouped[key].push({ ...item, damages: damagesByItem[String(item.id)] || [] });
     return grouped;
   }, {});
 
@@ -1646,6 +2197,102 @@ const listPackingHistory = async ({ dateFrom, dateTo, search, page = 1, pageSize
     },
   };
 };
+const getPackingDamageReport = async ({ dateFrom, dateTo, branchId, recipeId, productId, damageReason, packerEmployeeId, page, pageSize } = {}) => {
+  const db = await connect();
+  const filters = ["damage.packing_report_item_id IS NOT NULL"];
+  const params = [];
+  const addFilter = (sql, value) => {
+    if (value !== undefined && value !== null && String(value) !== "") {
+      filters.push(sql);
+      params.push(value);
+    }
+  };
+  addFilter("report.packed_date >= ?", dateFrom);
+  addFilter("report.packed_date <= ?", dateTo);
+  addFilter("batch.branch_id = ?", branchId ? Number(branchId) : null);
+  addFilter("batch.recipe_id = ?", recipeId ? Number(recipeId) : null);
+  addFilter("item.product_id = ?", productId ? Number(productId) : null);
+  addFilter("damage.damage_stage = ?", damageReason);
+  addFilter("report.packer_employee_id = ?", packerEmployeeId ? Number(packerEmployeeId) : null);
+  const limit = Math.min(Math.max(Number(pageSize || 25), 1), 500);
+  const currentPage = Math.max(Number(page || 1), 1);
+  const offset = (currentPage - 1) * limit;
+  const where = `WHERE ${filters.join(" AND ")}`;
+  const joins = `FROM production_damages damage
+    INNER JOIN packing_report_items item ON item.id = damage.packing_report_item_id
+    INNER JOIN packing_reports report ON report.id = item.packing_report_id
+    INNER JOIN production_batches batch ON batch.id = report.production_batch_id
+    INNER JOIN branches branch ON branch.id = batch.branch_id
+    INNER JOIN products product ON product.id = item.product_id
+    INNER JOIN employees packer_employee ON packer_employee.id = report.packer_employee_id
+    INNER JOIN users packer_user ON packer_user.id = packer_employee.user_id`;
+  const [countRows] = await db.query(`SELECT COUNT(*) AS total ${joins} ${where}`, params);
+  const [rows] = await db.query(
+    `SELECT damage.id AS damage_id, damage.packing_report_item_id, report.packed_date AS damage_date,
+            branch.id AS branch_id, branch.name AS branch_name, batch.id AS production_batch_id,
+            product.id AS product_id, product.name AS product_name, product.sku AS product_sku,
+            report.packer_employee_id, packer_user.full_name AS packer_name,
+            item.packed_quantity, damage.quantity AS damaged_quantity,
+            damage.damage_stage AS damage_reason, damage.notes AS damage_detail,
+            item.reconciliation_status, damage.created_at
+       ${joins} ${where}
+      ORDER BY report.packed_date DESC, damage.created_at DESC, damage.id DESC LIMIT ? OFFSET ?`,
+    [...params, limit, offset]
+  );
+  const [productTotals] = await db.query(
+    `SELECT product.id AS product_id, product.name AS product_name,
+            SUM(damage.quantity) AS damaged_quantity, COUNT(*) AS damage_records
+       ${joins} ${where} GROUP BY product.id, product.name
+      ORDER BY damaged_quantity DESC, product.name`, params
+  );
+  const [reasonTotals] = await db.query(
+    `SELECT damage.damage_stage AS damage_reason,
+            SUM(damage.quantity) AS damaged_quantity, COUNT(*) AS damage_records
+       ${joins} ${where} GROUP BY damage.damage_stage
+      ORDER BY damaged_quantity DESC, damage.damage_stage`, params
+  );
+  let correctionsByItem = {};
+  const itemIds = [...new Set(rows.map((row) => Number(row.packing_report_item_id)))];
+  if (itemIds.length) {
+    const placeholders = itemIds.map(() => "?").join(",");
+    const [corrections] = await db.query(
+      `SELECT correction.id, correction.packing_report_item_id, correction.original_quantity,
+              correction.corrected_quantity, correction.original_damages_json,
+              correction.corrected_damages_json, correction.reason, correction.created_at,
+              actor.full_name AS corrected_by_name
+         FROM production_record_corrections correction
+         INNER JOIN users actor ON actor.id = correction.corrected_by
+        WHERE correction.correction_type = 'packing'
+          AND correction.packing_report_item_id IN (${placeholders})
+        ORDER BY correction.created_at, correction.id`, itemIds
+    );
+    correctionsByItem = corrections.reduce((result, correction) => {
+      const key = String(correction.packing_report_item_id);
+      if (!result[key]) result[key] = [];
+      result[key].push(correction);
+      return result;
+    }, {});
+  }
+  const [branchRows, productRows, packerRows] = await Promise.all([
+    db.query(`SELECT DISTINCT branch.id, branch.name ${joins} ORDER BY branch.name`),
+    db.query(`SELECT DISTINCT product.id, product.name, product.sku ${joins} ORDER BY product.name`),
+    db.query(`SELECT DISTINCT packer_employee.id, packer_user.full_name AS name ${joins} ORDER BY packer_user.full_name`),
+  ]);
+  return {
+    code: 1,
+    message: "Reporte administrativo de daños obtenido.",
+    data: {
+      rows: rows.map((row) => ({ ...row,
+        corrections: correctionsByItem[String(row.packing_report_item_id)] || [],
+        was_corrected: Boolean(correctionsByItem[String(row.packing_report_item_id)]?.length),
+      })),
+      total: Number(countRows[0]?.total || 0), page: currentPage, page_size: limit,
+      totals_by_product: productTotals, totals_by_reason: reasonTotals,
+      catalogs: { branches: branchRows[0], products: productRows[0], packers: packerRows[0], reasons: ["production", "oven", "cut", "packaging"] },
+    },
+  };
+};
+
 const listJustifiedShortages = async ({
   branchId,
   productId,
@@ -1786,13 +2433,17 @@ const listJustifiedShortages = async ({
 };
 
 const registerProductionDamage = async (payload, actorUserId) => {
+  const quantity = Number(payload.p_quantity || 0);
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return { code: 0, message: "La cantidad dañada debe ser un numero entero mayor a cero.", data: null };
+  }
   const out = await callProcedure("sp_production_damage_register", [
     payload.p_production_batch_id || null,
     payload.p_production_batch_output_id || null,
     payload.p_product_id || null,
     payload.p_responsible_employee_id || null,
     payload.p_damage_stage || null,
-    payload.p_quantity || null,
+    quantity,
     payload.p_damaged_date || null,
     payload.p_notes || null,
     actorUserId || null,
@@ -1816,9 +2467,11 @@ const getRawMaterialUsageByProductReport = async ({
   recipeId,
   productId,
   rawMaterialId,
+  actorUserId,
+  canManageAll = false,
 } = {}) => {
   const db = await connect();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = getOperationalDate();
   const reportDateFrom = dateFrom || dateTo || today;
   const reportDateTo = dateTo || dateFrom || today;
 
@@ -1826,6 +2479,13 @@ const getRawMaterialUsageByProductReport = async ({
   const baseValues = [reportDateFrom, reportDateTo];
   const directFilters = ["pb.produced_date >= ?", "pb.produced_date <= ?", "pb.status <> 'cancelled'"];
   const directValues = [reportDateFrom, reportDateTo];
+
+  if (!canManageAll) {
+    baseFilters.push("EXISTS (SELECT 1 FROM employees access_baker WHERE access_baker.id = pb.baker_employee_id AND access_baker.user_id = ? AND access_baker.job_type = 'baker' AND access_baker.status = 'active' AND access_baker.deleted_at IS NULL)");
+    baseValues.push(Number(actorUserId));
+    directFilters.push("EXISTS (SELECT 1 FROM employees access_baker WHERE access_baker.id = pb.baker_employee_id AND access_baker.user_id = ? AND access_baker.job_type = 'baker' AND access_baker.status = 'active' AND access_baker.deleted_at IS NULL)");
+    directValues.push(Number(actorUserId));
+  }
 
   if (branchId) {
     baseFilters.push("pb.branch_id = ?");
@@ -2061,7 +2721,7 @@ const getPackingSummaryReport = async ({ dateFrom, dateTo, branchId } = {}) => {
 
 const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipeId } = {}) => {
   const db = await connect();
-  const reportDate = date || new Date().toISOString().slice(0, 10);
+  const reportDate = date || getOperationalDate();
   const reportDateFrom = dateFrom || reportDate;
   const reportDateTo = dateTo || dateFrom || reportDate;
   const filters = ["pb.produced_date >= ?", "pb.produced_date <= ?"];
@@ -2168,42 +2828,46 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
         pb.produced_date,
         pb.batch_quantity,
         pb.status
-      ORDER BY pb.id DESC
+      ORDER BY pb.produced_date ASC, pb.id ASC
     `,
     values
   );
 
-  const [productRows] = await db.query(
+  let [productRows] = await db.query(
     `
       SELECT
-        pbo.product_id,
-        p.name AS product_name,
-        p.sku AS product_sku,
+        physical.id AS product_id,
+        physical.name AS product_name,
+        physical.sku AS product_sku,
         COALESCE(pc.name, 'Sin categoria') AS product_category,
-        p.units_per_bag,
+        physical.units_per_bag,
         CASE
-          WHEN p.units_per_bag IS NULL OR p.units_per_bag <= 0 THEN NULL
-          ELSE COALESCE(SUM(pbo.produced_quantity), 0) / p.units_per_bag
+          WHEN physical.units_per_bag IS NULL OR physical.units_per_bag <= 0 THEN NULL
+          ELSE COALESCE(SUM(pbo.produced_quantity), 0) / physical.units_per_bag
         END AS bags_count,
         COUNT(DISTINCT pb.id) AS batches_count,
         COALESCE(SUM(pbo.produced_quantity), 0) AS produced_quantity,
           COALESCE(SUM(pbo.counted_quantity), 0) AS counted_quantity,
           COALESCE(SUM(pbo.packed_quantity), 0) AS packed_quantity,
         COALESCE(SUM(pbo.damaged_quantity), 0) AS damaged_quantity,
-        COALESCE(SUM(pbo.missing_quantity), 0) AS missing_quantity,
+        COALESCE(SUM(GREATEST(pbo.produced_quantity - pbo.packed_quantity - pbo.damaged_quantity, 0)), 0) AS shortage_quantity,
+        COALESCE(SUM(GREATEST(pbo.packed_quantity + pbo.damaged_quantity - pbo.produced_quantity, 0)), 0) AS surplus_quantity,
+        COALESCE(SUM(pbo.packed_quantity), 0) AS inventory_quantity,
+        SUM(CASE WHEN pbo.counted_at IS NULL THEN 1 ELSE 0 END) AS pending_outputs,
+        MAX(CASE WHEN EXISTS (
+          SELECT 1 FROM production_record_corrections correction
+          WHERE correction.production_batch_output_id = pbo.id
+        ) THEN 1 ELSE 0 END) AS has_corrections,
         COALESCE(SUM(pbo.direct_delivered_quantity), 0) AS direct_delivered_quantity,
-        COALESCE(SUM(GREATEST(
-          pbo.produced_quantity - pbo.packed_quantity - pbo.damaged_quantity
-          - pbo.missing_quantity - pbo.direct_delivered_quantity,
-          0
-        )), 0) AS pending_quantity
+        COALESCE(SUM(CASE WHEN pbo.counted_at IS NULL THEN pbo.produced_quantity ELSE 0 END), 0) AS pending_quantity
       FROM production_batches pb
       INNER JOIN production_batch_outputs pbo ON pbo.production_batch_id = pb.id
-      INNER JOIN products p ON p.id = pbo.product_id
-      LEFT JOIN product_categories pc ON pc.id = p.category_id
+      INNER JOIN products recorded_product ON recorded_product.id = pbo.product_id
+      INNER JOIN products physical ON physical.id = COALESCE(recorded_product.physical_product_id, recorded_product.id)
+      LEFT JOIN product_categories pc ON pc.id = physical.category_id
       ${whereClause}
-      GROUP BY pbo.product_id, p.name, p.sku, pc.name, p.units_per_bag
-      ORDER BY pc.name, p.name
+      GROUP BY physical.id, physical.name, physical.sku, pc.name, physical.units_per_bag
+      ORDER BY pc.name, physical.name
     `,
     values
   );
@@ -2235,8 +2899,8 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
       WHERE im.item_type = 'raw_material'
         AND im.movement_type = 'production_out'
         AND im.reference_type IN ('production_batch', 'production_output_material')
-        AND DATE(im.moved_at) >= ?
-        AND DATE(im.moved_at) <= ?
+        AND DATE(COALESCE(pb_base.produced_date, pb_pom.produced_date, im.moved_at)) >= ?
+        AND DATE(COALESCE(pb_base.produced_date, pb_pom.produced_date, im.moved_at)) <= ?
         AND (? IS NULL OR im.branch_id = ?)
         AND (? IS NULL OR COALESCE(pb_base.recipe_id, pb_pom.recipe_id) = ?)
       GROUP BY im.raw_material_id, rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity, rm.unit_cost
@@ -2258,16 +2922,14 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
          * COALESCE(im.unit_cost, rm.unit_cost, 0)), 0) AS correction_cost
      FROM inventory_movements im
      INNER JOIN raw_materials rm ON rm.id = im.raw_material_id
-     INNER JOIN production_plan_product_corrections correction ON correction.id = im.reference_id
-     INNER JOIN production_plan_product_details detail ON detail.id = correction.production_plan_product_detail_id
-     INNER JOIN production_plan_outputs plan_output ON plan_output.id = detail.production_plan_output_id
-     INNER JOIN production_plan_items plan_item ON plan_item.id = plan_output.production_plan_item_id
+     INNER JOIN production_record_corrections correction ON correction.id = im.reference_id
+     INNER JOIN production_batches correction_batch ON correction_batch.id = correction.production_batch_id
      WHERE im.item_type = 'raw_material'
        AND im.reference_type = 'production_correction'
        AND im.movement_type IN ('production_out', 'adjustment_in')
-       AND DATE(im.moved_at) >= ? AND DATE(im.moved_at) <= ?
+       AND correction_batch.produced_date >= ? AND correction_batch.produced_date <= ?
        AND (? IS NULL OR im.branch_id = ?)
-       AND (? IS NULL OR plan_item.recipe_id = ?)
+       AND (? IS NULL OR correction_batch.recipe_id = ?)
      GROUP BY im.raw_material_id, rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity, rm.unit_cost`,
     [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
   );
@@ -2335,6 +2997,141 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
     values
   );
 
+  const informedFilters = ["plan.planned_date >= ?", "plan.planned_date <= ?", "plan.status <> 'cancelled'"];
+  const informedValues = [reportDateFrom, reportDateTo];
+  if (branchId) {
+    informedFilters.push("plan.branch_id = ?");
+    informedValues.push(Number(branchId));
+  }
+  if (recipeId) {
+    informedFilters.push("plan_item.recipe_id = ?");
+    informedValues.push(Number(recipeId));
+  }
+  const [informedRows] = await db.query(
+    `SELECT plan_output.product_id, product.name AS product_name, product.sku AS product_sku,
+            COALESCE(category.name, 'Sin categoria') AS product_category, product.units_per_bag,
+            COALESCE(SUM(COALESCE(detail.estimated_units, plan_output.expected_quantity, 0)), 0) AS informed_quantity
+       FROM production_plans plan
+       INNER JOIN production_plan_items plan_item ON plan_item.production_plan_id = plan.id
+       INNER JOIN production_plan_outputs plan_output ON plan_output.production_plan_item_id = plan_item.id
+       LEFT JOIN production_plan_product_details detail ON detail.production_plan_output_id = plan_output.id
+       INNER JOIN products product ON product.id = plan_output.product_id
+       LEFT JOIN product_categories category ON category.id = product.category_id
+      WHERE ${informedFilters.join(" AND ")}
+      GROUP BY plan_output.product_id, product.name, product.sku, category.name, product.units_per_bag`,
+    informedValues
+  );
+  const informedByProduct = new Map(informedRows.map((row) => [Number(row.product_id), row]));
+  productRows = productRows.map((row) => {
+    const shortage = Number(row.shortage_quantity || 0);
+    const surplus = Number(row.surplus_quantity || 0);
+    const pending = Number(row.pending_outputs || 0) > 0;
+    const corrected = Number(row.has_corrections || 0) > 0;
+    return {
+      ...row,
+      informed_quantity: informedByProduct.has(Number(row.product_id))
+        ? Number(informedByProduct.get(Number(row.product_id)).informed_quantity || 0) : null,
+      missing_quantity: shortage,
+      inventory_quantity: Number(row.packed_quantity || 0),
+      reconciliation_status: corrected ? "corrected"
+        : pending ? "pending_count"
+          : shortage > 0 ? "shortage"
+            : surplus > 0 ? "surplus" : "matched",
+    };
+  });
+  const producedProductIds = new Set(productRows.map((row) => Number(row.product_id)));
+  informedRows.forEach((row) => {
+    if (producedProductIds.has(Number(row.product_id))) return;
+    productRows.push({
+      ...row,
+      batches_count: 0,
+      bags_count: null,
+      produced_quantity: 0,
+      counted_quantity: 0,
+      packed_quantity: 0,
+      damaged_quantity: 0,
+      shortage_quantity: 0,
+      surplus_quantity: 0,
+      inventory_quantity: 0,
+      pending_quantity: 0,
+      reconciliation_status: "pending_count",
+    });
+  });
+  productRows.sort((a, b) => `${a.product_category}-${a.product_name}`.localeCompare(`${b.product_category}-${b.product_name}`, "es"));
+  const productTotals = productRows.reduce((totals, row) => ({
+    informed_quantity: totals.informed_quantity + Number(row.informed_quantity || 0),
+    shortage_quantity: totals.shortage_quantity + Number(row.shortage_quantity || 0),
+    surplus_quantity: totals.surplus_quantity + Number(row.surplus_quantity || 0),
+  }), { informed_quantity: 0, shortage_quantity: 0, surplus_quantity: 0 });
+  summaryRows[0] = { ...(summaryRows[0] || {}), ...productTotals, missing_quantity: productTotals.shortage_quantity };
+
+  const dailyFilters = ["daily_batch.produced_date >= ?", "daily_batch.produced_date <= ?"];
+  const dailyValues = [reportDateFrom, reportDateTo];
+  if (branchId) {
+    dailyFilters.push("daily_batch.branch_id = ?");
+    dailyValues.push(Number(branchId));
+  }
+  if (recipeId) {
+    dailyFilters.push("daily_batch.recipe_id = ?");
+    dailyValues.push(Number(recipeId));
+  }
+  const dailyPlanFilters = ["daily_plan.planned_date >= ?", "daily_plan.planned_date <= ?", "daily_plan.status <> 'cancelled'"];
+  const dailyPlanValues = [reportDateFrom, reportDateTo];
+  if (branchId) {
+    dailyPlanFilters.push("daily_plan.branch_id = ?");
+    dailyPlanValues.push(Number(branchId));
+  }
+  if (recipeId) {
+    dailyPlanFilters.push("daily_plan_item.recipe_id = ?");
+    dailyPlanValues.push(Number(recipeId));
+  }
+  const [dailyProductRows] = await db.query(
+    `SELECT daily_batch.produced_date, daily_physical.id AS product_id,
+            daily_physical.name AS product_name, daily_physical.sku AS product_sku,
+            informed.informed_quantity,
+            SUM(daily_output.produced_quantity) AS produced_quantity,
+            SUM(daily_output.packed_quantity) AS packed_quantity,
+            SUM(daily_output.damaged_quantity) AS damaged_quantity,
+            SUM(GREATEST(daily_output.produced_quantity - daily_output.packed_quantity - daily_output.damaged_quantity, 0)) AS shortage_quantity,
+            SUM(GREATEST(daily_output.packed_quantity + daily_output.damaged_quantity - daily_output.produced_quantity, 0)) AS surplus_quantity,
+            SUM(daily_output.packed_quantity) AS inventory_quantity,
+            SUM(CASE WHEN daily_output.counted_at IS NULL THEN 1 ELSE 0 END) AS pending_outputs,
+            MAX(CASE WHEN EXISTS (
+              SELECT 1 FROM production_record_corrections daily_correction
+              WHERE daily_correction.production_batch_output_id = daily_output.id
+            ) THEN 1 ELSE 0 END) AS has_corrections
+       FROM production_batches daily_batch
+       INNER JOIN production_batch_outputs daily_output ON daily_output.production_batch_id = daily_batch.id
+       INNER JOIN products daily_product ON daily_product.id = daily_output.product_id
+       INNER JOIN products daily_physical ON daily_physical.id = COALESCE(daily_product.physical_product_id, daily_product.id)
+       LEFT JOIN (
+         SELECT daily_plan.planned_date,
+                COALESCE(plan_product.physical_product_id, plan_product.id) AS product_id,
+                SUM(COALESCE(daily_detail.estimated_units, daily_plan_output.expected_quantity, 0)) AS informed_quantity
+           FROM production_plans daily_plan
+           INNER JOIN production_plan_items daily_plan_item ON daily_plan_item.production_plan_id = daily_plan.id
+           INNER JOIN production_plan_outputs daily_plan_output ON daily_plan_output.production_plan_item_id = daily_plan_item.id
+           INNER JOIN products plan_product ON plan_product.id = daily_plan_output.product_id
+           LEFT JOIN production_plan_product_details daily_detail ON daily_detail.production_plan_output_id = daily_plan_output.id
+          WHERE ${dailyPlanFilters.join(" AND ")}
+          GROUP BY daily_plan.planned_date, COALESCE(plan_product.physical_product_id, plan_product.id)
+       ) informed ON informed.planned_date = daily_batch.produced_date AND informed.product_id = daily_physical.id
+      WHERE ${dailyFilters.join(" AND ")}
+      GROUP BY daily_batch.produced_date, daily_physical.id, daily_physical.name, daily_physical.sku, informed.informed_quantity
+      ORDER BY daily_batch.produced_date ASC, daily_physical.name ASC`,
+    [...dailyPlanValues, ...dailyValues]
+  );
+  const normalizedDailyProducts = dailyProductRows.map((row) => {
+    const shortage = Number(row.shortage_quantity || 0);
+    const surplus = Number(row.surplus_quantity || 0);
+    return {
+      ...row,
+      reconciliation_status: Number(row.has_corrections || 0) > 0 ? "corrected"
+        : Number(row.pending_outputs || 0) > 0 ? "pending_count"
+          : shortage > 0 ? "shortage" : surplus > 0 ? "surplus" : "matched",
+    };
+  });
+
   const planProductFilters = ["history.planned_date >= ?", "history.planned_date <= ?"];
   const planProductValues = [reportDateFrom, reportDateTo];
   if (branchId) {
@@ -2360,7 +3157,7 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
      INNER JOIN users baker ON baker.id = baker_employee.user_id
      LEFT JOIN users reporter ON reporter.id = history.reported_by
      WHERE ${planProductFilters.join(" AND ")}
-     ORDER BY history.planned_date DESC, baker.full_name, history.recipe_id, history.product_name`,
+     ORDER BY history.planned_date ASC, baker.full_name, history.recipe_id, history.product_name`,
     planProductValues
   );
 
@@ -2374,6 +3171,7 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
       summary: summaryRows[0] || {},
       batches: batchRows,
       products: productRows,
+      daily_products: normalizedDailyProducts,
       raw_materials_usage: rawMaterialRows,
       posterior_materials: posteriorRows,
       packers: packerRows,
@@ -2384,7 +3182,7 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
 
 const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, recipeId } = {}) => {
   const db = await connect();
-  const selectedMonth = month || new Date().toISOString().slice(0, 7);
+  const selectedMonth = month || getOperationalMonth();
   const [year, monthNumber] = selectedMonth.split("-").map((value) => Number(value));
   const lastDay = year && monthNumber ? new Date(year, monthNumber, 0).getDate() : 1;
   const reportDateFrom = dateFrom || `${selectedMonth}-01`;
@@ -2426,8 +3224,8 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
       WHERE im.item_type = 'raw_material'
         AND im.movement_type = 'production_out'
         AND im.reference_type IN ('production_batch', 'production_output_material')
-        AND DATE(im.moved_at) >= ?
-        AND DATE(im.moved_at) <= ?
+        AND DATE(COALESCE(pb_base.produced_date, pb_pom.produced_date, im.moved_at)) >= ?
+        AND DATE(COALESCE(pb_base.produced_date, pb_pom.produced_date, im.moved_at)) <= ?
         AND (? IS NULL OR im.branch_id = ?)
         AND (? IS NULL OR r.id = ?)
       GROUP BY r.id, r.notes, p.name, im.raw_material_id, rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity
@@ -2450,16 +3248,14 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
          * COALESCE(im.unit_cost, rm.unit_cost, 0)), 0) AS total_cost
      FROM inventory_movements im
      INNER JOIN raw_materials rm ON rm.id = im.raw_material_id
-     INNER JOIN production_plan_product_corrections correction ON correction.id = im.reference_id
-     INNER JOIN production_plan_product_details detail ON detail.id = correction.production_plan_product_detail_id
-     INNER JOIN production_plan_outputs plan_output ON plan_output.id = detail.production_plan_output_id
-     INNER JOIN production_plan_items plan_item ON plan_item.id = plan_output.production_plan_item_id
-     INNER JOIN recipes recipe ON recipe.id = plan_item.recipe_id
+     INNER JOIN production_record_corrections correction ON correction.id = im.reference_id
+     INNER JOIN production_batches correction_batch ON correction_batch.id = correction.production_batch_id
+     INNER JOIN recipes recipe ON recipe.id = correction_batch.recipe_id
      LEFT JOIN products recipe_product ON recipe_product.id = recipe.product_id
      WHERE im.item_type = 'raw_material'
        AND im.reference_type = 'production_correction'
        AND im.movement_type IN ('production_out', 'adjustment_in')
-       AND DATE(im.moved_at) >= ? AND DATE(im.moved_at) <= ?
+       AND correction_batch.produced_date >= ? AND correction_batch.produced_date <= ?
        AND (? IS NULL OR im.branch_id = ?)
        AND (? IS NULL OR recipe.id = ?)
      GROUP BY recipe.id, recipe.notes, recipe_product.name, im.raw_material_id,
@@ -2527,8 +3323,8 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
         WHERE im.item_type = 'raw_material'
           AND im.movement_type = 'production_out'
           AND im.reference_type IN ('production_batch', 'production_output_material')
-          AND DATE(im.moved_at) >= ?
-          AND DATE(im.moved_at) <= ?
+          AND DATE(COALESCE(pb_base.produced_date, pb_pom.produced_date, im.moved_at)) >= ?
+          AND DATE(COALESCE(pb_base.produced_date, pb_pom.produced_date, im.moved_at)) <= ?
           AND (? IS NULL OR im.branch_id = ?)
           AND (? IS NULL OR COALESCE(pb_base.recipe_id, pb_pom.recipe_id) = ?)
           AND (
@@ -2552,7 +3348,7 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
 
   const [flourCorrectionRows] = await db.query(
     `SELECT
-       DATE(im.moved_at) AS usage_date,
+       correction_batch.produced_date AS usage_date,
        im.raw_material_id,
        rm.name AS raw_material_name,
        rm.unit AS raw_material_unit,
@@ -2566,18 +3362,16 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
      FROM inventory_movements im
      INNER JOIN raw_materials rm ON rm.id = im.raw_material_id
      LEFT JOIN raw_material_categories category ON category.id = rm.category_id
-     INNER JOIN production_plan_product_corrections correction ON correction.id = im.reference_id
-     INNER JOIN production_plan_product_details detail ON detail.id = correction.production_plan_product_detail_id
-     INNER JOIN production_plan_outputs plan_output ON plan_output.id = detail.production_plan_output_id
-     INNER JOIN production_plan_items plan_item ON plan_item.id = plan_output.production_plan_item_id
+     INNER JOIN production_record_corrections correction ON correction.id = im.reference_id
+     INNER JOIN production_batches correction_batch ON correction_batch.id = correction.production_batch_id
      WHERE im.reference_type = 'production_correction'
        AND im.item_type = 'raw_material'
        AND im.movement_type IN ('production_out', 'adjustment_in')
-       AND DATE(im.moved_at) >= ? AND DATE(im.moved_at) <= ?
+       AND correction_batch.produced_date >= ? AND correction_batch.produced_date <= ?
        AND (? IS NULL OR im.branch_id = ?)
-       AND (? IS NULL OR plan_item.recipe_id = ?)
+       AND (? IS NULL OR correction_batch.recipe_id = ?)
        AND (LOWER(rm.name) LIKE '%harina%' OR LOWER(COALESCE(category.name, '')) LIKE '%harina%')
-     GROUP BY DATE(im.moved_at), im.raw_material_id, rm.name, rm.unit, rm.category_id,
+     GROUP BY correction_batch.produced_date, im.raw_material_id, rm.name, rm.unit, rm.category_id,
               category.name, rm.purchase_package_name, rm.purchase_package_quantity`,
     [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
   );
@@ -3052,7 +3846,7 @@ const createProductionPlan = async (payload, actorUserId) => {
        ) VALUES (?, 'production_plan', ?, ?, 'production_plan', ?)`,
       [
         Number(bakerRows[0].user_id),
-        `ProducciÃƒÂ³n asignada para ${plannedDate}`,
+        `Lista informativa para ${plannedDate}`,
         `${productCount} producto(s), ${recipeCount} receta(s) y ${totalArrobas.toLocaleString("es-CO")} arroba(s) en ${branchRows[0].name}.`,
         productionPlanId,
       ]
@@ -3105,7 +3899,6 @@ const updateProductionPlan = async (productionPlanId, payload, actorUser = {}) =
     connection.release();
     return { code: 0, message: "Selecciona sucursal, fecha, panadero y al menos un producto.", data: null };
   }
-
   try {
     if (ownsTransaction) await connection.beginTransaction();
     const [planRows] = await connection.query(
@@ -3344,6 +4137,21 @@ const listProductionPlans = async ({ userId, plannedDate, dateFrom, dateTo, bake
   }
 
   const planIds = plans.map((plan) => Number(plan.id));
+  if (userId) {
+    const viewedPlaceholders = planIds.map(() => "?").join(",");
+    await db.query(
+      `UPDATE production_plans
+          SET status = IF(status = 'assigned', 'viewed', status),
+              viewed_at = COALESCE(viewed_at, CURRENT_TIMESTAMP)
+        WHERE id IN (${viewedPlaceholders})
+          AND status <> 'cancelled'`,
+      planIds
+    );
+    plans.forEach((plan) => {
+      if (plan.status === "assigned") plan.status = "viewed";
+    });
+  }
+
   const placeholders = planIds.map(() => "?").join(",");
   const [items] = await db.query(
     `SELECT
@@ -3476,6 +4284,7 @@ const listProductionPlans = async ({ userId, plannedDate, dateFrom, dateTo, bake
 
     return {
       ...plan,
+      status: normalizeInformationalPlanStatus(plan.status),
       items: planItems,
       product_assignments: productAssignments,
       recipe_groups: Array.from(groupsByRecipe.values()),
@@ -3487,657 +4296,9 @@ const listProductionPlans = async ({ userId, plannedDate, dateFrom, dateTo, bake
 
   return {
     code: 1,
-    message: "planes de producciÃƒÂ³n listados",
+    message: "Listas informativas de produccion consultadas.",
     data: plans.map(buildCompatiblePlanData),
   };
-};
-
-const startProductionPlanItem = async ({ productionPlanItemId, userId }) => {
-  const db = await connect();
-  const [rows] = await db.query(
-    `SELECT ppi.id, ppi.started_at, ppi.production_batch_id, pp.status
-       FROM production_plan_items ppi
-       INNER JOIN production_plans pp ON pp.id = ppi.production_plan_id
-       INNER JOIN employees e ON e.id = pp.baker_employee_id
-      WHERE ppi.id = ?
-        AND e.user_id = ?
-      LIMIT 1`,
-    [Number(productionPlanItemId), Number(userId)]
-  );
-
-  if (!rows.length) {
-    return { code: 0, message: "Esta producciÃƒÂ³n no estÃƒÂ¡ asignada a tu usuario.", data: null };
-  }
-  if (rows[0].status === "cancelled") {
-    return { code: 0, message: "Esta asignaciÃƒÂ³n fue cancelada.", data: null };
-  }
-
-  await db.query(
-    `UPDATE production_plan_items
-        SET started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
-      WHERE id = ?`,
-    [Number(productionPlanItemId)]
-  );
-  await db.query(
-    `UPDATE production_plans pp
-       INNER JOIN production_plan_items ppi ON ppi.production_plan_id = pp.id
-        SET pp.status = IF(pp.status = 'assigned', 'viewed', pp.status),
-            pp.viewed_at = COALESCE(pp.viewed_at, CURRENT_TIMESTAMP)
-      WHERE ppi.id = ?`,
-    [Number(productionPlanItemId)]
-  );
-
-  return {
-    code: 1,
-    message: rows[0].production_batch_id ? "La producciÃƒÂ³n ya estÃƒÂ¡ finalizada." : "ProducciÃƒÂ³n iniciada.",
-    data: {
-      production_plan_item_id: Number(productionPlanItemId),
-      production_batch_id: rows[0].production_batch_id ? Number(rows[0].production_batch_id) : null,
-    },
-  };
-};
-
-const finishProductionPlanItem = async ({ productionPlanItemId, userId, outputs = [], batchQuantity }) => {
-  const db = await connect();
-  const lockConnection = await db.getConnection();
-  const lockName = `production_plan_item_${Number(productionPlanItemId)}`;
-  let lockAcquired = false;
-
-  try {
-    const [lockRows] = await lockConnection.query("SELECT GET_LOCK(?, 5) AS acquired", [lockName]);
-    lockAcquired = Number(lockRows[0]?.acquired || 0) === 1;
-    if (!lockAcquired) {
-      return { code: 0, message: "La producciÃƒÂ³n se estÃƒÂ¡ iniciando. Espera un momento.", data: null };
-    }
-
-    const [itemRows] = await lockConnection.query(
-      `SELECT
-         ppi.id,
-         ppi.recipe_id,
-         ppi.production_batch_id,
-         ppi.started_at,
-         ppi.arrobas,
-         pp.id AS production_plan_id,
-         pp.branch_id,
-         pp.planned_date,
-         pp.baker_employee_id,
-         pp.notes,
-         pp.status
-       FROM production_plan_items ppi
-       INNER JOIN production_plans pp ON pp.id = ppi.production_plan_id
-       INNER JOIN employees e ON e.id = pp.baker_employee_id
-       WHERE ppi.id = ?
-         AND e.user_id = ?
-       LIMIT 1`,
-      [Number(productionPlanItemId), Number(userId)]
-    );
-
-    if (!itemRows.length) {
-      return { code: 0, message: "Esta producciÃƒÂ³n no estÃƒÂ¡ asignada a tu usuario.", data: null };
-    }
-
-    const item = itemRows[0];
-    if (item.production_batch_id) {
-      return {
-        code: 1,
-        message: "Esta produccion ya fue finalizada.",
-        data: { production_batch_id: Number(item.production_batch_id) },
-      };
-    }
-
-    if (item.status === "cancelled") {
-      return { code: 0, message: "Esta asignaciÃƒÂ³n fue cancelada.", data: null };
-    }
-    if (!item.started_at) {
-      return { code: 0, message: "Primero debes iniciar la producciÃƒÂ³n.", data: null };
-    }
-
-    const [outputRows] = await lockConnection.query(
-      `SELECT ppo.product_id, p.name AS product_name, ppo.expected_quantity
-       FROM production_plan_outputs ppo
-       INNER JOIN products p ON p.id = ppo.product_id
-       WHERE ppo.production_plan_item_id = ?
-       ORDER BY ppo.id`,
-      [Number(productionPlanItemId)]
-    );
-
-    const outputMap = new Map(outputRows.map((output) => [Number(output.product_id), output]));
-    const requestedOutputs = Array.isArray(outputs) ? outputs : [];
-    const normalizedOutputs = (requestedOutputs.length ? requestedOutputs : outputRows).map((output) => {
-      const productId = Number(output.product_id);
-      const source = outputMap.get(productId);
-      const producedQuantity = output.produced_quantity !== undefined
-        ? Number(output.produced_quantity)
-        : Math.round(Number(source?.expected_quantity || 0) * Number(item.arrobas || 1) * 1000) / 1000;
-
-      return { product_id: productId, produced_quantity: producedQuantity };
-    });
-
-    if (!normalizedOutputs.length || normalizedOutputs.some((output) => !outputMap.has(Number(output.product_id)))) {
-      return { code: 0, message: "Selecciona productos validos de la asignacion.", data: null };
-    }
-
-    if (normalizedOutputs.some((output) => !Number.isFinite(Number(output.produced_quantity)) || Number(output.produced_quantity) <= 0)) {
-      return { code: 0, message: "Todas las cantidades realizadas deben ser mayores a cero.", data: null };
-    }
-
-    const batchResult = await registerProductionBatch(
-      {
-        p_branch_id: Number(item.branch_id),
-        p_recipe_id: Number(item.recipe_id),
-        p_baker_employee_id: Number(item.baker_employee_id),
-        p_produced_date: item.planned_date,
-        p_batch_quantity: Number(batchQuantity || item.arrobas),
-        p_outputs: normalizedOutputs,
-        p_notes: item.notes || `Plan de produccion #${item.production_plan_id}`,
-      },
-      Number(userId)
-    );
-
-    if (batchResult?.code !== 1) {
-      return batchResult;
-    }
-
-    const productionBatchId = Number(batchResult.data?.production_batch_id);
-    await lockConnection.query(
-      `UPDATE production_plan_items
-       SET production_batch_id = ?,
-           finished_at = CURRENT_TIMESTAMP
-       WHERE id = ?
-         AND production_batch_id IS NULL`,
-      [productionBatchId, Number(productionPlanItemId)]
-    );
-
-    await lockConnection.query(
-      `UPDATE production_sale_reservations psr
-       INNER JOIN production_plan_outputs ppo
-         ON ppo.id = psr.production_plan_output_id
-       INNER JOIN production_batch_outputs pbo
-         ON pbo.production_batch_id = ?
-        AND pbo.product_id = ppo.product_id
-       SET psr.production_batch_output_id = pbo.id
-       WHERE ppo.production_plan_item_id = ?
-         AND psr.production_batch_output_id IS NULL
-         AND psr.status IN ('reserved','partially_delivered')`,
-      [productionBatchId, Number(productionPlanItemId)]
-    );
-
-    const [pendingRows] = await lockConnection.query(
-      `SELECT COUNT(*) AS pending_items
-       FROM production_plan_items
-       WHERE production_plan_id = ?
-         AND production_batch_id IS NULL`,
-      [Number(item.production_plan_id)]
-    );
-
-    if (Number(pendingRows[0]?.pending_items || 0) === 0) {
-      await lockConnection.query(
-        `UPDATE production_plans
-         SET status = 'completed'
-         WHERE id = ?
-           AND status <> 'cancelled'`,
-        [Number(item.production_plan_id)]
-      );
-    }
-
-    return {
-      code: 1,
-      message: "Produccion finalizada. El lote quedo pendiente de conteo y empaque.",
-      data: { production_batch_id: productionBatchId },
-    };
-  } finally {
-    if (lockAcquired) {
-      await lockConnection.query("SELECT RELEASE_LOCK(?)", [lockName]);
-    }
-    lockConnection.release();
-  }
-};
-
-const getOwnedProductionPlanProduct = async (connection, productionPlanOutputId, userId, { forUpdate = false } = {}) => {
-  const [rows] = await connection.query(
-    `SELECT
-       ppo.id,
-       ppo.production_plan_item_id,
-       ppo.product_id,
-       ppo.expected_quantity,
-       ppi.recipe_id,
-       ppi.production_batch_id,
-       ppi.started_at AS item_started_at,
-       p.name AS product_name,
-       ppd.product_status,
-       ppd.planned_arrobas,
-       ppd.estimated_units,
-       pp.id AS production_plan_id,
-       pp.branch_id,
-       pp.planned_date,
-       pp.baker_employee_id,
-       pp.notes AS plan_notes,
-       pp.status AS plan_status
-     FROM production_plan_outputs ppo
-     INNER JOIN production_plan_product_details ppd ON ppd.production_plan_output_id = ppo.id
-     INNER JOIN production_plan_items ppi ON ppi.id = ppo.production_plan_item_id
-     INNER JOIN production_plans pp ON pp.id = ppi.production_plan_id
-     INNER JOIN employees e ON e.id = pp.baker_employee_id
-     INNER JOIN products p ON p.id = ppo.product_id
-     WHERE ppo.id = ? AND e.user_id = ?
-     LIMIT 1${forUpdate ? " FOR UPDATE" : ""}`,
-    [Number(productionPlanOutputId), Number(userId)]
-  );
-  return rows[0] || null;
-};
-
-const refreshProductionPlanStatus = async (connection, productionPlanId) => {
-  const [rows] = await connection.query(
-    `SELECT COUNT(*) AS pending_products
-     FROM production_plan_outputs ppo
-     INNER JOIN production_plan_items ppi ON ppi.id = ppo.production_plan_item_id
-     LEFT JOIN production_plan_product_details ppd ON ppd.production_plan_output_id = ppo.id
-     WHERE ppi.production_plan_id = ?
-       AND (
-         (ppd.id IS NOT NULL AND ppd.product_status NOT IN ('completed','skipped','cancelled'))
-         OR (ppd.id IS NULL AND ppi.production_batch_id IS NULL)
-       )`,
-    [Number(productionPlanId)]
-  );
-  if (Number(rows[0]?.pending_products || 0) === 0) {
-    await connection.query(
-      "UPDATE production_plans SET status = 'completed' WHERE id = ? AND status <> 'cancelled'",
-      [Number(productionPlanId)]
-    );
-  }
-};
-
-const normalizeProductProgress = (payload = {}) => {
-  const fields = [
-    ["actual_arrobas", payload.p_actual_arrobas, false],
-    ["produced_quantity", payload.p_produced_quantity, true],
-    ["actual_units_per_tray", payload.p_actual_units_per_tray, false],
-    ["actual_tray_count", payload.p_actual_tray_count, true],
-    ["actual_loose_units", payload.p_actual_loose_units, true],
-  ];
-  const values = {};
-  for (const [name, rawValue, allowZero] of fields) {
-    if (rawValue === undefined || rawValue === null || rawValue === "") {
-      values[name] = null;
-      continue;
-    }
-    const value = Number(rawValue);
-    if (!Number.isFinite(value) || (allowZero ? value < 0 : value <= 0)) return null;
-    if (name === "produced_quantity" && !Number.isInteger(value)) return null;
-    values[name] = roundProductionQuantity(value);
-  }
-  values.baker_notes = String(payload.p_baker_notes || "").trim().slice(0, 500) || null;
-  return values;
-};
-
-const startProductionPlanProduct = async ({ productionPlanOutputId, userId }) => {
-  const db = await connect();
-  const product = await getOwnedProductionPlanProduct(db, productionPlanOutputId, userId);
-  if (!product) return { code: 0, message: "Este producto no esta asignado a tu usuario.", data: null };
-  if (["completed", "skipped", "cancelled"].includes(product.product_status) || product.plan_status === "cancelled") {
-    return { code: 0, message: "Este producto ya no se puede iniciar.", data: null };
-  }
-  await db.query(
-    `UPDATE production_plan_product_details
-     SET product_status = 'in_progress', started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
-     WHERE production_plan_output_id = ?`,
-    [Number(productionPlanOutputId)]
-  );
-  await db.query(
-    `UPDATE production_plan_items ppi
-     INNER JOIN production_plan_outputs ppo ON ppo.production_plan_item_id = ppi.id
-     INNER JOIN production_plans pp ON pp.id = ppi.production_plan_id
-     SET ppi.started_at = COALESCE(ppi.started_at, CURRENT_TIMESTAMP),
-         pp.status = IF(pp.status = 'assigned', 'viewed', pp.status),
-         pp.viewed_at = COALESCE(pp.viewed_at, CURRENT_TIMESTAMP)
-     WHERE ppo.id = ?`,
-    [Number(productionPlanOutputId)]
-  );
-  return { code: 1, message: "Producto iniciado.", data: { production_plan_output_id: Number(productionPlanOutputId) } };
-};
-
-const saveProductionPlanProductProgress = async ({ productionPlanOutputId, userId, payload }) => {
-  const db = await connect();
-  const product = await getOwnedProductionPlanProduct(db, productionPlanOutputId, userId);
-  if (!product) return { code: 0, message: "Este producto no esta asignado a tu usuario.", data: null };
-  if (product.product_status !== "in_progress") {
-    return { code: 0, message: "Inicia el producto antes de guardar avances.", data: null };
-  }
-  const progress = normalizeProductProgress(payload);
-  if (!progress) return { code: 0, message: "Revisa las cantidades registradas.", data: null };
-  await db.query(
-    `UPDATE production_plan_product_details
-     SET actual_arrobas = ?, produced_quantity = ?, actual_units_per_tray = ?,
-         actual_tray_count = ?, actual_loose_units = ?, baker_notes = ?,
-         reported_by = ?, reported_at = CURRENT_TIMESTAMP
-     WHERE production_plan_output_id = ?`,
-    [progress.actual_arrobas, progress.produced_quantity, progress.actual_units_per_tray,
-      progress.actual_tray_count, progress.actual_loose_units, progress.baker_notes,
-      Number(userId), Number(productionPlanOutputId)]
-  );
-  return { code: 1, message: "Avance guardado.", data: { production_plan_output_id: Number(productionPlanOutputId) } };
-};
-
-const skipProductionPlanProduct = async ({ productionPlanOutputId, userId, justification }) => {
-  const db = await connect();
-  const product = await getOwnedProductionPlanProduct(db, productionPlanOutputId, userId);
-  const notes = String(justification || "").trim();
-  if (!product) return { code: 0, message: "Este producto no esta asignado a tu usuario.", data: null };
-  if (!notes) return { code: 0, message: "Escribe por que el producto no fue elaborado.", data: null };
-  if (["completed", "skipped", "cancelled"].includes(product.product_status)) {
-    return { code: 0, message: "Este producto ya fue cerrado.", data: null };
-  }
-  await db.query(
-    `UPDATE production_plan_product_details ppd
-     INNER JOIN production_plan_outputs ppo ON ppo.id = ppd.production_plan_output_id
-     INNER JOIN production_plan_items ppi ON ppi.id = ppo.production_plan_item_id
-     SET ppd.product_status = 'skipped', ppd.baker_notes = ?, ppd.reported_by = ?,
-         ppd.reported_at = CURRENT_TIMESTAMP, ppd.completed_at = CURRENT_TIMESTAMP,
-         ppi.finished_at = CURRENT_TIMESTAMP
-     WHERE ppd.production_plan_output_id = ?`,
-    [notes.slice(0, 500), Number(userId), Number(productionPlanOutputId)]
-  );
-  await refreshProductionPlanStatus(db, product.production_plan_id);
-  return { code: 1, message: "Producto marcado como no elaborado.", data: null };
-};
-
-const finishProductionPlanProduct = async ({ productionPlanOutputId, userId, payload }) => {
-  const db = await connect();
-  const connection = await db.getConnection();
-  const ownsTransaction = true;
-  try {
-    if (ownsTransaction) await connection.beginTransaction();
-    const product = await getOwnedProductionPlanProduct(
-      connection,
-      productionPlanOutputId,
-      userId,
-      { forUpdate: true }
-    );
-    if (!product) {
-      if (ownsTransaction) await connection.rollback();
-      return { code: 0, message: "Este producto no esta asignado a tu usuario.", data: null };
-    }
-    if (product.product_status === "completed" || product.production_batch_id) {
-      if (ownsTransaction) await connection.rollback();
-      return {
-        code: 1,
-        message: "El producto ya fue finalizado.",
-        data: { production_batch_id: Number(product.production_batch_id || 0) || null },
-      };
-    }
-    if (product.product_status !== "in_progress" || !product.item_started_at) {
-      if (ownsTransaction) await connection.rollback();
-      return { code: 0, message: "Inicia el producto antes de finalizarlo.", data: null };
-    }
-    if (product.plan_status === "cancelled") {
-      if (ownsTransaction) await connection.rollback();
-      return { code: 0, message: "El plan fue cancelado.", data: null };
-    }
-    const progress = normalizeProductProgress(payload);
-    if (!progress || !progress.actual_arrobas || !progress.produced_quantity) {
-      if (ownsTransaction) await connection.rollback();
-      return { code: 0, message: "Registra las arrobas utilizadas y la cantidad producida.", data: null };
-    }
-
-    const batchResult = await registerProductionBatch(
-      {
-        p_branch_id: Number(product.branch_id),
-        p_recipe_id: Number(product.recipe_id),
-        p_baker_employee_id: Number(product.baker_employee_id),
-        p_produced_date: product.planned_date,
-        p_batch_quantity: progress.actual_arrobas,
-        p_outputs: [{ product_id: product.product_id, produced_quantity: progress.produced_quantity }],
-        p_notes: progress.baker_notes || product.plan_notes || `Plan de produccion #${product.production_plan_id}`,
-      },
-      Number(userId),
-      { connection }
-    );
-    if (batchResult?.code !== 1) {
-        if (ownsTransaction) await connection.rollback();
-      return batchResult;
-    }
-
-    const productionBatchId = Number(batchResult.data?.production_batch_id);
-    await connection.query(
-      `UPDATE production_plan_items
-       SET production_batch_id = ?, finished_at = CURRENT_TIMESTAMP
-       WHERE id = ? AND production_batch_id IS NULL`,
-      [productionBatchId, Number(product.production_plan_item_id)]
-    );
-    await connection.query(
-      `UPDATE production_sale_reservations psr
-       INNER JOIN production_plan_outputs ppo ON ppo.id = psr.production_plan_output_id
-       INNER JOIN production_batch_outputs pbo
-         ON pbo.production_batch_id = ? AND pbo.product_id = ppo.product_id
-       SET psr.production_batch_output_id = pbo.id
-       WHERE ppo.id = ?
-         AND psr.production_batch_output_id IS NULL
-         AND psr.status IN ('reserved','partially_delivered')`,
-      [productionBatchId, Number(productionPlanOutputId)]
-    );
-    await connection.query(
-      `UPDATE production_plan_product_details
-       SET product_status = 'completed', actual_arrobas = ?, produced_quantity = ?,
-           actual_units_per_tray = ?, actual_tray_count = ?, actual_loose_units = ?,
-           baker_notes = ?, reported_by = ?, reported_at = CURRENT_TIMESTAMP,
-           completed_at = CURRENT_TIMESTAMP
-       WHERE production_plan_output_id = ?`,
-      [progress.actual_arrobas, progress.produced_quantity, progress.actual_units_per_tray,
-        progress.actual_tray_count, progress.actual_loose_units, progress.baker_notes,
-        Number(userId), Number(productionPlanOutputId)]
-    );
-    await connection.query(
-      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
-       VALUES (?, 'production_plan.product.finish', 'production_plan_outputs', ?,
-         JSON_OBJECT('production_plan_id', ?, 'production_batch_id', ?, 'product_id', ?,
-           'actual_arrobas', ?, 'produced_quantity', ?, 'inventory_state', 'pending_packaging'))`,
-      [Number(userId), String(productionPlanOutputId), Number(product.production_plan_id),
-        productionBatchId, Number(product.product_id), progress.actual_arrobas, progress.produced_quantity]
-    );
-    await refreshProductionPlanStatus(connection, product.production_plan_id);
-    if (ownsTransaction) await connection.commit();
-    return {
-      ...batchResult,
-      message: "Producto finalizado. La produccion queda pendiente de conteo y empaque.",
-    };
-  } catch (error) {
-    if (ownsTransaction) await connection.rollback();
-    throw error;
-  } finally {
-    if (ownsTransaction) connection.release();
-  }
-};
-
-const correctProductionPlanProduct = async ({ productionPlanOutputId, actorUser = {}, payload = {} }) => {
-  const db = await connect();
-  const connection = await db.getConnection();
-  const ownsTransaction = true;
-  const actorUserId = Number(actorUser.userId || 0);
-  const roleCodes = (Array.isArray(actorUser.roles) ? actorUser.roles : [])
-    .map((role) => String(typeof role === "string" ? role : role?.code || role?.name || "").toUpperCase());
-  const isAdministrator = roleCodes.includes("ADMIN") || roleCodes.includes("SUPER_ADMIN");
-  const correctedArrobas = roundProductionQuantity(payload.p_actual_arrobas);
-  const correctedQuantity = roundProductionQuantity(payload.p_produced_quantity);
-  const reason = String(payload.p_reason || "").trim();
-  if (!correctedArrobas || !correctedQuantity || !reason) {
-    connection.release();
-    return { code: 0, message: "Indica arrobas, cantidad producida y el motivo de la correccion.", data: null };
-  }
-  if (!Number.isInteger(Number(payload.p_produced_quantity))) {
-    connection.release();
-    return { code: 0, message: "La cantidad producida debe ser un numero entero.", data: null };
-  }
-
-  try {
-    if (ownsTransaction) await connection.beginTransaction();
-    const [rows] = await connection.query(
-      `SELECT
-         ppd.id AS detail_id, ppd.product_status, ppd.actual_arrobas, ppd.produced_quantity,
-         ppo.product_id, ppo.production_plan_item_id, ppi.recipe_id, ppi.production_batch_id,
-         pp.branch_id, e.user_id AS baker_user_id,
-         pb.status AS batch_status, pbo.id AS production_batch_output_id,
-         pbo.packed_quantity, pbo.damaged_quantity, pbo.missing_quantity,
-         COALESCE(pbo.direct_delivered_quantity, 0) AS direct_delivered_quantity
-       FROM production_plan_outputs ppo
-       INNER JOIN production_plan_product_details ppd ON ppd.production_plan_output_id = ppo.id
-       INNER JOIN production_plan_items ppi ON ppi.id = ppo.production_plan_item_id
-       INNER JOIN production_plans pp ON pp.id = ppi.production_plan_id
-       INNER JOIN employees e ON e.id = pp.baker_employee_id
-       INNER JOIN production_batches pb ON pb.id = ppi.production_batch_id
-       INNER JOIN production_batch_outputs pbo
-         ON pbo.production_batch_id = pb.id AND pbo.product_id = ppo.product_id
-       WHERE ppo.id = ?
-       LIMIT 1 FOR UPDATE`,
-      [Number(productionPlanOutputId)]
-    );
-    if (!rows.length || rows[0].product_status !== "completed") {
-      await connection.rollback();
-      return { code: 0, message: "El producto no tiene una produccion finalizada para corregir.", data: null };
-    }
-    const product = rows[0];
-    const accountedQuantity = Number(product.packed_quantity || 0)
-      + Number(product.damaged_quantity || 0)
-      + Number(product.missing_quantity || 0)
-      + Number(product.direct_delivered_quantity || 0);
-    const [reservationRows] = await connection.query(
-      `SELECT COALESCE(SUM(quantity), 0) AS committed_quantity
-       FROM production_sale_reservations
-       WHERE production_plan_output_id = ?
-         AND status NOT IN ('released','cancelled')`,
-      [Number(productionPlanOutputId)]
-    );
-    const committedQuantity = Number(reservationRows[0]?.committed_quantity || 0);
-    const hasPackaging = accountedQuantity > 0 || ["partially_packed", "packed"].includes(product.batch_status);
-    const requiresAdministrator = hasPackaging || committedQuantity > 0;
-    if (requiresAdministrator && !isAdministrator) {
-      await connection.rollback();
-      return { code: 0, message: "Despues del conteo, empaque o una reserva, solo un administrador puede corregir la produccion.", data: null };
-    }
-    if (!isAdministrator && Number(product.baker_user_id) !== actorUserId) {
-      await connection.rollback();
-      return { code: 0, message: "Esta produccion no esta asignada a tu usuario.", data: null };
-    }
-    if (correctedQuantity < Math.max(accountedQuantity, committedQuantity)) {
-      await connection.rollback();
-      return {
-        code: 0,
-        message: `La cantidad no puede ser menor a ${Math.max(accountedQuantity, committedQuantity).toLocaleString("es-CO")} unidades ya empacadas, entregadas o reservadas.`,
-        data: null,
-      };
-    }
-
-    const previousArrobas = Number(product.actual_arrobas);
-    const previousQuantity = Number(product.produced_quantity);
-    const arrobasDelta = roundProductionQuantity(correctedArrobas - previousArrobas);
-    const scope = requiresAdministrator ? "post_packaging" : "pre_packaging";
-    const [correctionInsert] = await connection.query(
-      `INSERT INTO production_plan_product_corrections (
-         production_plan_product_detail_id, production_batch_id, correction_scope,
-         previous_actual_arrobas, corrected_actual_arrobas,
-         previous_produced_quantity, corrected_produced_quantity, reason, corrected_by
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [Number(product.detail_id), Number(product.production_batch_id), scope,
-        previousArrobas, correctedArrobas, previousQuantity, correctedQuantity,
-        reason.slice(0, 500), actorUserId]
-    );
-    const correctionId = Number(correctionInsert.insertId);
-
-    if (arrobasDelta !== 0) {
-      const [materialRows] = await connection.query(
-        `SELECT usage.raw_material_id, rm.unit_cost,
-                ROUND(SUM(usage.quantity_per_arroba) * ABS(?), 3) AS adjustment_quantity
-         FROM (
-           SELECT ri.raw_material_id,
-                  ri.quantity * (1 + COALESCE(ri.wastage_percent, 0) / 100) AS quantity_per_arroba
-           FROM recipe_items ri WHERE ri.recipe_id = ?
-           UNION ALL
-           SELECT roi.raw_material_id,
-                  roi.quantity * (1 + COALESCE(roi.wastage_percent, 0) / 100) AS quantity_per_arroba
-           FROM recipe_output_items roi
-           INNER JOIN recipe_outputs ro ON ro.id = roi.recipe_output_id
-           WHERE ro.recipe_id = ? AND ro.product_id = ?
-         ) usage
-         INNER JOIN raw_materials rm ON rm.id = usage.raw_material_id
-         GROUP BY usage.raw_material_id, rm.unit_cost`,
-        [arrobasDelta, Number(product.recipe_id), Number(product.recipe_id), Number(product.product_id)]
-      );
-      for (const material of materialRows) {
-        const quantity = Number(material.adjustment_quantity || 0);
-        if (quantity <= 0) continue;
-        await connection.query(
-          `INSERT IGNORE INTO stock_raw_materials (branch_id, raw_material_id, quantity_on_hand, min_stock)
-           VALUES (?, ?, 0, 0)`,
-          [Number(product.branch_id), Number(material.raw_material_id)]
-        );
-        const [stockRows] = await connection.query(
-          `SELECT quantity_on_hand FROM stock_raw_materials
-           WHERE branch_id = ? AND raw_material_id = ? FOR UPDATE`,
-          [Number(product.branch_id), Number(material.raw_material_id)]
-        );
-        if (arrobasDelta > 0 && Number(stockRows[0]?.quantity_on_hand || 0) < quantity) {
-          await connection.rollback();
-          return { code: 0, message: "No hay materia prima suficiente para aumentar las arrobas utilizadas.", data: null };
-        }
-        await connection.query(
-          `UPDATE stock_raw_materials
-           SET quantity_on_hand = quantity_on_hand ${arrobasDelta > 0 ? "-" : "+"} ?
-           WHERE branch_id = ? AND raw_material_id = ?`,
-          [quantity, Number(product.branch_id), Number(material.raw_material_id)]
-        );
-        await connection.query(
-          `INSERT INTO inventory_movements (
-             branch_id, item_type, raw_material_id, product_id, movement_type,
-             quantity, unit_cost, reference_type, reference_id, notes, created_by
-           ) VALUES (?, 'raw_material', ?, NULL, ?, ?, ?, 'production_correction', ?, ?, ?)`,
-          [Number(product.branch_id), Number(material.raw_material_id),
-            arrobasDelta > 0 ? "production_out" : "adjustment_in", quantity,
-            material.unit_cost ?? null, correctionId, reason.slice(0, 500), actorUserId]
-        );
-      }
-    }
-
-    await connection.query(
-      `UPDATE production_batches SET batch_quantity = ? WHERE id = ?`,
-      [correctedArrobas, Number(product.production_batch_id)]
-    );
-    await connection.query(
-      `UPDATE production_batch_outputs SET produced_quantity = ? WHERE id = ?`,
-      [correctedQuantity, Number(product.production_batch_output_id)]
-    );
-    await connection.query(
-      `UPDATE production_plan_product_details
-       SET actual_arrobas = ?, produced_quantity = ?, baker_notes = ?,
-           reported_by = ?, reported_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-      [correctedArrobas, correctedQuantity, reason.slice(0, 500), actorUserId, Number(product.detail_id)]
-    );
-    const remainingQuantity = correctedQuantity - accountedQuantity;
-    await connection.query(
-      `UPDATE production_batches
-       SET status = CASE
-         WHEN ? <= 0 THEN 'packed'
-         WHEN ? > 0 THEN 'partially_packed'
-         ELSE 'pending_packaging'
-       END
-       WHERE id = ?`,
-      [remainingQuantity, accountedQuantity, Number(product.production_batch_id)]
-    );
-    await connection.query(
-      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
-       VALUES (?, 'production_plan.product.correct', 'production_plan_outputs', ?,
-         JSON_OBJECT('correction_id', ?, 'scope', ?, 'previous_arrobas', ?, 'corrected_arrobas', ?,
-           'previous_quantity', ?, 'corrected_quantity', ?, 'reason', ?))`,
-      [actorUserId, String(productionPlanOutputId), correctionId, scope, previousArrobas,
-        correctedArrobas, previousQuantity, correctedQuantity, reason.slice(0, 500)]
-    );
-    if (ownsTransaction) await connection.commit();
-    return { code: 1, message: "Correccion registrada con trazabilidad.", data: { correction_id: correctionId } };
-  } catch (error) {
-    if (ownsTransaction) await connection.rollback();
-    throw error;
-  } finally {
-    if (ownsTransaction) connection.release();
-  }
 };
 
 const listUserNotifications = async ({ userId, onlyUnread } = {}) => {
@@ -4343,13 +4504,17 @@ module.exports = {
   registerProductionOrderItemResult,
   listProductionBaseData,
   listMyProductionBaseData,
+  listPackagingActors,
   registerProductionResult,
   registerProductionBatch,
   registerMyProductionBatch,
   listPendingPackaging,
   createPackingReport,
+  correctPackingReportItem,
+  correctProductionBatchOutput,
+  listProductionRecordCorrections,
   listPackingHistory,
-  listJustifiedShortages,
+  getPackingDamageReport,
   registerProductionDamage,
   getRawMaterialUsageReport,
   getRawMaterialUsageByProductReport,
@@ -4360,13 +4525,6 @@ module.exports = {
   updateProductionPlan,
   cancelProductionPlan,
   listProductionPlans,
-  startProductionPlanItem,
-  finishProductionPlanItem,
-  startProductionPlanProduct,
-  saveProductionPlanProductProgress,
-  skipProductionPlanProduct,
-  finishProductionPlanProduct,
-  correctProductionPlanProduct,
   listUserNotifications,
   markUserNotificationViewed,
   closeProductionOrder,
