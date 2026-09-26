@@ -25,6 +25,19 @@ const { normalizeRawMaterialEntryQuantity } = require("../domain/raw-material-en
 const { resolveWholesalePrice } = require("../domain/wholesale-pricing");
 const { resolvePhysicalProduct } = require("../domain/physical-product");
 
+const normalizeSqlDateValue = (value, fieldName = "fecha") => {
+  if (!value) return null;
+  const directValue = String(value).trim();
+  const directMatch = directValue.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (directMatch) return directMatch[1];
+
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`${fieldName} invalida`);
+  }
+  return parsed.toISOString().slice(0, 10);
+};
+
 const resolveOrderProductPrice = async ({
   connection,
   customerId,
@@ -2628,6 +2641,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
     const [previousItemRows] = await connection.query(
       `SELECT
          oi.id,
+         oi.inventory_product_id,
          oi.quantity,
          COALESCE((
            SELECT SUM(psr.delivered_quantity)
@@ -2641,6 +2655,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
       [orderId, orderItemId, orderItemId, orderItemId, lineGroupKey, productId, previousLineType]
     );
     const previousItem = previousItemRows[0] || null;
+    let inventoryProductId = Number(previousItem?.inventory_product_id || productId);
     const previousStockQuantity = previousItem
       ? Math.max(Number(previousItem.quantity || 0) - Number(previousItem.directly_delivered_quantity || 0), 0)
       : 0;
@@ -2774,7 +2789,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
         await connection.rollback();
         return { code: 0, message: "producto no encontrado o inactivo", data: null };
       }
-      const inventoryProductId = Number(products[0].inventory_product_id);
+      inventoryProductId = Number(products[0].inventory_product_id);
       if (lineType === "bonus" && isPastryCategoryName(products[0].category_name)) {
         await connection.rollback();
         return {
@@ -2790,7 +2805,7 @@ const upsertOrderItem = async (payload, actorUserId) => {
           connection,
           customerId: Number(orders[0].customer_id),
           productId,
-          effectiveDate: String(orders[0].order_date).slice(0, 10),
+          effectiveDate: normalizeSqlDateValue(orders[0].order_date, "fecha del pedido"),
           regularPrice: products[0].base_price,
           lock: true,
         });
@@ -6640,6 +6655,7 @@ const getPurchaseOrderDetail = async ({ purchaseOrderId }) => {
 };
 
 module.exports = {
+  normalizeSqlDateValue,
   resolveOrderProductPrice,
   getCustomerCreditBalance,
   listOrders,
