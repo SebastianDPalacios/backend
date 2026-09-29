@@ -32,6 +32,25 @@ test("usa el precio mayorista general cuando no existe uno especial vigente", ()
   assert.equal(result.priceConfigurationId, 10);
 });
 
+test("acepta las fechas DATE que MySQL devuelve como objetos Date", () => {
+  const result = resolveWholesalePrice({
+    customerIsWholesale: true,
+    regularPrice: 1500,
+    customerSpecialPrice: {
+      id: 21,
+      price: 900,
+      validFrom: new Date("2026-09-24T05:00:00.000Z"),
+      validTo: new Date("2026-09-30T05:00:00.000Z"),
+    },
+    effectiveDate: "2026-09-29",
+  });
+
+  assert.equal(result.appliedUnitPrice, 900);
+  assert.equal(result.priceSource, PRICE_SOURCES.CUSTOMER_SPECIAL);
+  assert.equal(result.evaluations.customerSpecial.validFrom, "2026-09-24");
+  assert.equal(result.evaluations.customerSpecial.validTo, "2026-09-30");
+});
+
 test("usa el precio regular cuando no existe configuración mayorista", () => {
   const result = resolveWholesalePrice({
     ...baseInput,

@@ -15,7 +15,12 @@ const PRICE_STATES = Object.freeze({
 const roundMoney = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 
 const normalizeDate = (value, fieldName) => {
-  const normalized = String(value || "").trim().slice(0, 10);
+  const directValue = String(value || "").trim();
+  const directMatch = directValue.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (directMatch) return directMatch[1];
+
+  const parsed = value instanceof Date ? value : new Date(value);
+  const normalized = Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString().slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
     throw new Error(`${fieldName} debe usar el formato YYYY-MM-DD`);
   }
