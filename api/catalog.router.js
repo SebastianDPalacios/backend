@@ -23,6 +23,8 @@ const {
   updateProduct,
   updateProductYield,
   setProductStatus,
+  deleteProduct,
+  deleteProductCategory,
   createRawMaterial,
   updateRawMaterial,
   setRawMaterialStatus,
@@ -196,6 +198,18 @@ router.put("/product-categories/:id", verifyToken, canManageProducts, async (req
   }
 });
 
+router.delete("/product-categories/:id", verifyToken, canManageProducts, async (req, res, next) => {
+  try {
+    const result = await deleteProductCategory(
+      { ...req.body, p_category_id: Number(req.params.id) },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.post("/raw-material-categories", verifyToken, canManageMaterials, async (req, res, next) => {
   try {
     const result = await createRawMaterialCategory(req.body, req.user.userId);
@@ -250,6 +264,18 @@ router.post("/products", verifyToken, canManageProducts, async (req, res, next) 
 router.put("/products/:id", verifyToken, canManageProducts, async (req, res, next) => {
   try {
     const result = await updateProduct(
+      { ...req.body, p_product_id: Number(req.params.id) },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.delete("/products/:id", verifyToken, canManageProducts, async (req, res, next) => {
+  try {
+    const result = await deleteProduct(
       { ...req.body, p_product_id: Number(req.params.id) },
       req.user.userId
     );

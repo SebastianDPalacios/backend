@@ -88,6 +88,17 @@ const validatePhysicalProductRelation = async (productId, requestedPhysicalProdu
   return targets.length ? null : "selecciona un producto físico principal activo";
 };
 
+const validateActiveProductCategory = async (categoryId) => {
+  const db = await connect();
+  const [rows] = await db.query(
+    `SELECT id FROM product_categories
+      WHERE id = ? AND is_active = 1 AND deleted_at IS NULL
+      LIMIT 1`,
+    [Number(categoryId || 0)]
+  );
+  return rows.length > 0;
+};
+
 const enrichRawMaterialPackages = async (payload) => {
   const rows = getRows(payload);
   const ids = rows.map((row) => Number(row.id || 0)).filter((id) => id > 0);
@@ -199,7 +210,20 @@ const listTaxRates = async ({ onlyActive }) => {
 
 const listProductCategories = async ({ onlyActive }) => {
   const out = await callProcedure("sp_product_category_list", [Number(onlyActive || 0)]);
-  return mapSpResult(out);
+  const result = mapSpResult(out);
+  if (result.code !== 1) return result;
+
+  const rows = getRows(result.data);
+  if (!rows.length) return result;
+  const db = await connect();
+  const [deletedRows] = await db.query(
+    `SELECT id FROM product_categories
+      WHERE deleted_at IS NOT NULL AND id IN (${rows.map(() => "?").join(",")})`,
+    rows.map((row) => Number(row.id))
+  );
+  const deletedIds = new Set(deletedRows.map((row) => Number(row.id)));
+  const visibleRows = rows.filter((row) => !deletedIds.has(Number(row.id)));
+  return { ...result, data: withRows(result.data, visibleRows) };
 };
 
 const listRawMaterialCategories = async ({ onlyActive }) => {
@@ -341,6 +365,9 @@ const createProduct = async (payload, actorUserId) => {
   if (!isWholeFinishedProductQuantity(payload.p_min_stock ?? 0, { allowZero: true })) {
     return { code: 0, message: "El stock minimo del producto debe ser una cantidad entera.", data: null };
   }
+  if (!await validateActiveProductCategory(payload.p_category_id)) {
+    return { code: 0, message: "Selecciona una categoría activa.", data: null };
+  }
   if (payload.p_units_per_bag !== null && payload.p_units_per_bag !== undefined
     && payload.p_units_per_bag !== "" && !isWholeFinishedProductQuantity(payload.p_units_per_bag)) {
     return { code: 0, message: "Las unidades por bulto deben ser una cantidad entera mayor a cero.", data: null };
@@ -426,6 +453,9 @@ const updateProduct = async (payload, actorUserId) => {
   if (!isWholeFinishedProductQuantity(payload.p_min_stock ?? 0, { allowZero: true })) {
     return { code: 0, message: "El stock minimo del producto debe ser una cantidad entera.", data: null };
   }
+  if (!await validateActiveProductCategory(payload.p_category_id)) {
+    return { code: 0, message: "Selecciona una categoría activa.", data: null };
+  }
   if (payload.p_units_per_bag !== null && payload.p_units_per_bag !== undefined
     && payload.p_units_per_bag !== "" && !isWholeFinishedProductQuantity(payload.p_units_per_bag)) {
     return { code: 0, message: "Las unidades por bulto deben ser una cantidad entera mayor a cero.", data: null };
@@ -473,6 +503,103 @@ const setProductStatus = async (payload, actorUserId) => {
     actorUserId || null,
   ]);
   return mapSpResult(out);
+};
+
+const deleteProduct = async (payload, actorUserId) => {
+  const productId = Number(payload.p_product_id || 0);
+  const reason = String(payload.p_reason || "").trim() || null;
+  if (!productId) return { code: 0, message: "selecciona un producto", data: null };
+
+  const db = await connect();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [products] = await connection.query(
+      `SELECT id, name, sku, physical_product_id, is_active, deleted_at
+         FROM products WHERE id = ? FOR UPDATE`,
+      [productId]
+    );
+    if (!products.length || products[0].deleted_at) {
+      await connection.rollback();
+      return { code: 0, message: "producto no encontrado o ya eliminado", data: null };
+    }
+    const [variants] = await connection.query(
+      `SELECT COUNT(*) AS total FROM products
+        WHERE physical_product_id = ? AND deleted_at IS NULL`,
+      [productId]
+    );
+    if (Number(variants[0]?.total || 0) > 0) {
+      await connection.rollback();
+      return { code: 0, message: "no puedes eliminar el producto físico mientras tenga variantes comerciales asociadas", data: null };
+    }
+
+    await connection.query(
+      `UPDATE products
+          SET is_active = 0, deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?`,
+      [productId]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'product.delete', 'products', ?, JSON_OBJECT('reason', ?, 'name', ?, 'sku', ?))`,
+      [actorUserId || null, String(productId), reason, products[0].name, products[0].sku]
+    );
+    await connection.commit();
+    return { code: 1, message: "producto eliminado sin afectar sus registros históricos", data: { product_id: productId } };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+const deleteProductCategory = async (payload, actorUserId) => {
+  const categoryId = Number(payload.p_category_id || 0);
+  const reason = String(payload.p_reason || "").trim() || null;
+  if (!categoryId) return { code: 0, message: "selecciona una categoría", data: null };
+
+  const db = await connect();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [categories] = await connection.query(
+      `SELECT id, name, deleted_at FROM product_categories WHERE id = ? FOR UPDATE`,
+      [categoryId]
+    );
+    if (!categories.length || categories[0].deleted_at) {
+      await connection.rollback();
+      return { code: 0, message: "categoría no encontrada o ya eliminada", data: null };
+    }
+    const [products] = await connection.query(
+      `SELECT COUNT(*) AS total FROM products
+        WHERE category_id = ? AND deleted_at IS NULL`,
+      [categoryId]
+    );
+    if (Number(products[0]?.total || 0) > 0) {
+      await connection.rollback();
+      return { code: 0, message: "reasigna o elimina los productos de esta categoría antes de eliminarla", data: null };
+    }
+
+    await connection.query(
+      `UPDATE product_categories
+          SET is_active = 0, deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?`,
+      [categoryId]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'product_category.delete', 'product_categories', ?, JSON_OBJECT('reason', ?, 'name', ?))`,
+      [actorUserId || null, String(categoryId), reason, categories[0].name]
+    );
+    await connection.commit();
+    return { code: 1, message: "categoría eliminada sin afectar sus registros históricos", data: { category_id: categoryId } };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 };
 
 const createRawMaterial = async (payload, actorUserId) => {
@@ -573,6 +700,8 @@ module.exports = {
   updateProduct,
   updateProductYield,
   setProductStatus,
+  deleteProduct,
+  deleteProductCategory,
   createRawMaterial,
   updateRawMaterial,
   setRawMaterialStatus,
