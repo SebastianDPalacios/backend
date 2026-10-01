@@ -69,5 +69,6 @@ test("la vista permite día, mes, rango y exportación Excel completa", () => {
   assert.match(pageSource, /for \(let current = 2; current <= pages/);
   assert.match(excelSource, /Totales por vendedor/);
   assert.match(excelSource, /Totales por producto/);
+  assert.match(excelSource, /Totales por motivo/);
   assert.match(excelSource, /workbook\.xlsx\.writeBuffer/);
 });

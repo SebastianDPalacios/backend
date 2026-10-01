@@ -5359,7 +5359,7 @@ const listSalesOperationsReport = async ({
   }
   const whereSql = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
   const filteredSql = `FROM (${baseSql}) report ${whereSql}`;
-  const [[countRow], [items], [sellerTotals], [productTotals]] = await Promise.all([
+  const [[countRow], [items], [sellerTotals], [reasonTotals], [productTotals]] = await Promise.all([
     db.query(`SELECT COUNT(*) AS total ${filteredSql}`, values),
     db.query(`SELECT * ${filteredSql} ORDER BY operation_date DESC, registered_at DESC, row_key DESC LIMIT ? OFFSET ?`, [...values, normalizedPageSize, offset]),
     db.query(
@@ -5370,6 +5370,16 @@ const listSalesOperationsReport = async ({
          ${filteredSql}
         GROUP BY sales_agent_user_id, sales_agent_name
         ORDER BY sales_agent_name`,
+      values
+    ),
+    db.query(
+      `SELECT reason, operation_type, COUNT(*) AS result_count,
+              SUM(received_quantity) AS received_quantity,
+              SUM(delivered_quantity) AS delivered_quantity,
+              SUM(total_value) AS total_value
+         ${filteredSql}
+        GROUP BY reason, operation_type
+        ORDER BY operation_type, reason`,
       values
     ),
     db.query(
@@ -5398,6 +5408,7 @@ const listSalesOperationsReport = async ({
       totalPages: Math.ceil(total / normalizedPageSize),
       totalsBySeller: sellerTotals,
       totalsByProduct: productTotals,
+      totalsByReason: reasonTotals,
     },
   };
 };

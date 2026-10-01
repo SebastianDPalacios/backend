@@ -1,5 +1,5 @@
 const express = require("express");
-const { verifyToken, requirePermission } = require("../middlewares/auth.handler");
+const { verifyToken, requirePermission, requireAdministrativeRole } = require("../middlewares/auth.handler");
 const {
   listBranches,
   listCustomers,
@@ -135,7 +135,7 @@ router.get("/suppliers", verifyToken, canManageMaterials, async (req, res, next)
   }
 });
 
-router.post("/branches", verifyToken, async (req, res, next) => {
+router.post("/branches", verifyToken, requireAdministrativeRole, async (req, res, next) => {
   try {
     const result = await createBranch(req.body, req.user.userId);
     res.json(result);
@@ -144,7 +144,7 @@ router.post("/branches", verifyToken, async (req, res, next) => {
   }
 });
 
-router.put("/branches/:id", verifyToken, async (req, res, next) => {
+router.put("/branches/:id", verifyToken, requireAdministrativeRole, async (req, res, next) => {
   try {
     const result = await updateBranch(
       { ...req.body, p_branch_id: Number(req.params.id) },

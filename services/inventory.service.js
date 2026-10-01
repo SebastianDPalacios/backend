@@ -278,6 +278,95 @@ const applyInventoryMovement = async (payload, actorUserId) => {
   return mapSpResult(out);
 };
 
+const zeroInventoryStock = async (payload, actorUserId) => {
+  const branchId = Number(payload.p_branch_id || 0);
+  const requestedItemId = Number(payload.p_item_id || 0);
+  const itemType = payload.p_item_type;
+
+  if (!Number.isInteger(branchId) || branchId <= 0) {
+    return { code: -1, message: "Selecciona una sucursal valida", data: null };
+  }
+  if (!Number.isInteger(requestedItemId) || requestedItemId <= 0) {
+    return { code: -1, message: "Selecciona un elemento valido", data: null };
+  }
+  if (!['raw_material', 'product'].includes(itemType)) {
+    return { code: -1, message: "Tipo de inventario invalido", data: null };
+  }
+
+  const db = await connect();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    let inventoryItemId = requestedItemId;
+    let stockTable = "stock_raw_materials";
+    let stockColumn = "raw_material_id";
+    if (itemType === "product") {
+      const physicalProduct = await resolvePhysicalProduct(connection, requestedItemId, { lock: true });
+      inventoryItemId = physicalProduct.physicalProductId;
+      stockTable = "stock_products";
+      stockColumn = "product_id";
+    }
+
+    const [stockRows] = await connection.query(
+      `SELECT quantity_on_hand
+         FROM ${stockTable}
+        WHERE branch_id = ? AND ${stockColumn} = ?
+        FOR UPDATE`,
+      [branchId, inventoryItemId]
+    );
+    const currentStock = Number(stockRows[0]?.quantity_on_hand || 0);
+    if (!Number.isFinite(currentStock) || currentStock <= 0) {
+      await connection.rollback();
+      return { code: -1, message: "El elemento ya se encuentra sin stock", data: null };
+    }
+
+    await connection.query(
+      `UPDATE ${stockTable}
+          SET quantity_on_hand = 0
+        WHERE branch_id = ? AND ${stockColumn} = ?`,
+      [branchId, inventoryItemId]
+    );
+
+    const [movementResult] = await connection.query(
+      `INSERT INTO inventory_movements
+        (branch_id, item_type, raw_material_id, product_id, movement_type, quantity, unit_cost,
+         reference_type, reference_id, notes, created_by)
+       VALUES (?, ?, ?, ?, 'adjustment_out', ?, NULL, 'manual', NULL, ?, ?)`,
+      [
+        branchId,
+        itemType,
+        itemType === "raw_material" ? inventoryItemId : null,
+        itemType === "product" ? inventoryItemId : null,
+        currentStock,
+        payload.p_notes || "Stock llevado a cero manualmente",
+        actorUserId || null,
+      ]
+    );
+
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'inventory.stock.zeroed', 'inventory_movements', ?,
+         JSON_OBJECT('branch_id', ?, 'item_type', ?, 'requested_item_id', ?,
+           'inventory_item_id', ?, 'previous_stock', ?, 'resulting_stock', 0))`,
+      [actorUserId || null, String(movementResult.insertId), branchId, itemType,
+        requestedItemId, inventoryItemId, currentStock]
+    );
+
+    await connection.commit();
+    return {
+      code: 1,
+      message: "Stock eliminado correctamente",
+      data: { movement_id: movementResult.insertId, previous_stock: currentStock, resulting_stock: 0 },
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
 const listInventoryMovements = async ({ branchId, itemType, movementType, search, dateFrom, dateTo, page, pageSize } = {}) => {
   const db = await connect();
   const operationalDateSql = `COALESCE(
@@ -432,5 +521,6 @@ const listInventoryMovements = async ({ branchId, itemType, movementType, search
 module.exports = {
   listInventoryBaseData,
   applyInventoryMovement,
+  zeroInventoryStock,
   listInventoryMovements,
 };

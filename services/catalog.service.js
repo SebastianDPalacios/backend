@@ -242,23 +242,49 @@ const listSuppliers = async ({ status, search, page, pageSize }) => {
 };
 
 const createBranch = async (payload, actorUserId) => {
+  const code = String(payload.p_code || "").trim().toUpperCase();
+  const name = String(payload.p_name || "").trim();
+  const address = String(payload.p_address || "").trim();
+  const phone = String(payload.p_phone || "").trim();
+  if (!/^[A-Z0-9_-]{2,30}$/.test(code)) {
+    return { code: 0, message: "El código debe tener entre 2 y 30 caracteres y usar solo letras, números, guion o guion bajo", data: null };
+  }
+  if (name.length < 2 || name.length > 120) {
+    return { code: 0, message: "El nombre debe tener entre 2 y 120 caracteres", data: null };
+  }
+  if (address.length > 255 || phone.length > 30) {
+    return { code: 0, message: "La dirección o el teléfono superan la longitud permitida", data: null };
+  }
   const out = await callProcedure("sp_branch_create", [
-    payload.p_code || null,
-    payload.p_name || null,
-    payload.p_address || null,
-    payload.p_phone || null,
+    code,
+    name,
+    address || null,
+    phone || null,
     actorUserId || null,
   ]);
   return mapSpResult(out);
 };
 
 const updateBranch = async (payload, actorUserId) => {
+  const branchId = Number(payload.p_branch_id || 0);
+  const name = String(payload.p_name || "").trim();
+  const address = String(payload.p_address || "").trim();
+  const phone = String(payload.p_phone || "").trim();
+  if (!Number.isInteger(branchId) || branchId <= 0) {
+    return { code: 0, message: "Sucursal inválida", data: null };
+  }
+  if (name.length < 2 || name.length > 120) {
+    return { code: 0, message: "El nombre debe tener entre 2 y 120 caracteres", data: null };
+  }
+  if (address.length > 255 || phone.length > 30) {
+    return { code: 0, message: "La dirección o el teléfono superan la longitud permitida", data: null };
+  }
   const out = await callProcedure("sp_branch_update", [
-    payload.p_branch_id,
-    payload.p_name || null,
-    payload.p_address || null,
-    payload.p_phone || null,
-    payload.p_is_active || null,
+    branchId,
+    name,
+    address || null,
+    phone || null,
+    payload.p_is_active ?? null,
     actorUserId || null,
   ]);
   return mapSpResult(out);

@@ -1,8 +1,9 @@
 const express = require("express");
-const { verifyToken, requirePermission } = require("../middlewares/auth.handler");
+const { verifyToken, requirePermission, requireAdministrativeRole } = require("../middlewares/auth.handler");
 const {
   listInventoryBaseData,
   applyInventoryMovement,
+  zeroInventoryStock,
   listInventoryMovements,
 } = require("../services/inventory.service");
 
@@ -45,6 +46,15 @@ router.get("/movements", verifyToken, canManageInventory, async (req, res, next)
 router.post("/movements", verifyToken, canManageInventory, async (req, res, next) => {
   try {
     const result = await applyInventoryMovement(req.body, req.user.userId);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post("/stock/zero", verifyToken, canManageInventory, requireAdministrativeRole, async (req, res, next) => {
+  try {
+    const result = await zeroInventoryStock(req.body, req.user.userId);
     res.json(result);
   } catch (error) {
     next(error);
