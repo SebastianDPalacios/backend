@@ -2880,6 +2880,7 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
         rm.unit AS raw_material_unit,
         rm.purchase_package_name,
         rm.purchase_package_quantity,
+        COALESCE(rm.is_inventory_valued, 1) AS is_inventory_valued,
         COALESCE(rm.unit_cost, 0) AS unit_cost,
         COALESCE(SUM(CASE WHEN im.reference_type = 'production_batch' THEN im.quantity ELSE 0 END), 0) AS base_quantity,
         COALESCE(SUM(CASE WHEN im.reference_type = 'production_output_material' THEN im.quantity ELSE 0 END), 0) AS posterior_quantity,
@@ -2903,7 +2904,8 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
         AND DATE(COALESCE(pb_base.produced_date, pb_pom.produced_date, im.moved_at)) <= ?
         AND (? IS NULL OR im.branch_id = ?)
         AND (? IS NULL OR COALESCE(pb_base.recipe_id, pb_pom.recipe_id) = ?)
-      GROUP BY im.raw_material_id, rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity, rm.unit_cost
+      GROUP BY im.raw_material_id, rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity,
+               rm.is_inventory_valued, rm.unit_cost
       ORDER BY rm.name
     `,
     [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
@@ -2916,6 +2918,7 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
        rm.unit AS raw_material_unit,
        rm.purchase_package_name,
        rm.purchase_package_quantity,
+       COALESCE(rm.is_inventory_valued, 1) AS is_inventory_valued,
        COALESCE(rm.unit_cost, 0) AS unit_cost,
        COALESCE(SUM(CASE WHEN im.movement_type = 'production_out' THEN im.quantity ELSE -im.quantity END), 0) AS correction_quantity,
        COALESCE(SUM(CASE WHEN im.movement_type = 'production_out' THEN im.quantity ELSE -im.quantity END
@@ -2930,7 +2933,8 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
        AND correction_batch.produced_date >= ? AND correction_batch.produced_date <= ?
        AND (? IS NULL OR im.branch_id = ?)
        AND (? IS NULL OR correction_batch.recipe_id = ?)
-     GROUP BY im.raw_material_id, rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity, rm.unit_cost`,
+     GROUP BY im.raw_material_id, rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity,
+              rm.is_inventory_valued, rm.unit_cost`,
     [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
   );
   const rawMaterialMap = new Map(rawMaterialRows.map((row) => [Number(row.raw_material_id), { ...row }]));
@@ -2950,6 +2954,14 @@ const getProductionDayReport = async ({ date, dateFrom, dateTo, branchId, recipe
     current.base_cost = Number(current.base_cost || 0) + Number(correction.correction_cost || 0);
     current.total_cost = Number(current.total_cost || 0) + Number(correction.correction_cost || 0);
     rawMaterialMap.set(id, current);
+  });
+  rawMaterialMap.forEach((material) => {
+    if (Number(material.is_inventory_valued ?? 1) === 0) {
+      material.unit_cost = 0;
+      material.base_cost = 0;
+      material.posterior_cost = 0;
+      material.total_cost = 0;
+    }
   });
   rawMaterialRows = Array.from(rawMaterialMap.values()).sort((a, b) => String(a.raw_material_name).localeCompare(String(b.raw_material_name)));
 
@@ -3208,6 +3220,7 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
         rm.unit AS raw_material_unit,
         rm.purchase_package_name,
         rm.purchase_package_quantity,
+        COALESCE(rm.is_inventory_valued, 1) AS is_inventory_valued,
         COALESCE(SUM(im.quantity), 0) AS total_quantity,
         COALESCE(SUM(im.quantity * COALESCE(im.unit_cost, rm.unit_cost, 0)), 0) AS total_cost
       FROM inventory_movements im
@@ -3228,7 +3241,8 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
         AND DATE(COALESCE(pb_base.produced_date, pb_pom.produced_date, im.moved_at)) <= ?
         AND (? IS NULL OR im.branch_id = ?)
         AND (? IS NULL OR r.id = ?)
-      GROUP BY r.id, r.notes, p.name, im.raw_material_id, rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity
+      GROUP BY r.id, r.notes, p.name, im.raw_material_id, rm.name, rm.unit,
+               rm.purchase_package_name, rm.purchase_package_quantity, rm.is_inventory_valued
       ORDER BY recipe_name, rm.name
     `,
     [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
@@ -3243,6 +3257,7 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
        rm.unit AS raw_material_unit,
        rm.purchase_package_name,
        rm.purchase_package_quantity,
+       COALESCE(rm.is_inventory_valued, 1) AS is_inventory_valued,
        COALESCE(SUM(CASE WHEN im.movement_type = 'production_out' THEN im.quantity ELSE -im.quantity END), 0) AS total_quantity,
        COALESCE(SUM(CASE WHEN im.movement_type = 'production_out' THEN im.quantity ELSE -im.quantity END
          * COALESCE(im.unit_cost, rm.unit_cost, 0)), 0) AS total_cost
@@ -3259,7 +3274,8 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
        AND (? IS NULL OR im.branch_id = ?)
        AND (? IS NULL OR recipe.id = ?)
      GROUP BY recipe.id, recipe.notes, recipe_product.name, im.raw_material_id,
-              rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity`,
+              rm.name, rm.unit, rm.purchase_package_name, rm.purchase_package_quantity,
+              rm.is_inventory_valued`,
     [reportDateFrom, reportDateTo, branchId || null, branchId || null, recipeId || null, recipeId || null]
   );
   const recipeMaterialMap = new Map(recipeMaterialRows.map((row) => [`${row.recipe_id}-${row.raw_material_id}`, { ...row }]));
@@ -3269,6 +3285,11 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
     current.total_quantity = Number(current.total_quantity || 0) + Number(correction.total_quantity || 0);
     current.total_cost = Number(current.total_cost || 0) + Number(correction.total_cost || 0);
     recipeMaterialMap.set(key, current);
+  });
+  recipeMaterialMap.forEach((material) => {
+    if (Number(material.is_inventory_valued ?? 1) === 0) {
+      material.total_cost = 0;
+    }
   });
   recipeMaterialRows = Array.from(recipeMaterialMap.values()).sort((a, b) =>
     `${a.recipe_name}-${a.raw_material_name}`.localeCompare(`${b.recipe_name}-${b.raw_material_name}`)
@@ -3442,9 +3463,12 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
         rm.sku,
         rmc.name AS category_name,
         rm.unit,
-        COALESCE(rm.unit_cost, 0) AS unit_cost,
+        COALESCE(rm.is_inventory_valued, 1) AS is_inventory_valued,
+        CASE WHEN COALESCE(rm.is_inventory_valued, 1) = 1 THEN COALESCE(rm.unit_cost, 0) ELSE 0 END AS unit_cost,
         COALESCE(SUM(srm.quantity_on_hand), 0) AS quantity_on_hand,
-        COALESCE(SUM(srm.quantity_on_hand * COALESCE(rm.unit_cost, 0)), 0) AS total_value
+        CASE WHEN COALESCE(rm.is_inventory_valued, 1) = 1
+          THEN COALESCE(SUM(srm.quantity_on_hand * COALESCE(rm.unit_cost, 0)), 0)
+          ELSE 0 END AS total_value
       FROM raw_materials rm
       INNER JOIN raw_material_categories rmc ON rmc.id = rm.category_id
       LEFT JOIN stock_raw_materials srm
@@ -3453,7 +3477,7 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
       WHERE rm.deleted_at IS NULL
         AND COALESCE(rm.inventory_usage_type, 'production') = 'production'
         AND rmc.name NOT IN ('Rollos', 'Bolsas')
-      GROUP BY rm.id, rm.name, rm.sku, rmc.name, rm.unit, rm.unit_cost
+      GROUP BY rm.id, rm.name, rm.sku, rmc.name, rm.unit, rm.is_inventory_valued, rm.unit_cost
       ORDER BY rmc.name, rm.name
     `,
     [branchId || null, branchId || null]
@@ -3490,9 +3514,12 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
         rm.sku,
         rmc.name AS category_name,
         rm.unit,
-        COALESCE(rm.unit_cost, 0) AS unit_cost,
+        COALESCE(rm.is_inventory_valued, 1) AS is_inventory_valued,
+        CASE WHEN COALESCE(rm.is_inventory_valued, 1) = 1 THEN COALESCE(rm.unit_cost, 0) ELSE 0 END AS unit_cost,
         COALESCE(SUM(srm.quantity_on_hand), 0) AS quantity_on_hand,
-        COALESCE(SUM(srm.quantity_on_hand * COALESCE(rm.unit_cost, 0)), 0) AS total_value
+        CASE WHEN COALESCE(rm.is_inventory_valued, 1) = 1
+          THEN COALESCE(SUM(srm.quantity_on_hand * COALESCE(rm.unit_cost, 0)), 0)
+          ELSE 0 END AS total_value
       FROM raw_materials rm
       INNER JOIN raw_material_categories rmc ON rmc.id = rm.category_id
       LEFT JOIN stock_raw_materials srm
@@ -3503,7 +3530,7 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
           COALESCE(rm.inventory_usage_type, 'production') = 'packaging'
           OR rmc.name IN ('Rollos', 'Bolsas')
         )
-      GROUP BY rm.id, rm.name, rm.sku, rmc.name, rm.unit, rm.unit_cost
+      GROUP BY rm.id, rm.name, rm.sku, rmc.name, rm.unit, rm.is_inventory_valued, rm.unit_cost
       ORDER BY rmc.name, rm.name
     `,
     [branchId || null, branchId || null]

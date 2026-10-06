@@ -7,6 +7,7 @@ const root = path.join(__dirname, "..", "..");
 const returnsSource = fs.readFileSync(path.join(root, "frontend", "src", "pages", "orders", "returns.js"), "utf8");
 const reportService = fs.readFileSync(path.join(__dirname, "..", "services", "orders.service.js"), "utf8");
 const excelSource = fs.readFileSync(path.join(root, "frontend", "src", "components", "organisms", "orders", "exportSalesOperationsExcel.js"), "utf8");
+const searchableSelectSource = fs.readFileSync(path.join(root, "frontend", "src", "@core", "components", "ui", "SearchableSelect.js"), "utf8");
 
 test("Mojado no se ofrece en nuevas devoluciones pero sus historicos siguen siendo legibles", () => {
   const reasonOptions = returnsSource.slice(returnsSource.indexOf("const reasonOptions"), returnsSource.indexOf("const statusConfig"));
@@ -18,4 +19,10 @@ test("el reporte devuelve y exporta totales por motivo", () => {
   assert.match(reportService, /GROUP BY reason, operation_type/);
   assert.match(reportService, /totalsByReason: reasonTotals/);
   assert.match(excelSource, /addWorksheet\("Totales por motivo"\)/);
+});
+
+test("los selectores buscables permiten limpiar el valor general y escribir una búsqueda", () => {
+  assert.match(searchableSelectSource, /String\(normalizedValue\) === ""\s*\? null/);
+  assert.match(searchableSelectSource, /emptyOption\?\.label \?\? "Buscar\.\.\."/);
+  assert.match(searchableSelectSource, /option\?\.value \?\? ""/);
 });

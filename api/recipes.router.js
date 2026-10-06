@@ -18,6 +18,7 @@ const {
 
 const router = express.Router();
 const canManageRecipes = requirePermission("recipes.manage");
+const canListRecipes = requirePermission("recipes.manage", "production.manage");
 
 router.post("/", verifyToken, canManageRecipes, async (req, res, next) => {
   try {
@@ -28,7 +29,7 @@ router.post("/", verifyToken, canManageRecipes, async (req, res, next) => {
   }
 });
 
-router.get("/", verifyToken, canManageRecipes, async (req, res, next) => {
+router.get("/", verifyToken, canListRecipes, async (req, res, next) => {
   try {
     const result = await listRecipes({
       onlyActive: req.query.onlyActive,

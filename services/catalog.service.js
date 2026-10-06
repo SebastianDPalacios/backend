@@ -53,6 +53,19 @@ const saveRawMaterialInventoryUsage = async (rawMaterialId, payload) => {
   );
 };
 
+const normalizeInventoryValuation = (payload) => {
+  const value = payload.p_is_inventory_valued ?? payload.is_inventory_valued;
+  return value === false || value === 0 || value === "0" ? 0 : 1;
+};
+
+const saveRawMaterialInventoryValuation = async (rawMaterialId, payload) => {
+  const db = await connect();
+  await db.query(
+    "UPDATE raw_materials SET is_inventory_valued = ? WHERE id = ?",
+    [normalizeInventoryValuation(payload), rawMaterialId]
+  );
+};
+
 const savePhysicalProductRelation = async (productId, requestedPhysicalProductId) => {
   const db = await connect();
   const physicalProductId = requestedPhysicalProductId ? Number(requestedPhysicalProductId) : null;
@@ -110,7 +123,8 @@ const enrichRawMaterialPackages = async (payload) => {
   const placeholders = ids.map(() => "?").join(",");
   const db = await connect();
   const [packageRows] = await db.query(
-    `SELECT id, purchase_package_name, purchase_package_quantity, inventory_usage_type
+    `SELECT id, purchase_package_name, purchase_package_quantity, inventory_usage_type,
+            COALESCE(is_inventory_valued, 1) AS is_inventory_valued
        FROM raw_materials
       WHERE id IN (${placeholders})`,
     ids
@@ -124,6 +138,7 @@ const enrichRawMaterialPackages = async (payload) => {
       purchase_package_name: packageById.get(Number(row.id))?.purchase_package_name || null,
       purchase_package_quantity: packageById.get(Number(row.id))?.purchase_package_quantity || null,
       inventory_usage_type: packageById.get(Number(row.id))?.inventory_usage_type || "production",
+      is_inventory_valued: Number(packageById.get(Number(row.id))?.is_inventory_valued ?? 1),
     }))
   );
 };
@@ -650,6 +665,7 @@ const createRawMaterial = async (payload, actorUserId) => {
     if (result.code === 1 && result.data?.raw_material_id) {
       await saveRawMaterialPurchasePackage(Number(result.data.raw_material_id), payload);
       await saveRawMaterialInventoryUsage(Number(result.data.raw_material_id), payload);
+      await saveRawMaterialInventoryValuation(Number(result.data.raw_material_id), payload);
     }
     return result;
   }
@@ -660,6 +676,7 @@ const createRawMaterial = async (payload, actorUserId) => {
   await db.query("UPDATE raw_materials SET sku = ? WHERE id = ?", [sku, rawMaterialId]);
   await saveRawMaterialPurchasePackage(rawMaterialId, payload);
   await saveRawMaterialInventoryUsage(rawMaterialId, payload);
+  await saveRawMaterialInventoryValuation(rawMaterialId, payload);
 
   return {
     ...result,
@@ -688,6 +705,7 @@ const updateRawMaterial = async (payload, actorUserId) => {
   if (result.code === 1) {
     await saveRawMaterialPurchasePackage(Number(payload.p_raw_material_id), payload);
     await saveRawMaterialInventoryUsage(Number(payload.p_raw_material_id), payload);
+    await saveRawMaterialInventoryValuation(Number(payload.p_raw_material_id), payload);
   }
 
   return result;
