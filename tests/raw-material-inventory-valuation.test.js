@@ -25,9 +25,17 @@ test("un insumo simbólico conserva cantidades pero aporta cero a costos e inven
   assert.doesNotMatch(productionService, /is_inventory_valued[^\n]+quantity_on_hand\s*=\s*0/);
 });
 
-test("la administración y Excel muestran claramente los insumos no valorizados", () => {
+test("la administración conserva la valoración y Excel muestra la presentación de inventario", () => {
   assert.match(editDialog, /Incluir esta materia prima en la valoración/);
   assert.match(editDialog, /seguirá en recetas, consumos y existencias/);
-  assert.match(monthExcel, /"No valorizado"/);
+  assert.match(monthExcel, /Bultos \/ presentación/);
+  assert.match(monthExcel, /formatInventoryPresentation/);
   assert.match(monthExcel, /sumBy\(rows, "total_value"\)/);
+});
+
+test("plásticos, rollos y bolsas comparten la sección de empaque del reporte", () => {
+  assert.match(productionService, /LOWER\(rmc\.name\) LIKE '%plastic%'/);
+  assert.match(productionService, /rm\.purchase_package_name/);
+  assert.match(productionService, /rm\.purchase_package_quantity/);
+  assert.match(monthExcel, /Inventario de plásticos, rollos y bolsas/);
 });

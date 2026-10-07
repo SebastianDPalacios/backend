@@ -3463,6 +3463,8 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
         rm.sku,
         rmc.name AS category_name,
         rm.unit,
+        rm.purchase_package_name,
+        rm.purchase_package_quantity,
         COALESCE(rm.is_inventory_valued, 1) AS is_inventory_valued,
         CASE WHEN COALESCE(rm.is_inventory_valued, 1) = 1 THEN COALESCE(rm.unit_cost, 0) ELSE 0 END AS unit_cost,
         COALESCE(SUM(srm.quantity_on_hand), 0) AS quantity_on_hand,
@@ -3476,8 +3478,11 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
        AND (? IS NULL OR srm.branch_id = ?)
       WHERE rm.deleted_at IS NULL
         AND COALESCE(rm.inventory_usage_type, 'production') = 'production'
-        AND rmc.name NOT IN ('Rollos', 'Bolsas')
-      GROUP BY rm.id, rm.name, rm.sku, rmc.name, rm.unit, rm.is_inventory_valued, rm.unit_cost
+        AND LOWER(rmc.name) NOT LIKE '%rollo%'
+        AND LOWER(rmc.name) NOT LIKE '%bolsa%'
+        AND LOWER(rmc.name) NOT LIKE '%plastic%'
+      GROUP BY rm.id, rm.name, rm.sku, rmc.name, rm.unit, rm.purchase_package_name,
+               rm.purchase_package_quantity, rm.is_inventory_valued, rm.unit_cost
       ORDER BY rmc.name, rm.name
     `,
     [branchId || null, branchId || null]
@@ -3514,6 +3519,8 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
         rm.sku,
         rmc.name AS category_name,
         rm.unit,
+        rm.purchase_package_name,
+        rm.purchase_package_quantity,
         COALESCE(rm.is_inventory_valued, 1) AS is_inventory_valued,
         CASE WHEN COALESCE(rm.is_inventory_valued, 1) = 1 THEN COALESCE(rm.unit_cost, 0) ELSE 0 END AS unit_cost,
         COALESCE(SUM(srm.quantity_on_hand), 0) AS quantity_on_hand,
@@ -3528,9 +3535,12 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
       WHERE rm.deleted_at IS NULL
         AND (
           COALESCE(rm.inventory_usage_type, 'production') = 'packaging'
-          OR rmc.name IN ('Rollos', 'Bolsas')
+          OR LOWER(rmc.name) LIKE '%rollo%'
+          OR LOWER(rmc.name) LIKE '%bolsa%'
+          OR LOWER(rmc.name) LIKE '%plastic%'
         )
-      GROUP BY rm.id, rm.name, rm.sku, rmc.name, rm.unit, rm.is_inventory_valued, rm.unit_cost
+      GROUP BY rm.id, rm.name, rm.sku, rmc.name, rm.unit, rm.purchase_package_name,
+               rm.purchase_package_quantity, rm.is_inventory_valued, rm.unit_cost
       ORDER BY rmc.name, rm.name
     `,
     [branchId || null, branchId || null]
