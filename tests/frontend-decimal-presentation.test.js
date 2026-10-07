@@ -13,6 +13,7 @@ const rawMaterials = read("frontend", "src", "pages", "catalogo", "materias-prim
 const productionPlanning = read("frontend", "src", "pages", "production", "planning.js");
 const salesSettings = read("frontend", "src", "components", "organisms", "orders", "SalesSettingsForm.js");
 const products = read("frontend", "src", "pages", "catalogo", "productos.js");
+const materialUsage = read("frontend", "src", "pages", "production", "material-usage.js");
 
 test("los valores DECIMAL del backend se limpian antes de mostrarse en formularios", () => {
   assert.match(flowUtils, /export const formatEditableNumber/);
@@ -28,4 +29,28 @@ test("los valores DECIMAL del backend se limpian antes de mostrarse en formulari
 test("los campos decimales conservan precisión real pero quitan ceros al perder foco", () => {
   assert.match(recipeIngredients, /onBlur=.*formatEditableNumber/);
   assert.doesNotMatch(productionPlanning, /minimumFractionDigits:\s*[1-9]/);
+});
+
+test("el reporte público de materias primas usadas presenta cantidades enteras", () => {
+  assert.match(materialUsage, /maximumFractionDigits:\s*0/);
+  assert.doesNotMatch(materialUsage, /maximumFractionDigits:\s*[1-9]/);
+});
+
+test("ninguna vista fuerza decimales en los formateadores públicos", () => {
+  const frontendRoot = path.join(root, "frontend", "src");
+  const pending = [];
+  const inspect = (directory) => {
+    fs.readdirSync(directory, { withFileTypes: true }).forEach((entry) => {
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) return inspect(fullPath);
+      if (!entry.name.endsWith(".js")) return;
+      const source = fs.readFileSync(fullPath, "utf8");
+      if (/m(?:inimum|aximum)FractionDigits:\s*[1-9]/.test(source)) {
+        pending.push(path.relative(frontendRoot, fullPath));
+      }
+    });
+  };
+
+  inspect(frontendRoot);
+  assert.deepEqual(pending, []);
 });
