@@ -124,7 +124,7 @@ const enrichRawMaterialPackages = async (payload) => {
   const db = await connect();
   const [packageRows] = await db.query(
     `SELECT id, purchase_package_name, purchase_package_quantity, inventory_usage_type,
-            COALESCE(is_inventory_valued, 1) AS is_inventory_valued
+            COALESCE(is_inventory_valued, 1) AS is_inventory_valued, deleted_at
        FROM raw_materials
       WHERE id IN (${placeholders})`,
     ids
@@ -133,7 +133,7 @@ const enrichRawMaterialPackages = async (payload) => {
 
   return withRows(
     payload,
-    rows.map((row) => ({
+    rows.filter((row) => !packageById.get(Number(row.id))?.deleted_at).map((row) => ({
       ...row,
       purchase_package_name: packageById.get(Number(row.id))?.purchase_package_name || null,
       purchase_package_quantity: packageById.get(Number(row.id))?.purchase_package_quantity || null,
@@ -644,6 +644,28 @@ const deleteProductCategory = async (payload, actorUserId) => {
 };
 
 const createRawMaterial = async (payload, actorUserId) => {
+  const db = await connect();
+  const requestedName = String(payload.p_name || "").trim();
+  const requestedSku = String(payload.p_sku || "").trim();
+  const [duplicates] = await db.query(
+    `SELECT id, name, sku
+       FROM raw_materials
+      WHERE deleted_at IS NULL
+        AND (LOWER(TRIM(name)) = LOWER(TRIM(?))
+          OR (? <> '' AND LOWER(TRIM(sku)) = LOWER(TRIM(?))))
+      LIMIT 1`,
+    [requestedName, requestedSku, requestedSku]
+  );
+  if (duplicates.length) {
+    const sameSku = requestedSku && String(duplicates[0].sku || "").trim().toLowerCase() === requestedSku.toLowerCase();
+    return {
+      code: 0,
+      message: sameSku
+        ? "Ya existe una materia prima con ese SKU."
+        : `Ya existe una materia prima llamada ${duplicates[0].name}. Actívala o edita el registro existente.`,
+      data: { duplicate_raw_material_id: Number(duplicates[0].id) },
+    };
+  }
   const shouldAutoGenerateSku = !payload.p_sku;
   const temporarySku = shouldAutoGenerateSku ? `RM-TMP-${Date.now()}-${Math.floor(Math.random() * 1000)}` : payload.p_sku;
 
@@ -672,7 +694,6 @@ const createRawMaterial = async (payload, actorUserId) => {
 
   const rawMaterialId = Number(result.data.raw_material_id);
   const sku = `RM-${String(rawMaterialId).padStart(6, "0")}`;
-  const db = await connect();
   await db.query("UPDATE raw_materials SET sku = ? WHERE id = ?", [sku, rawMaterialId]);
   await saveRawMaterialPurchasePackage(rawMaterialId, payload);
   await saveRawMaterialInventoryUsage(rawMaterialId, payload);
@@ -688,6 +709,24 @@ const createRawMaterial = async (payload, actorUserId) => {
 };
 
 const updateRawMaterial = async (payload, actorUserId) => {
+  const rawMaterialId = Number(payload.p_raw_material_id || 0);
+  const db = await connect();
+  const [duplicates] = await db.query(
+    `SELECT id, name
+       FROM raw_materials
+      WHERE deleted_at IS NULL
+        AND id <> ?
+        AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+      LIMIT 1`,
+    [rawMaterialId, String(payload.p_name || "").trim()]
+  );
+  if (duplicates.length) {
+    return {
+      code: 0,
+      message: `Ya existe una materia prima llamada ${duplicates[0].name}.`,
+      data: { duplicate_raw_material_id: Number(duplicates[0].id) },
+    };
+  }
   const out = await callProcedure("sp_raw_material_update", [
     payload.p_raw_material_id,
     payload.p_name || null,
@@ -720,6 +759,67 @@ const setRawMaterialStatus = async (payload, actorUserId) => {
   return mapSpResult(out);
 };
 
+const deleteRawMaterial = async (payload, actorUserId) => {
+  const rawMaterialId = Number(payload.p_raw_material_id || 0);
+  const reason = String(payload.p_reason || "").trim() || null;
+  if (!rawMaterialId) return { code: 0, message: "Selecciona una materia prima.", data: null };
+
+  const db = await connect();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [materials] = await connection.query(
+      `SELECT id, name, sku, deleted_at
+         FROM raw_materials
+        WHERE id = ?
+        FOR UPDATE`,
+      [rawMaterialId]
+    );
+    if (!materials.length || materials[0].deleted_at) {
+      await connection.rollback();
+      return { code: 0, message: "La materia prima no existe o ya fue eliminada.", data: null };
+    }
+
+    const [stocks] = await connection.query(
+      `SELECT COALESCE(SUM(ABS(quantity_on_hand)), 0) AS total
+         FROM stock_raw_materials
+        WHERE raw_material_id = ?`,
+      [rawMaterialId]
+    );
+    if (Number(stocks[0]?.total || 0) > 0.000001) {
+      await connection.rollback();
+      return {
+        code: 0,
+        message: "No puedes eliminar esta materia prima mientras tenga existencias. Deja su stock en cero y vuelve a intentarlo.",
+        data: null,
+      };
+    }
+
+    await connection.query(
+      `UPDATE raw_materials
+          SET is_active = 0, deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?`,
+      [rawMaterialId]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'raw_material.delete', 'raw_materials', ?, JSON_OBJECT('reason', ?, 'name', ?, 'sku', ?))`,
+      [actorUserId || null, String(rawMaterialId), reason, materials[0].name, materials[0].sku]
+    );
+    await connection.commit();
+    return {
+      code: 1,
+      message: "Materia prima eliminada sin afectar recetas, movimientos ni registros históricos.",
+      data: { raw_material_id: rawMaterialId },
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
 module.exports = {
   listBranches,
   listCustomers,
@@ -749,4 +849,5 @@ module.exports = {
   createRawMaterial,
   updateRawMaterial,
   setRawMaterialStatus,
+  deleteRawMaterial,
 };

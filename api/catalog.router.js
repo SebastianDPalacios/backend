@@ -28,6 +28,7 @@ const {
   createRawMaterial,
   updateRawMaterial,
   setRawMaterialStatus,
+  deleteRawMaterial,
 } = require("../services/catalog.service");
 
 const router = express.Router();
@@ -321,6 +322,18 @@ router.post("/raw-materials", verifyToken, canManageMaterials, async (req, res, 
 router.put("/raw-materials/:id", verifyToken, canManageMaterials, async (req, res, next) => {
   try {
     const result = await updateRawMaterial(
+      { ...req.body, p_raw_material_id: Number(req.params.id) },
+      req.user.userId
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.delete("/raw-materials/:id", verifyToken, canManageMaterials, async (req, res, next) => {
+  try {
+    const result = await deleteRawMaterial(
       { ...req.body, p_raw_material_id: Number(req.params.id) },
       req.user.userId
     );

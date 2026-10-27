@@ -115,7 +115,9 @@ const getRecipeDetail = async ({ recipeId }) => {
         rm.name AS raw_material_name,
         rm.sku AS raw_material_sku,
         rm.unit,
-        rm.unit_cost
+        rm.unit_cost,
+        rm.is_active AS raw_material_is_active,
+        rm.deleted_at AS raw_material_deleted_at
       FROM recipe_items ri
       INNER JOIN raw_materials rm ON rm.id = ri.raw_material_id
       WHERE ri.recipe_id = ?
@@ -155,7 +157,11 @@ const getRecipeDetail = async ({ recipeId }) => {
         roi.wastage_percent,
         roi.sort_order,
         rm.name AS raw_material_name,
-        rm.sku AS raw_material_sku
+        rm.sku AS raw_material_sku,
+        rm.unit,
+        rm.unit_cost,
+        rm.is_active AS raw_material_is_active,
+        rm.deleted_at AS raw_material_deleted_at
       FROM recipe_output_items roi
       INNER JOIN raw_materials rm ON rm.id = roi.raw_material_id
       INNER JOIN recipe_outputs ro ON ro.id = roi.recipe_output_id
@@ -194,8 +200,8 @@ const getRecipeBaseData = async ({ onlyActive } = {}) => {
   const db = await connect();
   const activeFilter = onlyActive ? "WHERE is_active = 1" : "";
   const rawMaterialFilter = onlyActive
-    ? "WHERE is_active = 1 AND COALESCE(inventory_usage_type, 'production') = 'production'"
-    : "WHERE COALESCE(inventory_usage_type, 'production') = 'production'";
+    ? "WHERE is_active = 1 AND deleted_at IS NULL AND COALESCE(inventory_usage_type, 'production') = 'production'"
+    : "WHERE deleted_at IS NULL AND COALESCE(inventory_usage_type, 'production') = 'production'";
 
   const [products] = await db.query(`
     SELECT

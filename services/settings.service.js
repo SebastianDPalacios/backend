@@ -3,6 +3,71 @@ const { connect } = require("../data-access");
 
 const ORDER_RECEIPT_KEY = "order_receipt";
 
+const serializeCommercialVersion = (row) => row ? ({
+  id: Number(row.id),
+  version: row.version,
+  title: row.title,
+  release_notes: row.release_notes || "",
+  released_at: row.released_at,
+  is_current: Boolean(row.is_current),
+}) : null;
+
+const getCurrentCommercialVersion = async () => {
+  const db = await connect();
+  const [rows] = await db.query(
+    `SELECT id, version, title, release_notes, released_at, is_current
+       FROM system_commercial_versions
+      WHERE is_current = 1
+      ORDER BY released_at DESC, id DESC
+      LIMIT 1`
+  );
+  return {
+    code: 1,
+    message: "versión comercial vigente",
+    data: serializeCommercialVersion(rows[0]),
+  };
+};
+
+const publishCommercialVersion = async (payload, actorUserId) => {
+  const version = String(payload.version || "").trim().replace(/^v/i, "");
+  const title = String(payload.title || "").trim();
+  const releaseNotes = String(payload.release_notes || payload.releaseNotes || "").trim() || null;
+  const releasedAt = payload.released_at || payload.releasedAt || new Date();
+  if (!/^\d+\.\d+\.\d+$/.test(version)) throw boom.badRequest("la versión debe usar el formato 1.0.0");
+  if (!title || title.length > 120) throw boom.badRequest("el nombre de la actualización es obligatorio y admite máximo 120 caracteres");
+  if (releaseNotes && releaseNotes.length > 5000) throw boom.badRequest("las novedades admiten máximo 5000 caracteres");
+  if (Number.isNaN(new Date(releasedAt).getTime())) throw boom.badRequest("la fecha de publicación no es válida");
+
+  const db = await connect();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    await connection.query("UPDATE system_commercial_versions SET is_current = 0 WHERE is_current = 1");
+    const [result] = await connection.query(
+      `INSERT INTO system_commercial_versions (version, title, release_notes, released_at, is_current, created_by)
+       VALUES (?, ?, ?, ?, 1, ?)`,
+      [version, title, releaseNotes, new Date(releasedAt), actorUserId || null]
+    );
+    await connection.query(
+      `INSERT INTO audit_logs (actor_user_id, action, entity_name, entity_id, metadata_json)
+       VALUES (?, 'system_version.publish', 'system_commercial_versions', ?, JSON_OBJECT('version', ?, 'title', ?))`,
+      [actorUserId || null, String(result.insertId), version, title]
+    );
+    await connection.commit();
+    const [rows] = await db.query(
+      "SELECT id, version, title, release_notes, released_at, is_current FROM system_commercial_versions WHERE id = ?",
+      [result.insertId]
+    );
+    return { code: 1, message: "versión comercial publicada", data: serializeCommercialVersion(rows[0]) };
+  } catch (error) {
+    await connection.rollback();
+    if (error?.code === "ER_DUP_ENTRY") throw boom.conflict("esa versión comercial ya fue registrada");
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
 const defaultOrderReceiptSettings = {
   businessName: "PANADERIA",
   businessSubtitle: "",
@@ -292,7 +357,9 @@ const updatePosTicketSettings = async (payload, actorUserId) => {
 
 module.exports = {
   defaultOrderReceiptSettings,
+  getCurrentCommercialVersion,
   getPosTicketSettings,
+  publishCommercialVersion,
   updatePosTicketSettings,
 };
 
