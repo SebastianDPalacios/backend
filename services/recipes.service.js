@@ -228,6 +228,7 @@ const getRecipeBaseData = async ({ onlyActive } = {}) => {
       bag_size_grams,
       purchase_package_name,
       purchase_package_quantity,
+      COALESCE(is_inventory_valued, 1) AS is_inventory_valued,
       is_active
     FROM raw_materials
     ${rawMaterialFilter}
