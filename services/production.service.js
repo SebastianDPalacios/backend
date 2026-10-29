@@ -3442,6 +3442,25 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
     [reportDateFrom, reportDateTo, branchId || null, branchId || null]
   );
 
+  const [returnReasonRows] = await db.query(
+    `
+      SELECT
+        sri.reason,
+        COALESCE(SUM(sri.quantity), 0) AS returned_quantity,
+        COUNT(*) AS return_records
+      FROM sales_returns sr
+      INNER JOIN sales_return_items sri ON sri.sales_return_id = sr.id
+      INNER JOIN orders o ON o.id = sr.order_id
+      WHERE sr.status = 'completed'
+        AND DATE(sr.authorized_at) >= ?
+        AND DATE(sr.authorized_at) <= ?
+        AND (? IS NULL OR o.branch_id = ?)
+      GROUP BY sri.reason
+      ORDER BY returned_quantity DESC, sri.reason
+    `,
+    [reportDateFrom, reportDateTo, branchId || null, branchId || null]
+  );
+
   const [salesUsers] = await db.query(
     `SELECT DISTINCT
        u.id AS sales_agent_user_id,
@@ -3563,6 +3582,7 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
       recipe_materials_usage: recipeMaterialRows,
       flour_daily_usage: flourDailyRows,
       returns_summary: returnRows,
+      returns_by_reason: returnReasonRows,
       sales_users: salesUsers,
       inventory_snapshot: {
         raw_materials: rawInventoryRows,
