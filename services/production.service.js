@@ -3199,6 +3199,18 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
   const lastDay = year && monthNumber ? new Date(year, monthNumber, 0).getDate() : 1;
   const reportDateFrom = dateFrom || `${selectedMonth}-01`;
   const reportDateTo = dateTo || `${selectedMonth}-${String(lastDay).padStart(2, "0")}`;
+  const inventoryCutoffDate = reportDateTo < getOperationalDate() ? reportDateTo : getOperationalDate();
+  const inventoryMovementDateSql = `COALESCE(
+    pb_base.produced_date,
+    pb_pom.produced_date,
+    correction_batch.produced_date,
+    DATE(CONVERT_TZ(im.moved_at, '+00:00', '-05:00'))
+  )`;
+  const inventoryMovementDeltaSql = `CASE
+    WHEN im.movement_type IN ('purchase_in', 'production_in', 'adjustment_in', 'return_in') THEN im.quantity
+    WHEN im.movement_type IN ('production_out', 'sale_out', 'adjustment_out', 'waste_out') THEN -im.quantity
+    ELSE 0
+  END`;
   const dayReport = await getProductionDayReport({
     dateFrom: reportDateFrom,
     dateTo: reportDateTo,
@@ -3486,16 +3498,38 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
         rm.purchase_package_quantity,
         COALESCE(rm.is_inventory_valued, 1) AS is_inventory_valued,
         CASE WHEN COALESCE(rm.is_inventory_valued, 1) = 1 THEN COALESCE(rm.unit_cost, 0) ELSE 0 END AS unit_cost,
-        COALESCE(SUM(srm.quantity_on_hand), 0) AS quantity_on_hand,
+        COALESCE(SUM(srm.quantity_on_hand - COALESCE(movement_after_cutoff.net_change, 0)), 0) AS quantity_on_hand,
         CASE WHEN COALESCE(rm.is_inventory_valued, 1) = 1
-          THEN COALESCE(SUM(srm.quantity_on_hand * COALESCE(rm.unit_cost, 0)), 0)
+          THEN COALESCE(SUM((srm.quantity_on_hand - COALESCE(movement_after_cutoff.net_change, 0)) * COALESCE(rm.unit_cost, 0)), 0)
           ELSE 0 END AS total_value
       FROM raw_materials rm
       INNER JOIN raw_material_categories rmc ON rmc.id = rm.category_id
       LEFT JOIN stock_raw_materials srm
         ON srm.raw_material_id = rm.id
        AND (? IS NULL OR srm.branch_id = ?)
-      WHERE rm.deleted_at IS NULL
+      LEFT JOIN (
+        SELECT im.branch_id, im.raw_material_id, SUM(${inventoryMovementDeltaSql}) AS net_change
+          FROM inventory_movements im
+          LEFT JOIN production_batches pb_base
+            ON im.reference_type = 'production_batch'
+           AND pb_base.id = im.reference_id
+          LEFT JOIN production_output_materials pom_ref
+            ON im.reference_type = 'production_output_material'
+           AND pom_ref.id = im.reference_id
+          LEFT JOIN production_batches pb_pom ON pb_pom.id = pom_ref.production_batch_id
+          LEFT JOIN production_record_corrections correction
+            ON im.reference_type = 'production_correction'
+           AND correction.id = im.reference_id
+          LEFT JOIN production_batches correction_batch ON correction_batch.id = correction.production_batch_id
+         WHERE im.item_type = 'raw_material'
+           AND ${inventoryMovementDateSql} > ?
+           AND (? IS NULL OR im.branch_id = ?)
+         GROUP BY im.branch_id, im.raw_material_id
+      ) movement_after_cutoff
+        ON movement_after_cutoff.branch_id = srm.branch_id
+       AND movement_after_cutoff.raw_material_id = srm.raw_material_id
+      WHERE DATE(CONVERT_TZ(rm.created_at, '+00:00', '-05:00')) <= ?
+        AND (rm.deleted_at IS NULL OR DATE(CONVERT_TZ(rm.deleted_at, '+00:00', '-05:00')) > ?)
         AND COALESCE(rm.inventory_usage_type, 'production') = 'production'
         AND LOWER(rmc.name) NOT LIKE '%rollo%'
         AND LOWER(rmc.name) NOT LIKE '%bolsa%'
@@ -3504,7 +3538,11 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
                rm.purchase_package_quantity, rm.is_inventory_valued, rm.unit_cost
       ORDER BY rmc.name, rm.name
     `,
-    [branchId || null, branchId || null]
+    [
+      branchId || null, branchId || null,
+      inventoryCutoffDate, branchId || null, branchId || null,
+      inventoryCutoffDate, inventoryCutoffDate,
+    ]
   );
 
   const [productInventoryRows] = await db.query(
@@ -3516,18 +3554,44 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
         pc.name AS category_name,
         p.unit,
         COALESCE(p.base_price, 0) AS unit_cost,
-        COALESCE(SUM(sp.quantity_on_hand), 0) AS quantity_on_hand,
-        COALESCE(SUM(sp.quantity_on_hand * COALESCE(p.base_price, 0)), 0) AS total_value
+        COALESCE(SUM(sp.quantity_on_hand - COALESCE(movement_after_cutoff.net_change, 0)), 0) AS quantity_on_hand,
+        COALESCE(SUM((sp.quantity_on_hand - COALESCE(movement_after_cutoff.net_change, 0)) * COALESCE(p.base_price, 0)), 0) AS total_value
       FROM products p
       INNER JOIN product_categories pc ON pc.id = p.category_id
       LEFT JOIN stock_products sp
         ON sp.product_id = p.id
        AND (? IS NULL OR sp.branch_id = ?)
-      WHERE p.deleted_at IS NULL
+      LEFT JOIN (
+        SELECT im.branch_id, im.product_id, SUM(${inventoryMovementDeltaSql}) AS net_change
+          FROM inventory_movements im
+          LEFT JOIN production_batches pb_base
+            ON im.reference_type = 'production_batch'
+           AND pb_base.id = im.reference_id
+          LEFT JOIN production_output_materials pom_ref
+            ON im.reference_type = 'production_output_material'
+           AND pom_ref.id = im.reference_id
+          LEFT JOIN production_batches pb_pom ON pb_pom.id = pom_ref.production_batch_id
+          LEFT JOIN production_record_corrections correction
+            ON im.reference_type = 'production_correction'
+           AND correction.id = im.reference_id
+          LEFT JOIN production_batches correction_batch ON correction_batch.id = correction.production_batch_id
+         WHERE im.item_type = 'product'
+           AND ${inventoryMovementDateSql} > ?
+           AND (? IS NULL OR im.branch_id = ?)
+         GROUP BY im.branch_id, im.product_id
+      ) movement_after_cutoff
+        ON movement_after_cutoff.branch_id = sp.branch_id
+       AND movement_after_cutoff.product_id = sp.product_id
+      WHERE DATE(CONVERT_TZ(p.created_at, '+00:00', '-05:00')) <= ?
+        AND (p.deleted_at IS NULL OR DATE(CONVERT_TZ(p.deleted_at, '+00:00', '-05:00')) > ?)
       GROUP BY p.id, p.name, p.sku, pc.name, p.unit, p.base_price
       ORDER BY pc.name, p.name
     `,
-    [branchId || null, branchId || null]
+    [
+      branchId || null, branchId || null,
+      inventoryCutoffDate, branchId || null, branchId || null,
+      inventoryCutoffDate, inventoryCutoffDate,
+    ]
   );
 
   const [packagingInventoryRows] = await db.query(
@@ -3542,16 +3606,38 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
         rm.purchase_package_quantity,
         COALESCE(rm.is_inventory_valued, 1) AS is_inventory_valued,
         CASE WHEN COALESCE(rm.is_inventory_valued, 1) = 1 THEN COALESCE(rm.unit_cost, 0) ELSE 0 END AS unit_cost,
-        COALESCE(SUM(srm.quantity_on_hand), 0) AS quantity_on_hand,
+        COALESCE(SUM(srm.quantity_on_hand - COALESCE(movement_after_cutoff.net_change, 0)), 0) AS quantity_on_hand,
         CASE WHEN COALESCE(rm.is_inventory_valued, 1) = 1
-          THEN COALESCE(SUM(srm.quantity_on_hand * COALESCE(rm.unit_cost, 0)), 0)
+          THEN COALESCE(SUM((srm.quantity_on_hand - COALESCE(movement_after_cutoff.net_change, 0)) * COALESCE(rm.unit_cost, 0)), 0)
           ELSE 0 END AS total_value
       FROM raw_materials rm
       INNER JOIN raw_material_categories rmc ON rmc.id = rm.category_id
       LEFT JOIN stock_raw_materials srm
         ON srm.raw_material_id = rm.id
        AND (? IS NULL OR srm.branch_id = ?)
-      WHERE rm.deleted_at IS NULL
+      LEFT JOIN (
+        SELECT im.branch_id, im.raw_material_id, SUM(${inventoryMovementDeltaSql}) AS net_change
+          FROM inventory_movements im
+          LEFT JOIN production_batches pb_base
+            ON im.reference_type = 'production_batch'
+           AND pb_base.id = im.reference_id
+          LEFT JOIN production_output_materials pom_ref
+            ON im.reference_type = 'production_output_material'
+           AND pom_ref.id = im.reference_id
+          LEFT JOIN production_batches pb_pom ON pb_pom.id = pom_ref.production_batch_id
+          LEFT JOIN production_record_corrections correction
+            ON im.reference_type = 'production_correction'
+           AND correction.id = im.reference_id
+          LEFT JOIN production_batches correction_batch ON correction_batch.id = correction.production_batch_id
+         WHERE im.item_type = 'raw_material'
+           AND ${inventoryMovementDateSql} > ?
+           AND (? IS NULL OR im.branch_id = ?)
+         GROUP BY im.branch_id, im.raw_material_id
+      ) movement_after_cutoff
+        ON movement_after_cutoff.branch_id = srm.branch_id
+       AND movement_after_cutoff.raw_material_id = srm.raw_material_id
+      WHERE DATE(CONVERT_TZ(rm.created_at, '+00:00', '-05:00')) <= ?
+        AND (rm.deleted_at IS NULL OR DATE(CONVERT_TZ(rm.deleted_at, '+00:00', '-05:00')) > ?)
         AND (
           COALESCE(rm.inventory_usage_type, 'production') = 'packaging'
           OR LOWER(rmc.name) LIKE '%rollo%'
@@ -3562,7 +3648,11 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
                rm.purchase_package_quantity, rm.is_inventory_valued, rm.unit_cost
       ORDER BY rmc.name, rm.name
     `,
-    [branchId || null, branchId || null]
+    [
+      branchId || null, branchId || null,
+      inventoryCutoffDate, branchId || null, branchId || null,
+      inventoryCutoffDate, inventoryCutoffDate,
+    ]
   );
 
   return {
@@ -3585,6 +3675,8 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
       returns_by_reason: returnReasonRows,
       sales_users: salesUsers,
       inventory_snapshot: {
+        cutoff_date: inventoryCutoffDate,
+        reconstruction_method: "current_stock_minus_later_movements",
         raw_materials: rawInventoryRows,
         finished_products: productInventoryRows,
         packaging: packagingInventoryRows,
