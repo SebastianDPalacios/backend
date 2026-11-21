@@ -42,6 +42,13 @@ test("usa fecha operativa y conserva filtros de sucursal", () => {
   assert.match(productionService, /\(\? IS NULL OR im\.branch_id = \?\)/);
 });
 
+test("el reporte mensual conserva el detalle diario calculado", () => {
+  assert.match(
+    productionService,
+    /daily_products:\s*dayReport\.data\?\.daily_products\s*\|\|\s*\[\]/
+  );
+});
+
 test("el Excel identifica claramente la fecha de corte del inventario", () => {
   assert.match(monthPage, /cutoff_date/);
   assert.match(monthExcel, /Existencias con corte al/);

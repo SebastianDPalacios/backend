@@ -3666,6 +3666,7 @@ const getProductionMonthReport = async ({ month, dateFrom, dateTo, branchId, rec
       summary: dayReport.data?.summary || {},
       batches: dayReport.data?.batches || [],
       products: dayReport.data?.products || [],
+      daily_products: dayReport.data?.daily_products || [],
       packers: dayReport.data?.packers || [],
       plan_products: dayReport.data?.plan_products || [],
       raw_materials_usage: rawMaterialsUsage,
